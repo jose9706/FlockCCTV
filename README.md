@@ -659,10 +659,16 @@ today, this week, this month, or all time unless stated otherwise.
   private elsewhere. A public reply names the voice channel only if the
   `@everyone` role can view it;
   a private reply names it only if the requester can view it.
-- `/flock company period: user:` attaches a pie chart of the person's observed
+- `/flock company period: count: user:` attaches a pie chart of the person's observed
   voice time with each companion or alone. The default is this week. Companions
   are all humans in the same voice channel, tracked or not. Its image legend and
-  text list show names, percentages, and durations.
+  text list show names, percentages, and durations. `count` sets how time shared
+  with several people is counted: `split` (default) splits each shared minute
+  evenly so the slices add up to the observed time; `full` credits each person
+  with the whole minute, as `/flock leaderboard` does, so slices overlap,
+  percentages are of observed time, and the chart shows relative shares. With
+  `full`, company time recorded before whole shared time was tracked counts as
+  its split share.
   Names are looked up from Discord when absent from the bot's cache; if Discord
   cannot provide a name, the report shows the user ID. Names are not stored.
   The chart includes only source voice channels visible to the requester
@@ -677,7 +683,7 @@ today, this week, this month, or all time unless stated otherwise.
   the top 10 is counted on one line. The default period is all time. Company
   time recorded before whole shared time was tracked counts as its split share,
   since the group size at the time was not stored.
-- `/flock trends period: kind: user:` attaches a chart of how activity changes. The
+- `/flock trends period: kind: count: user:` attaches a chart of how activity changes. The
   default period is the last 7 days (today and the six days before it); pick
   `This week` to start on Monday instead. Kinds:
   - `daily` (default): messages and observed voice time per day (grouped by
@@ -695,7 +701,9 @@ today, this week, this month, or all time unless stated otherwise.
     activity or fully watched by the tracker; unwatched quiet days are left out.
   - `company`: stacked bars of companion time per day, week, or month with the
     top companion for recent buckets, under the same channel visibility rules
-    and name lookup as `/flock company`.
+    and name lookup as `/flock company`. `count` works as in `/flock company`;
+    with `full`, stacked bars can add up to more than the observed time. Other
+    kinds ignore `count`.
   - `bursts`: runs of messages sent within two minutes of each other, with the
     biggest burst, the average size, and the share in bursts of five or more.
   `hours`, `bursts`, and `compare` need message send times or voice sessions,

@@ -81,7 +81,8 @@ recorded only while a person is tracked; earlier company cannot be
 reconstructed. Bots are excluded. Each observed minute is split evenly among
 the people present, so slices plus time alone sum to the observed, attributable
 voice time. Each person's whole shared time is also stored, without the split,
-for the leaderboard. Rows recorded before that change count their split share.
+for the leaderboard and for company reports run with `count:full`. Rows
+recorded before that change count their split share.
 When someone joins or leaves a channel, every tracked person in it gets the
 change applied to their own roster at that moment. An outage ends attribution at
 the last reliable checkpoint.
@@ -126,9 +127,9 @@ activity to show (defaults to you)”; omitted, it is the requester.
 | `/flock stats period:week user:` | Messages, voice time, active days, observation start and gaps for the person |
 | `/flock records user:` | Personal records, dates, and measurement period |
 | `/flock where user:` | Latest observed voice channel and time, including current voice presence |
-| `/flock company period:week user:` | Pie chart of the person's observed voice time attributed to companions or time alone, limited to voice channels visible to the report audience |
+| `/flock company period:week count:split user:` | Pie chart of the person's observed voice time attributed to companions or time alone, limited to voice channels visible to the report audience; `count:full` credits each companion with whole shared time instead of an even split |
 | `/flock leaderboard period:all user:` | Ranked top 10 people by whole observed voice time shared with the person (not split), with time alone listed but unranked; same channel visibility as company |
-| `/flock trends period:last7 kind:daily user:` | Charts: per-day activity with streaks and ghost days, comparison with the previous period so far, time of day, day of week, company over time, or message bursts |
+| `/flock trends period:last7 kind:daily count:split user:` | Charts: per-day activity with streaks and ghost days, comparison with the previous period so far, time of day, day of week, company over time, or message bursts |
 | `/flock online user:` | Current Discord status of a currently tracked person; idle and Do Not Disturb count as online |
 | `/flock roast period:week user:` | A short template joke using a real statistic about the person |
 | `/flock top period:week metric:messages` | Ranks the tracked people by messages, voice time, or active days; top 10 plus a count of the rest |

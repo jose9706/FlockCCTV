@@ -43,6 +43,11 @@ TOP_METRIC_CHOICES = [
 ]
 # Trends default to a rolling window so early in the week the chart still has data.
 TREND_PERIOD_CHOICES = [app_commands.Choice(name="Last 7 days", value="last7"), *PERIOD_CHOICES]
+# How company reports count a minute shared with several people.
+COMPANY_COUNT_CHOICES = [
+    app_commands.Choice(name="Split evenly among people present", value="split"),
+    app_commands.Choice(name="Full time with each person", value="full"),
+]
 
 _ROAST_COOLDOWN = SharedRoastCooldown(seconds=30)
 # Company member ID that stands in for people whose data was deleted.
@@ -51,6 +56,7 @@ _DELETED_COMPANION = int(DELETED_COMPANION_ID)
 _LOOKUP_TIMEOUT = 2.0
 _FAILURE_TEXT = "The tracker could not complete that request. The error was logged."
 _USER_OPTION = "Whose activity to show (defaults to you)"
+_COMPANY_COUNT_OPTION = "How to count time shared with several people (split by default)"
 # Categorical palette in fixed slot order, validated for colour-vision deficiency.
 _PIE_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948")
 
@@ -289,7 +295,10 @@ async def _seen_text(bot: Any, interaction: discord.Interaction, person: _Person
     return f"{person.safe} was last seen in {channel_label} **{elapsed} ago** ({date})."
 
 
-def _pie_png(slices: list[tuple[str, float]], owner: str) -> bytes:
+def _pie_png(
+    slices: list[tuple[str, float]], owner: str, details: list[str] | None = None
+) -> bytes:
+    """Draw a pie with a legend; ``details`` replaces each slice's share and duration line."""
     image = Image.new("RGB", (1100, 640), "#ffffff")
     draw = ImageDraw.Draw(image)
     try:
@@ -322,10 +331,8 @@ def _pie_png(slices: list[tuple[str, float]], owner: str) -> bytes:
                 visible_name = visible_name[:-1]
             visible_name += "…"
         draw.text((660, legend_y), visible_name, font=label_font, fill="#17212f")
-        draw.text(
-            (660, legend_y + 36), f"{seconds / total:.1%}  ·  {_duration(seconds)}",
-            font=detail_font, fill="#48576b",
-        )
+        detail = details[index] if details else f"{seconds / total:.1%}  ·  {_duration(seconds)}"
+        draw.text((660, legend_y + 36), detail, font=detail_font, fill="#48576b")
         angle = next_angle
     output = BytesIO()
     image.save(output, format="PNG")
@@ -526,18 +533,23 @@ def _visible_company_rows(
     return visible_rows
 
 
-async def _company_seconds(
-    bot: Any, interaction: discord.Interaction, person: _Person, period: str, field: str = "seconds"
-) -> dict[int, float]:
-    """Return seconds by peer (0 means alone) in channels the audience can view.
-
-    ``field`` is ``seconds`` for the even split or ``full_seconds`` for whole shared time.
-    """
+async def _visible_company_totals(
+    bot: Any, interaction: discord.Interaction, person: _Person, period: str
+) -> list[dict[str, Any]]:
+    """Return company totals by channel and peer from channels the audience can view."""
     rows = await bot.store.company_totals(
         person.user_id, period, time.time(), include_live=_collection_reliable(bot)
     )
+    return _visible_company_rows(bot, interaction, rows)
+
+
+def _seconds_by_member(rows: list[dict[str, Any]], field: str) -> dict[int, float]:
+    """Sum one company field by peer (0 means alone), dropping peers without time.
+
+    ``field`` is ``seconds`` for the even split or ``full_seconds`` for whole shared time.
+    """
     seconds_by_member: dict[int, float] = {}
-    for row in _visible_company_rows(bot, interaction, rows):
+    for row in rows:
         seconds = float(row.get(field, 0.0))
         if seconds <= 0:
             continue
@@ -546,10 +558,26 @@ async def _company_seconds(
     return seconds_by_member
 
 
+async def _company_seconds(
+    bot: Any, interaction: discord.Interaction, person: _Person, period: str, field: str = "seconds"
+) -> dict[int, float]:
+    """Return seconds by peer (0 means alone) in channels the audience can view."""
+    return _seconds_by_member(await _visible_company_totals(bot, interaction, person, period), field)
+
+
+def _company_field(count: str) -> str:
+    """Map a company ``count`` choice to the stored field it reads."""
+    return "full_seconds" if count == "full" else "seconds"
+
+
 async def _company_report(
-    bot: Any, interaction: discord.Interaction, person: _Person, period: str
+    bot: Any, interaction: discord.Interaction, person: _Person, period: str, count: str = "split"
 ) -> tuple[str, bytes | None]:
-    seconds_by_member = await _company_seconds(bot, interaction, person, period)
+    rows = await _visible_company_totals(bot, interaction, person, period)
+    # Split shares sum to the observed time; full time overlaps and cannot.
+    observed_by_member = _seconds_by_member(rows, "seconds")
+    full = count == "full"
+    seconds_by_member = _seconds_by_member(rows, "full_seconds") if full else observed_by_member
 
     label = _period_label(period)
     if not seconds_by_member:
@@ -567,28 +595,51 @@ async def _company_report(
     if 0 in seconds_by_member:
         top.append((0, seconds_by_member[0]))
         top.sort(key=lambda item: (-item[1], item[0]))
-    if len(ranked_peers) > limit:
+    rest = len(ranked_peers) - limit
+    if rest > 0:
         top.append((-1, sum(seconds for _, seconds in ranked_peers[limit:])))
     guild = bot.get_guild(bot.config.guild_id)
     names = await asyncio.gather(*(
         _company_name(bot, guild, member_id) for member_id, _ in top
     ))
     slices = [(name, seconds) for name, (_, seconds) in zip(names, top)]
-    total = sum(seconds_by_member.values())
+    total = sum(observed_by_member.values())
+    title = f"**{person.safe}'s voice company — {label}**"
     lines = [
-        f"**{person.safe}'s voice company — {label}**",
+        f"{title} (full time with each person)" if full else title,
         f"Observed time in visible channels: **{_duration(total)}**.",
     ]
-    for index, (name, seconds) in enumerate(slices):
+    details = []
+    for index, ((member_id, _), (name, seconds)) in enumerate(zip(top, slices)):
         safe_name = discord.utils.escape_mentions(discord.utils.escape_markdown(name))
+        if full and member_id == -1:
+            # Overlapping time with several people has no meaningful share of the whole.
+            details.append(f"{_duration(seconds)} combined")
+            lines.append(
+                f"{index + 1}. **{safe_name}** — {_duration(seconds)} combined across {rest} people"
+            )
+        elif full:
+            details.append(f"{seconds / total:.1%} of time  ·  {_duration(seconds)}")
+            lines.append(
+                f"{index + 1}. **{safe_name}** — {_duration(seconds)} ({seconds / total:.1%} of observed time)"
+            )
+        else:
+            lines.append(
+                f"{index + 1}. **{safe_name}** — {_duration(seconds)} ({seconds / total:.1%})"
+            )
+    if full:
         lines.append(
-            f"{index + 1}. **{safe_name}** — {_duration(seconds)} ({seconds / total:.1%})"
+            "Each person is credited with every minute they shared, so slices overlap: percentages are "
+            "of observed time and the chart shows relative shares. Time alone has its own slice. "
+            "Only observed time since companion tracking began is included, and time recorded before "
+            "whole shared time was tracked counts as its split share."
         )
-    lines.append(
-        "Each shared minute is split evenly among the people present; time alone has its own slice. "
-        "Only observed time since companion tracking began is included."
-    )
-    return "\n".join(lines), _pie_png(slices, person.name)
+    else:
+        lines.append(
+            "Each shared minute is split evenly among the people present; time alone has its own slice. "
+            "Only observed time since companion tracking began is included."
+        )
+    return "\n".join(lines), _pie_png(slices, person.name, details if full else None)
 
 
 _LEADERBOARD_SIZE = 10
@@ -1241,7 +1292,8 @@ def _burst_trend(
 
 
 async def _company_trend(
-    bot: Any, interaction: discord.Interaction, person: _Person, period: str, label: str
+    bot: Any, interaction: discord.Interaction, person: _Person, period: str, label: str,
+    count: str = "split",
 ) -> tuple[str, bytes | None]:
     now = time.time()
     rows = await bot.store.company_daily(
@@ -1264,7 +1316,9 @@ async def _company_trend(
     by_member: dict[int, list[float]] = {}
     for row in rows:
         values = by_member.setdefault(int(row["member_id"]), [0.0] * len(keys))
-        values[position[_bucket_key(date.fromisoformat(row["day"]), unit)]] += float(row["seconds"])
+        values[position[_bucket_key(date.fromisoformat(row["day"]), unit)]] += float(
+            row.get(_company_field(count), 0.0)
+        )
     peers = sorted(
         (member_id for member_id in by_member if member_id != 0),
         key=lambda member_id: (-sum(by_member[member_id]), member_id),
@@ -1289,7 +1343,9 @@ async def _company_trend(
     guild = bot.get_guild(bot.config.guild_id)
     names = await asyncio.gather(*(_company_name(bot, guild, member_id) for member_id in named))
     name_of = dict(zip(named, names))
-    lines = [f"**{person.safe}'s company over time — {label}**"]
+    full = count == "full"
+    title = f"**{person.safe}'s company over time — {label}**"
+    lines = [f"{title} (full time with each person)" if full else title]
     lines.append(f"Top companion each {unit} (most recent last):")
     for index, key in recent:
         best = winners[index]
@@ -1300,13 +1356,21 @@ async def _company_trend(
         else:
             safe = discord.utils.escape_mentions(discord.utils.escape_markdown(name_of[best]))
             lines.append(f"{when}: **{safe}** — {_duration(by_member[best][index])}")
-    lines.append(
-        "Each shared minute is split evenly among the people present; only observed time since "
-        "companion tracking began is included."
-    )
+    if full:
+        lines.append(
+            "Each person is credited with every minute they shared, so stacked bars can add up to more "
+            "than the observed time; only observed time since companion tracking began is included, and "
+            "time recorded before whole shared time was tracked counts as its split share."
+        )
+    else:
+        lines.append(
+            "Each shared minute is split evenly among the people present; only observed time since "
+            "companion tracking began is included."
+        )
     png = _stacked_png(
         f"{person.name}'s company per {unit} — {label}",
-        f"Observed voice time per {unit}, by companion",
+        f"Full shared time per {unit}, by companion (overlapping)" if full
+        else f"Observed voice time per {unit}, by companion",
         [_bucket_label(key, unit, day_count) for key in keys],
         [
             (name_of[member_id], values, _PIE_COLORS[index])
@@ -1317,7 +1381,8 @@ async def _company_trend(
 
 
 async def _trend_report(
-    bot: Any, interaction: discord.Interaction, person: _Person, period: str, kind: str
+    bot: Any, interaction: discord.Interaction, person: _Person, period: str, kind: str,
+    count: str = "split",
 ) -> tuple[str, bytes | None]:
     now = time.time()
     label = _period_label(period)
@@ -1338,7 +1403,7 @@ async def _trend_report(
             period, label, person,
         )
     if kind == "company":
-        return await _company_trend(bot, interaction, person, period, label)
+        return await _company_trend(bot, interaction, person, period, label, count)
     series = await bot.store.daily_trend(user_id, period, now, include_live=reliable)
     if not any(_is_active(entry) for entry in series):
         return f"No activity has been recorded for {label}, so there is no trend to chart.", None
@@ -1531,7 +1596,7 @@ def _help_text(bot: Any) -> str:
         "`/flock stats` — messages, observed voice time, active days, visits, and coverage gaps (week by default).",
         "`/flock records` — busiest message day, longest fully observed voice visit, and top voice companion.",
         "`/flock where` — last observed voice channel and time.",
-        "`/flock company` — pie chart of who shared observed voice time, or time alone.",
+        "`/flock company` — pie chart of who shared observed voice time, or time alone; `count:full` credits each person with whole group calls.",
         "`/flock leaderboard` — who spent the most voice time with someone, counting whole group calls (all time by default).",
         "`/flock trends` — day by day, versus last period, time of day, day of week, company, or message bursts (last 7 days by default).",
         "`/flock online` — Discord status of a tracked person; away counts as online.",
@@ -1841,11 +1906,14 @@ def register_commands(bot: Any) -> None:
         )
 
     @flock.command(name="company", description="Chart who shared someone's observed voice time")
-    @app_commands.describe(period="The period to summarize", user=_USER_OPTION)
-    @app_commands.choices(period=PERIOD_CHOICES)
+    @app_commands.describe(
+        period="The period to summarize", count=_COMPANY_COUNT_OPTION, user=_USER_OPTION
+    )
+    @app_commands.choices(period=PERIOD_CHOICES, count=COMPANY_COUNT_CHOICES)
     async def company_command(
         interaction: discord.Interaction,
         period: str = "week",
+        count: str = "split",
         user: discord.User | None = None,
     ) -> None:
         person = await _resolve_person(interaction, bot, "flock company", user)
@@ -1856,7 +1924,7 @@ def register_commands(bot: Any) -> None:
             bot,
             "flock company",
             person,
-            lambda: _company_report(bot, interaction, person, period),
+            lambda: _company_report(bot, interaction, person, period, count),
             ephemeral=_report_is_ephemeral(bot, interaction),
             filename="flock-voice-company.png",
         )
@@ -1883,13 +1951,17 @@ def register_commands(bot: Any) -> None:
 
     @flock.command(name="trends", description="Chart how someone's activity changes over a period")
     @app_commands.describe(
-        period="The period to chart", kind="Which trend to chart", user=_USER_OPTION
+        period="The period to chart",
+        kind="Which trend to chart",
+        count="Company kind only: how to count time shared with several people (split by default)",
+        user=_USER_OPTION,
     )
-    @app_commands.choices(period=TREND_PERIOD_CHOICES, kind=TREND_CHOICES)
+    @app_commands.choices(period=TREND_PERIOD_CHOICES, kind=TREND_CHOICES, count=COMPANY_COUNT_CHOICES)
     async def trends_command(
         interaction: discord.Interaction,
         period: str = "last7",
         kind: str = "daily",
+        count: str = "split",
         user: discord.User | None = None,
     ) -> None:
         person = await _resolve_person(interaction, bot, "flock trends", user)
@@ -1900,7 +1972,7 @@ def register_commands(bot: Any) -> None:
             bot,
             "flock trends",
             person,
-            lambda: _trend_report(bot, interaction, person, period, kind),
+            lambda: _trend_report(bot, interaction, person, period, kind, count),
             ephemeral=_report_is_ephemeral(bot, interaction),
             filename=f"flock-trends-{kind}.png",
         )

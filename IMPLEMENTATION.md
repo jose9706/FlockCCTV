@@ -345,9 +345,10 @@ mentions, never a mention. Options and defaults:
 
 | Command | Options (default) |
 | --- | --- |
-| `stats`, `company`, `roast` | `period` (week), `user` |
+| `stats`, `roast` | `period` (week), `user` |
+| `company` | `period` (week), `count`: `split` (default) or `full`, `user` |
 | `leaderboard` | `period` (all), `user` |
-| `trends` | `period` (last7), `kind` (daily), `user` |
+| `trends` | `period` (last7), `kind` (daily), `count` (split; company kind only), `user` |
 | `records`, `where`, `online` | `user` |
 | `top` | `period` (week), `metric`: `messages` (default), `voice`, `active_days` |
 | `track add` | `user` (a server member) |
@@ -392,6 +393,10 @@ replies. Missing/deleted channels are omitted. It attaches a PNG generated in
 memory; no image or message body is stored. Resolve visible companion names from
 the member/user cache, then Discord's member/user API if needed. Use the user ID
 only when name lookup fails, and do not persist display names.
+`count:split` (default) reads `seconds`, so slices and percentages add up to the
+observed time. `count:full` reads `full_seconds` for the slices but keeps the
+observed total and percentages on `seconds`; the “Other people” slice then
+shows combined time without a percentage, and the pie shows relative shares.
 `/flock leaderboard period:` (default `all`) uses the company report's
 visibility filter and name lookup on `full_seconds`, as text only: top 10
 people ranked, ties by user ID, the remainder counted, and alone time listed but not ranked.
@@ -404,7 +409,7 @@ visibility and attaches an in-memory PNG: `daily` and `weekdays` from
 `compare` from `Store.period_comparison`, `hours` from `Store.message_times`
 and `Store.voice_hours`, `bursts` from `Store.message_times` (two-minute gap),
 and `company` from `Store.company_daily` filtered and named like the company
-report. All of them take the resolved person's ID. No activity yields a text-only
+report, reading `seconds` or, with `count:full`, `full_seconds`. All of them take the resolved person's ID. No activity yields a text-only
 reply.
 
 `evil-mode` and `reaction-mode` check admin access, then reply privately that Leland

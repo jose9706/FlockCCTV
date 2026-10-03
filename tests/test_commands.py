@@ -269,6 +269,13 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         trends = next(command for command in flock.commands if command.name == "trends")
         self.assertEqual(inspect.signature(trends.callback).parameters["period"].default, "last7")
         self.assertEqual(inspect.signature(trends.callback).parameters["kind"].default, "daily")
+        company = next(command for command in flock.commands if command.name == "company")
+        for command in (company, trends):
+            with self.subTest(command=command.name):
+                self.assertEqual(inspect.signature(command.callback).parameters["count"].default, "split")
+                count = next(item for item in command.parameters if item.name == "count")
+                self.assertFalse(count.required)
+                self.assertEqual([choice.value for choice in count.choices], ["split", "full"])
         leaderboard = next(command for command in flock.commands if command.name == "leaderboard")
         self.assertEqual(inspect.signature(leaderboard.callback).parameters["period"].default, "all")
         top = next(command for command in flock.commands if command.name == "top")
@@ -684,6 +691,70 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         content, _ = await _company_report(self.bot, public, PERSON, "week")
         self.assertIn("Alone", content)
         self.assertIn("Other people", content)
+
+    async def test_company_chart_can_count_full_shared_time(self):
+        self.config.public_report_channel_ids = frozenset({20})
+        names = {41: "Alice", 42: "Bob"}
+        self.bot.get_guild = lambda guild_id: SimpleNamespace(
+            get_member=lambda member_id: SimpleNamespace(display_name=names.get(member_id, f"P{member_id}"))
+        )
+        self.bot.get_channel = lambda channel_id: SimpleNamespace(
+            permissions_for=lambda viewer: SimpleNamespace(view_channel=True)
+        )
+        # A one-hour call with Alice and Bob, plus 30 minutes alone: 1h 30m observed.
+        self.bot.store.company_rows = [
+            {"channel_id": 40, "member_id": 41, "seconds": 1800.0, "full_seconds": 3600.0},
+            {"channel_id": 40, "member_id": 42, "seconds": 1800.0, "full_seconds": 3600.0},
+            {"channel_id": 40, "member_id": 0, "seconds": 1800.0, "full_seconds": 1800.0},
+        ]
+        public = FakeInteraction(channel_id=20)
+        public.guild = SimpleNamespace(default_role=object())
+
+        content, _ = await _company_report(self.bot, public, PERSON, "week")
+        self.assertIn("**Alice** — 30m (33.3%)", content)
+        self.assertIn("split evenly", content)
+
+        content, png = await _company_report(self.bot, public, PERSON, "week", "full")
+        self.assertIn("(full time with each person)", content)
+        self.assertIn("Observed time in visible channels: **1h 30m**.", content)
+        self.assertIn("**Alice** — 1h 0m (66.7% of observed time)", content)
+        self.assertIn("**Bob** — 1h 0m (66.7% of observed time)", content)
+        self.assertIn("**Alone** — 30m (33.3% of observed time)", content)
+        self.assertIn("slices overlap", content)
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+        # People past the top slices are combined without a share of observed time.
+        self.bot.store.company_rows = [
+            {"channel_id": 40, "member_id": member_id, "seconds": 600.0, "full_seconds": 6000.0}
+            for member_id in range(50, 60)
+        ]
+        content, _ = await _company_report(self.bot, public, PERSON, "week", "full")
+        self.assertIn("**Other people** — 5h 0m combined across 3 people", content)
+
+    async def test_company_trend_can_count_full_shared_time(self):
+        guild = SimpleNamespace(
+            default_role=object(),
+            get_member=lambda user_id: SimpleNamespace(display_name={41: "Alice", 42: "Bob"}.get(user_id)),
+        )
+        self.bot.get_guild = lambda guild_id: guild
+        self.bot.get_channel = lambda channel_id: SimpleNamespace(
+            permissions_for=lambda viewer: SimpleNamespace(view_channel=True)
+        )
+        # Alice was in a big group call; Bob had a shorter one-on-one.
+        self.bot.store.company_rows_daily = [
+            {"day": "2025-03-03", "channel_id": 101, "member_id": 41, "seconds": 600.0, "full_seconds": 3600.0},
+            {"day": "2025-03-03", "channel_id": 101, "member_id": 42, "seconds": 1200.0, "full_seconds": 1200.0},
+        ]
+        with patch.object(commands_module.time, "time", return_value=1_741_132_800.0):
+            content, _ = await _trend_report(self.bot, FakeInteraction(), PERSON, "week", "company")
+            self.assertIn("Mon 3: **Bob** — 20m", content)
+            content, png = await _trend_report(
+                self.bot, FakeInteraction(), PERSON, "week", "company", "full"
+            )
+        self.assertIn("(full time with each person)", content)
+        self.assertIn("Mon 3: **Alice** — 1h 0m", content)
+        self.assertIn("can add up to more than the observed time", content)
+        self.assertIsNotNone(png)
 
     async def test_leaderboard_ranks_full_shared_time_in_visible_channels(self):
         self.config.public_report_channel_ids = frozenset({20})
@@ -1571,13 +1642,18 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.bot.get_channel = lambda channel_id: SimpleNamespace(
             permissions_for=lambda viewer: SimpleNamespace(view_channel=True)
         )
-        self.bot.store.company_rows = [{"channel_id": 40, "member_id": 51, "seconds": 60.0}]
+        self.bot.store.company_rows = [{"channel_id": 40, "member_id": 51, "seconds": 60.0, "full_seconds": 60.0}]
         interaction = FakeInteraction(channel_id=20)
         interaction.guild = SimpleNamespace(default_role=object())
         await self.command("company").callback(interaction, user=_user(41, "Ana"))
         sent = interaction.followup.sent[0]
         self.assertTrue(sent["content"].startswith("**Ana's voice company — this week**"))
         self.assertEqual(sent["file"].filename, "flock-voice-company.png")
+
+        full = FakeInteraction(channel_id=20)
+        full.guild = interaction.guild
+        await self.command("company").callback(full, count="full", user=_user(41, "Ana"))
+        self.assertIn("(full time with each person)", full.followup.sent[0]["content"])
 
     # -- /flock top -------------------------------------------------------------
 
