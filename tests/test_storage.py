@@ -859,10 +859,10 @@ class MultiPersonStoreTests(unittest.IsolatedAsyncioTestCase):
             )
             conn.execute("PRAGMA user_version = 9")
             conn.commit()
-        for path in (newer, legacy):
+        for path, message in ((newer, "newer than supported"), (legacy, "new database file")):
             store = Store(path, self.root / "refused-backups", "UTC")
             try:
-                with self.assertRaises(StoreError):
+                with self.assertRaisesRegex(StoreError, message):
                     await store.initialize(200.0, 11)
             finally:
                 await store.close()
