@@ -1040,7 +1040,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(interaction.followup.sent[0]["ephemeral"])
             replies[name] = interaction.followup.sent[0]["content"]
         self.bot.tracker.pause.assert_awaited_once_with(actor_id=31)
-        self.bot.tracker.resume.assert_awaited_once_with(33, snapshot)
+        self.bot.tracker.resume.assert_awaited_once_with(33, self.bot.voice_snapshot)
         # Only tracked people in voice are mentioned; the untracked member 99 is not counted.
         self.assertIn("1 tracked person currently in voice is being observed", replies["resume"])
 
@@ -1051,7 +1051,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         interaction = FakeInteraction(user=SimpleNamespace(id=31))
         await self.command("resume").callback(interaction)
         self.assertIn("will start when a tracked person joins", interaction.followup.sent[0]["content"])
-        self.bot.tracker.resume.assert_awaited_once_with(31, {99: 7})
+        self.bot.tracker.resume.assert_awaited_once_with(31, self.bot.voice_snapshot)
 
     async def test_update_command_requests_a_check_privately_unless_held(self):
         import json
@@ -1691,13 +1691,13 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(
             self.bot.tracker.track_user.await_args_list,
-            [call(35, 31, snapshot), call(35, 33, snapshot)],
+            [call(35, 31, self.bot.voice_snapshot), call(35, 33, self.bot.voice_snapshot)],
         )
 
         # Admins and the owner may be tracked themselves.
         own = FakeInteraction(user=SimpleNamespace(id=31))
         await add.callback(own, _user(31, "Owner"))
-        self.bot.tracker.track_user.assert_awaited_with(31, 31, snapshot)
+        self.bot.tracker.track_user.assert_awaited_with(31, 31, self.bot.voice_snapshot)
 
         self.bot.tracker.track_user.reset_mock()
         for actor, manage in ((32, False), (30, False), (34, True)):
@@ -1906,6 +1906,87 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         await view.children[0].callback(again)
         self.assertIn("expired or finished", again.response.sent[0]["content"])
         self.bot.tracker.delete_user_data.assert_awaited_once()
+
+    async def test_per_person_delete_by_id_works_for_departed_members(self):
+        self.bot.tracker.delete_user_data = AsyncMock(return_value=True)
+        self.bot.get_user = lambda user_id: None
+        command = self.command("delete-data")
+        for raw in ("77", "<@77>", "<@!77>"):
+            interaction = FakeInteraction(user=SimpleNamespace(id=31))
+            interaction.guild = SimpleNamespace(get_member=lambda user_id: None)
+            await command.callback(interaction, user_id=raw)
+            sent = interaction.response.sent[0]
+            self.assertTrue(sent["ephemeral"])
+            self.assertIn("only **User 77**", sent["content"])
+            self.assertEqual(sent["view"].target_id, 77)
+        confirmation = FakeInteraction(user=SimpleNamespace(id=31))
+        await sent["view"].children[0].callback(confirmation)
+        self.bot.tracker.delete_user_data.assert_awaited_once_with(77, 31)
+
+        # A cached name is used when the member is still around.
+        interaction = FakeInteraction(user=SimpleNamespace(id=31))
+        interaction.guild = SimpleNamespace(
+            get_member=lambda user_id: SimpleNamespace(display_name="Ana", bot=False)
+        )
+        await command.callback(interaction, user_id="41")
+        self.assertIn("only **Ana**", interaction.response.sent[0]["content"])
+
+    async def test_per_person_delete_by_id_rejects_bad_input(self):
+        self.bot.tracker.delete_user_data = AsyncMock()
+        command = self.command("delete-data")
+        both = FakeInteraction(user=SimpleNamespace(id=31))
+        await command.callback(both, user=_user(41, "Ana"), user_id="41")
+        self.assertIn("either `user` or `user_id`", both.response.sent[0]["content"])
+        garbage = FakeInteraction(user=SimpleNamespace(id=31))
+        await command.callback(garbage, user_id="Ana")
+        self.assertIn("user ID or mention", garbage.response.sent[0]["content"])
+        robot = FakeInteraction(user=SimpleNamespace(id=31))
+        robot.guild = SimpleNamespace(get_member=lambda user_id: SimpleNamespace(display_name="Bot", bot=True))
+        await command.callback(robot, user_id="88")
+        self.assertEqual(robot.response.sent[0]["content"], "Bots aren't tracked.")
+        for interaction in (both, garbage, robot):
+            self.assertTrue(interaction.response.sent[0]["ephemeral"])
+            self.assertNotIn("view", interaction.response.sent[0])
+        self.bot.tracker.delete_user_data.assert_not_awaited()
+
+        # Only tracker admins may delete by ID.
+        outsider = FakeInteraction(user=SimpleNamespace(id=30))
+        await command.callback(outsider, user_id="41")
+        self.assertNotIn("view", outsider.response.sent[0])
+
+    async def test_reports_say_busy_when_the_store_does_not_answer_in_time(self):
+        async def slow():
+            await asyncio.sleep(1)
+            return []
+
+        self.bot.store.tracked_users = slow
+        interaction = FakeInteraction(user=SimpleNamespace(id=41))
+        with patch.object(commands_module, "_LOOKUP_TIMEOUT", 0.01):
+            await self.command("stats").callback(interaction)
+        sent = interaction.response.sent[0]
+        self.assertTrue(sent["ephemeral"])
+        self.assertIn("busy", sent["content"])
+        self.assertFalse(interaction.response.deferred)
+
+    async def test_deleted_companions_are_named_but_never_ranked(self):
+        self.bot.get_guild = lambda guild_id: SimpleNamespace(
+            get_member=lambda member_id: SimpleNamespace(display_name=f"P{member_id}")
+        )
+        self.bot.get_channel = lambda channel_id: SimpleNamespace(
+            permissions_for=lambda viewer: SimpleNamespace(view_channel=True)
+        )
+        self.bot.store.company_rows = [
+            {"channel_id": 40, "member_id": -2, "seconds": 900.0, "full_seconds": 900.0},
+            {"channel_id": 40, "member_id": 41, "seconds": 300.0, "full_seconds": 300.0},
+        ]
+        private = FakeInteraction(channel_id=21)
+        board = await _leaderboard_text(self.bot, private, PERSON, "all")
+        self.assertIn("🥇 **P41** — 5m", board)
+        self.assertNotIn("Deleted person", board)
+        records = await _records_text(self.bot, private, PERSON)
+        self.assertIn("Top voice companion: **P41**", records)
+        content, _ = await _company_report(self.bot, private, PERSON, "all")
+        self.assertIn("**Deleted person** — 15m", content)
 
     async def test_global_delete_still_confirms_for_everyone_and_calls_delete_data(self):
         self.bot.tracker.delete_user_data = AsyncMock()

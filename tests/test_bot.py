@@ -61,6 +61,15 @@ class BotTests(unittest.TestCase):
         self.assertFalse(bot.allowed_mentions.roles)
         self.assertFalse(bot.allowed_mentions.replied_user)
 
+    def test_message_content_intent_is_requested_only_for_leland_mode(self):
+        with TemporaryDirectory() as directory:
+            with_leland = create_bot(make_config(Path(directory), leland_user_id=20))
+            without = create_bot(make_config(Path(directory), leland_user_id=None))
+        self.assertTrue(with_leland.intents.message_content)
+        self.assertFalse(without.intents.message_content)
+        self.assertTrue(without.intents.presences)
+        self.assertTrue(without.intents.guild_messages)
+
     def test_voice_snapshot_respects_allowlist_afk_guild_and_bot_exclusion(self):
         with TemporaryDirectory() as directory:
             bot = create_bot(make_config(Path(directory), voice_channels=frozenset({40, 42, 99})))
@@ -293,7 +302,8 @@ class GracefulSignalTests(unittest.IsolatedAsyncioTestCase):
         bot.get_guild = lambda guild_id: SimpleNamespace(unavailable=False)
         bot.voice_snapshot = lambda: {20: 40, 21: 40}
         await bot._checkpoint_once()
-        tracker.guild_available.assert_awaited_once_with({20: 40, 21: 40})
+        # The Tracker takes the snapshot itself, once it holds its lock.
+        tracker.guild_available.assert_awaited_once_with(bot.voice_snapshot)
         tracker.checkpoint.assert_awaited_once()
         tracker.guild_available.reset_mock()
         tracker.connected = False
@@ -313,14 +323,15 @@ class GracefulSignalTests(unittest.IsolatedAsyncioTestCase):
         bot.tracker = tracker
         await bot._reconcile_gateway_ready()
         tracker.gateway_ready.assert_awaited_once()
-        tracker.ready.assert_awaited_once_with(snapshot)
+        tracker.ready.assert_awaited_once_with(bot.voice_snapshot)
+        self.assertEqual(tracker.ready.await_args.args[0](), snapshot)
 
         guild = SimpleNamespace(id=10, unavailable=False)
         await bot.on_guild_available(guild)
-        tracker.guild_available.assert_awaited_once_with(snapshot)
+        tracker.guild_available.assert_awaited_once_with(bot.voice_snapshot)
         tracker.guild_available.reset_mock()
         await bot.on_guild_join(guild)
-        tracker.guild_available.assert_awaited_once_with(snapshot)
+        tracker.guild_available.assert_awaited_once_with(bot.voice_snapshot)
         tracker.guild_available.reset_mock()
         await bot.on_guild_available(SimpleNamespace(id=11, unavailable=False))
         tracker.guild_available.assert_not_awaited()

@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from . import update_status, version_string
 from .jokes import SharedRoastCooldown, make_roast
+from .storage import DELETED_COMPANION_ID
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,10 @@ TOP_METRIC_CHOICES = [
 TREND_PERIOD_CHOICES = [app_commands.Choice(name="Last 7 days", value="last7"), *PERIOD_CHOICES]
 
 _ROAST_COOLDOWN = SharedRoastCooldown(seconds=30)
+# Company member ID that stands in for people whose data was deleted.
+_DELETED_COMPANION = int(DELETED_COMPANION_ID)
+# Seconds a pre-acknowledgement store read may take (Discord allows three).
+_LOOKUP_TIMEOUT = 2.0
 _FAILURE_TEXT = "The tracker could not complete that request. The error was logged."
 _USER_OPTION = "Whose activity to show (defaults to you)"
 # Categorical palette in fixed slot order, validated for colour-vision deficiency.
@@ -360,6 +365,8 @@ async def _company_name(bot: Any, guild: Any, member_id: int) -> str:
         return "Alone"
     if member_id == -1:
         return "Other people"
+    if member_id == _DELETED_COMPANION:
+        return "Deleted person"
     found = await _lookup_user(bot, guild, member_id)
     return _clean_name(getattr(found, "display_name", None)) or f"User {member_id}"
 
@@ -440,7 +447,12 @@ async def _resolve_person(
     user_id = int(target.id)
     name = _person_name(target, user_id)
     try:
-        rows = await bot.store.tracked_users()
+        # This runs before the interaction is acknowledged, so a store busy with
+        # a backup or compaction must not use up Discord's three seconds.
+        rows = await asyncio.wait_for(bot.store.tracked_users(), timeout=_LOOKUP_TIMEOUT)
+    except TimeoutError:
+        await _send(interaction, "The tracker is busy right now. Try again in a moment.", ephemeral=True)
+        return None
     except Exception:
         logger.exception("Slash command %s failed", label)
         await _send(interaction, _FAILURE_TEXT, ephemeral=True)
@@ -589,8 +601,9 @@ async def _leaderboard_text(
     """Rank people by the whole voice time they shared with ``person``."""
     full_by_member = await _company_seconds(bot, interaction, person, period, "full_seconds")
     label = _period_label(period)
+    # Time alone and time with people whose data was deleted are not ranked.
     ranked = sorted(
-        ((member_id, seconds) for member_id, seconds in full_by_member.items() if member_id != 0),
+        ((member_id, seconds) for member_id, seconds in full_by_member.items() if member_id > 0),
         key=lambda item: (-item[1], item[0]),
     )
     if not ranked:
@@ -1392,7 +1405,7 @@ async def _records_text(bot: Any, interaction: discord.Interaction, person: _Per
     peers = [
         (member_id, seconds)
         for member_id, seconds in (await _company_seconds(bot, interaction, person, "all")).items()
-        if member_id != 0
+        if member_id > 0
     ]
     if peers:
         member_id, seconds = min(peers, key=lambda item: (-item[1], item[0]))
@@ -2085,7 +2098,7 @@ def register_commands(bot: Any) -> None:
             return
 
         async def action() -> str:
-            added = await bot.tracker.track_user(user.id, interaction.user.id, bot.voice_snapshot())
+            added = await bot.tracker.track_user(user.id, interaction.user.id, bot.voice_snapshot)
             label = _user_label(user, user.id)
             if not added:
                 return f"{label} is already tracked."
@@ -2161,8 +2174,8 @@ def register_commands(bot: Any) -> None:
             return
 
         async def action() -> str:
+            await bot.tracker.resume(interaction.user.id, bot.voice_snapshot)
             snapshot = bot.voice_snapshot()
-            await bot.tracker.resume(interaction.user.id, snapshot)
             tracked = getattr(bot.tracker, "tracked_ids", frozenset())
             watching = sum(1 for member_id in snapshot if member_id in tracked)
             if not watching:
@@ -2220,27 +2233,52 @@ def register_commands(bot: Any) -> None:
         await _execute_after_scope(interaction, bot, "flock reaction-mode", action, ephemeral=True)
 
     @flock.command(name="delete-data", description="Erase one person's statistics, or everyone's and pause collection")
-    @app_commands.describe(user="Erase only this person's data (everyone's if omitted)")
+    @app_commands.describe(
+        user="Erase only this person's data (everyone's if both options are omitted)",
+        user_id="Erase one person by Discord user ID or mention; works after they leave",
+    )
     async def delete_data_command(
-        interaction: discord.Interaction, user: discord.User | None = None
+        interaction: discord.Interaction,
+        user: discord.User | None = None,
+        user_id: str | None = None,
     ) -> None:
         if not await _scope_ok(interaction, bot):
             return
         if not await _control_permission_ok(interaction, bot):
             return
+        if user is not None and user_id is not None:
+            await _send(interaction, "Choose either `user` or `user_id`, not both.", ephemeral=True)
+            return
         if user is not None and user.bot:
             await _send(interaction, "Bots aren't tracked.", ephemeral=True)
             return
-        if user is None:
+        target_id: int | None = None if user is None else int(user.id)
+        if user_id is not None:
+            target_id = _admin_id(user_id)
+            if target_id is None:
+                await _send(interaction, "Enter a Discord user ID or mention.", ephemeral=True)
+                return
+            # Cache only: this prompt is the interaction's first response, so a
+            # Discord lookup could run past the acknowledgement window.
+            guild = getattr(interaction, "guild", None)
+            found = guild.get_member(target_id) if guild is not None else None
+            if found is None and hasattr(bot, "get_user"):
+                found = bot.get_user(target_id)
+            if getattr(found, "bot", False):
+                await _send(interaction, "Bots aren't tracked.", ephemeral=True)
+                return
+            name = _safe_name(_person_name(found, target_id))
+        elif user is not None:
+            name = _safe_name(_person_name(user, target_id))
+        if target_id is None:
             view = DeleteDataConfirmation(bot, interaction.user.id)
             prompt = (
                 "This permanently erases the tracked statistics of **everyone** and all managed "
                 "local backups, then pauses collection. The tracked list is kept. Continue?"
             )
         else:
-            name = _safe_name(_person_name(user, user.id))
             view = DeleteDataConfirmation(
-                bot, interaction.user.id, target_id=user.id, target_name=name
+                bot, interaction.user.id, target_id=target_id, target_name=name
             )
             prompt = (
                 f"This permanently erases only **{name}**'s recorded statistics, removes them from "

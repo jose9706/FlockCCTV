@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from flock_cctv.storage import Store, StoreError
+from flock_cctv.storage import DELETED_COMPANION_ID, Store, StoreError
 
 
 USER = 22
@@ -1046,13 +1046,72 @@ class MultiPersonStoreTests(unittest.IsolatedAsyncioTestCase):
         await self.store.connect(100)
         await self.store.voice_transition(USER, 101, 110)
         await self.store.voice_transition(THIRD, 102, 110)
-        await self.store.companion_transition(101, 31, True, 150)  # USER 150, THIRD 110.
+        # USER's channel event credits every open segment, THIRD's included, to 150.
+        await self.store.companion_transition(101, 31, True, 150)
         await self.store.disconnect(300)
         user = await self.store.stats(USER, "all", 300)
         third = await self.store.stats(THIRD, "all", 300)
-        self.assertEqual((user["voice_seconds"], user["gap_seconds"]), (40, 190))
-        self.assertEqual((third["voice_seconds"], third["gap_seconds"]), (0, 190))
-        self.assertEqual((await self.store.state())["last_checkpoint"], 110)
+        self.assertEqual((user["voice_seconds"], user["gap_seconds"]), (40, 150))
+        self.assertEqual((third["voice_seconds"], third["gap_seconds"]), (40, 150))
+        self.assertEqual((await self.store.state())["last_checkpoint"], 150)
+        # Coverage ends exactly where the gap starts: no watched time without voice.
+        self.assertEqual(
+            self.rows("SELECT ended_at FROM coverage_intervals"), [(150.0,)]
+        )
+        self.assertEqual(self.rows("SELECT started_at FROM coverage_gaps"), [(150.0,)])
+
+    async def test_channel_events_credit_every_open_segment_exactly_once(self) -> None:
+        await self.store.connect(100)
+        await self.store.voice_transition(USER, 101, 110, companions={OTHER})
+        await self.store.voice_transition(OTHER, 101, 110, companions={USER})
+        await self.store.voice_transition(THIRD, 102, 110)
+        # An untracked person joins and leaves USER and OTHER's channel.
+        await self.store.companion_transition(101, 31, True, 130)
+        await self.store.companion_transition(101, 31, False, 150)
+        await self.store.voice_transition(THIRD, None, 170)
+        await self.store.checkpoint(200)
+        for person in (USER, OTHER):
+            self.assertEqual((await self.store.stats(person, "all", 200))["voice_seconds"], 90)
+            totals = {
+                row["member_id"]: (row["seconds"], row["full_seconds"])
+                for row in await self.store.company_totals(person, "all", 200)
+            }
+            peer = OTHER if person == USER else USER
+            self.assertAlmostEqual(totals[peer][0], 70 + 10)
+            self.assertEqual(totals[peer][1], 90)
+            self.assertEqual(totals[31], (10.0, 20.0))
+        self.assertEqual((await self.store.stats(THIRD, "all", 200))["voice_seconds"], 60)
+        self.assertEqual(self.rows(
+            "SELECT DISTINCT checkpoint FROM voice_segments WHERE ended_at IS NULL"
+        ), [(200.0,)])
+
+    async def test_untrack_mid_call_keeps_coverage_level_with_other_segments(self) -> None:
+        await self.store.connect(100)
+        await self.store.voice_transition(USER, 101, 110)
+        await self.store.voice_transition(OTHER, 102, 110)
+        await self.store.checkpoint(160)
+        self.assertTrue(await self.store.untrack_user(USER, 99, 190))
+        await self.reopen(400)  # A crash right after the untrack.
+        self.assertEqual(self.rows(
+            "SELECT user_id, ended_at FROM voice_visits ORDER BY user_id"
+        ), [("22", 190.0), ("23", 190.0)])
+        self.assertEqual(self.rows("SELECT ended_at FROM coverage_intervals"), [(190.0,)])
+        self.assertEqual(self.rows("SELECT started_at FROM coverage_gaps"), [(190.0,)])
+        self.assertEqual((await self.store.stats(OTHER, "all", 400))["voice_seconds"], 80)
+
+    async def test_deleting_someone_known_only_as_a_companion_anonymizes_them(self) -> None:
+        await self.store.connect(100)
+        await self.store.voice_transition(USER, 101, 110, companions={31})
+        await self.store.voice_transition(USER, None, 170)
+        await self.store.maintenance(180, 90)
+        self.assertTrue(await self.store.delete_user_data(31, 99, 200))
+        self.assertEqual(list(self.backups.glob("flock-cctv-*.sqlite3")), [])
+        self.assertEqual(
+            await self.store.company_totals(USER, "all", 200),
+            [{"channel_id": 101, "member_id": -2, "seconds": 60.0, "full_seconds": 60.0}],
+        )
+        self.assertEqual((await self.store.stats(USER, "all", 200))["voice_seconds"], 60)
+        self.assertFalse(await self.store.delete_user_data(31, 99, 210))
 
     async def test_pause_closes_every_open_segment_as_incomplete(self) -> None:
         await self.store.connect(100)
@@ -1072,17 +1131,17 @@ class MultiPersonStoreTests(unittest.IsolatedAsyncioTestCase):
         await self.store.voice_transition(USER, 101, 110, companions={OTHER})
         await self.store.voice_transition(OTHER, 101, 110, companions={USER})
         await self.store.voice_transition(THIRD, 102, 110)
-        await self.store.companion_transition(101, 31, True, 150)  # USER/OTHER 150, THIRD 110.
+        await self.store.companion_transition(101, 31, True, 150)  # Credits everyone to 150.
         await self.reopen(180)
         self.assertEqual(self.rows("SELECT COUNT(*) FROM voice_segments WHERE ended_at IS NULL"), [(0,)])
         self.assertEqual(self.rows("SELECT COUNT(*) FROM voice_company_current"), [(0,)])
         self.assertEqual(
             self.rows("SELECT user_id, ended_at, complete_end FROM voice_visits ORDER BY user_id"),
-            [("22", 150.0, 0), ("23", 150.0, 0), ("24", 110.0, 0)],
+            [("22", 150.0, 0), ("23", 150.0, 0), ("24", 150.0, 0)],
         )
-        # The restart gap begins at the oldest recovery point and stays open.
+        # The restart gap begins at the shared recovery point and stays open.
         user = await self.store.stats(USER, "all", 180)
-        self.assertEqual((user["voice_seconds"], user["gap_seconds"]), (40, 70))
+        self.assertEqual((user["voice_seconds"], user["gap_seconds"]), (40, 30))
         self.assertEqual((await self.store.stats(OTHER, "all", 180))["voice_seconds"], 40)
 
         await self.store.connect(200)
@@ -1318,15 +1377,19 @@ class MultiPersonStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 self.rows(f"SELECT COUNT(*) FROM {table} WHERE user_id = '22'"), [(0,)], table
             )
-        # OTHER's statistics, including the deleted person as their companion, stay.
+        # OTHER keeps the shared time, but their history no longer names USER.
         self.assertEqual(self.rows(
-            "SELECT COUNT(*) FROM voice_company_daily WHERE user_id = '23' AND member_id = '22'"
-        ), [(1,)])
+            "SELECT member_id, seconds, full_seconds FROM voice_company_daily WHERE user_id = '23'"
+        ), [(DELETED_COMPANION_ID, 90.0, 90.0)])
         other = await self.store.stats(OTHER, "all", 300)
         self.assertEqual((other["messages"], other["voice_seconds"]), (1, 190))
+        # USER is still in the call, so OTHER's live roster still counts them from 200.
         self.assertEqual(
             await self.store.company_totals(OTHER, "all", 300),
-            [{"channel_id": 101, "member_id": 22, "seconds": 190.0, "full_seconds": 190.0}],
+            [
+                {"channel_id": 101, "member_id": -2, "seconds": 90.0, "full_seconds": 90.0},
+                {"channel_id": 101, "member_id": 22, "seconds": 100.0, "full_seconds": 100.0},
+            ],
         )
         # The other people are still collected; the deleted person is not tracked any more.
         self.assertTrue(await self.store.add_message(OTHER, 5, 30, 310))

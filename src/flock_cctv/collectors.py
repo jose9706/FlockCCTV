@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -38,6 +38,16 @@ def _id(obj: Any) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+# A voice snapshot, or a function that takes one. Passing the function lets the
+# Tracker read Discord's cache only once it holds its lock, so a member who
+# leaves while a command waits for the lock is not recorded as present.
+VoiceSnapshot = Mapping[int, int] | Callable[[], Mapping[int, int]]
+
+
+def _take_snapshot(snapshot: VoiceSnapshot) -> Mapping[int, int]:
+    return snapshot() if callable(snapshot) else snapshot
 
 
 class Tracker:
@@ -119,7 +129,7 @@ class Tracker:
             companions=self._snapshot_companions(snapshot, user_id, channel_id),
         )
 
-    async def _start_guild_collection(self, snapshot: Mapping[int, int], now: float) -> None:
+    async def _start_guild_collection(self, snapshot: VoiceSnapshot, now: float) -> None:
         self.collection_ready = False
         state = await self.store.state()
         self._collection_since = now
@@ -132,8 +142,9 @@ class Tracker:
         # span the outage when Store.connect sees it as already open.
         await self.store.disconnect(now)
         await self.store.connect(now)
+        members = _take_snapshot(snapshot)
         for user_id in sorted(self.tracked_ids):
-            await self._start_visit_from_snapshot(user_id, snapshot, now)
+            await self._start_visit_from_snapshot(user_id, members, now)
         self.collection_ready = True
         self._recovered("disconnect")
         self._recovered("guild unavailable")
@@ -146,7 +157,7 @@ class Tracker:
             self.connected = True
             self._shutdown = False
 
-    async def ready(self, snapshot: Mapping[int, int], now: float | None = None) -> None:
+    async def ready(self, snapshot: VoiceSnapshot, now: float | None = None) -> None:
         """Handle the initial ready event or a fresh session for the configured guild."""
         current = self._now(now)
         async with self._lock:
@@ -163,7 +174,7 @@ class Tracker:
                 raise
 
     async def guild_available(
-        self, snapshot: Mapping[int, int], now: float | None = None
+        self, snapshot: VoiceSnapshot, now: float | None = None
     ) -> None:
         """Reconcile cached voice state when the configured guild returns."""
         current = self._now(now)
@@ -388,7 +399,7 @@ class Tracker:
                 self._record_error("pause", exc)
                 raise
 
-    async def resume(self, actor_id: int, snapshot: Mapping[int, int]) -> None:
+    async def resume(self, actor_id: int, snapshot: VoiceSnapshot) -> None:
         current = time.time()
         async with self._lock:
             try:
@@ -421,7 +432,7 @@ class Tracker:
                 raise
 
     async def track_user(
-        self, user_id: int, actor_id: int, snapshot: Mapping[int, int]
+        self, user_id: int, actor_id: int, snapshot: VoiceSnapshot
     ) -> bool:
         """Start tracking a person; return False when they were already tracked.
 
@@ -429,15 +440,17 @@ class Tracker:
         channel, an incomplete-start visit begins at this moment: the bot did
         not observe them joining.
         """
-        current = time.time()
         async with self._lock:
+            current = time.time()
             try:
                 added = await self.store.track_user(user_id, actor_id, current)
                 await self._refresh_tracked()
                 if added and self._collecting():
                     state = await self.store.state()
                     if not state["paused"]:
-                        await self._start_visit_from_snapshot(user_id, snapshot, current)
+                        await self._start_visit_from_snapshot(
+                            user_id, _take_snapshot(snapshot), current
+                        )
                 self._recovered("track user")
                 return added
             except Exception as exc:

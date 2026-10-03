@@ -650,6 +650,21 @@ class TrackedListTests(unittest.IsolatedAsyncioTestCase):
         # Their own messages count from now on.
         self.assertTrue(await tracker.message(message(message_id=7, user_id=22, created=181.0)))
 
+    async def test_snapshot_functions_are_read_only_while_holding_the_lock(self):
+        store, tracker = await self.live_tracker(active=frozenset({20}))
+        seen = []
+
+        def take():
+            seen.append(tracker._lock.locked())
+            return {22: 40}
+
+        with patch("flock_cctv.collectors.time.time", return_value=180.0):
+            self.assertTrue(await tracker.track_user(22, 99, take))
+        self.assertEqual(seen, [True])
+        self.assertEqual(store.transitions, [(22, 40, 180.0, False)])
+        await tracker.ready(take, now=200.0)
+        self.assertEqual(seen, [True, True])
+
     async def test_track_user_not_in_voice_only_updates_the_tracked_set(self):
         store, tracker = await self.live_tracker()
         with patch("flock_cctv.collectors.time.time", return_value=180.0):

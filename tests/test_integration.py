@@ -87,7 +87,8 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 sync.assert_awaited_once_with(guild=discord.Object(id=GUILD_ID))
                 groups = bot.tree.get_commands(guild=discord.Object(id=GUILD_ID))
                 self.assertEqual({group.name for group in groups}, {"flock"})
-                self.assertTrue(bot.intents.message_content)
+                # Without Leland mode nothing reads message text.
+                self.assertFalse(bot.intents.message_content)
                 self.assertTrue(bot.intents.presences)
                 self.assertTrue(bot.intents.guild_messages)
                 self.assertTrue(bot.intents.voice_states)

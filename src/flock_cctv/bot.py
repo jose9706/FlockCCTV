@@ -54,7 +54,9 @@ class TrackerClient(discord.Client):
         intents.guild_messages = True
         intents.voice_states = True
         intents.presences = True
-        intents.message_content = True
+        # Only Evil Leland reposts read message text; without Leland mode the bot
+        # does not request the privileged Message Content intent at all.
+        intents.message_content = config.leland_user_id is not None
         super().__init__(
             intents=intents,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -139,7 +141,7 @@ class TrackerClient(discord.Client):
         if tracker.connected and not tracker.collection_ready and self.is_ready():
             guild = self.get_guild(self.config.guild_id)
             if guild is not None and not getattr(guild, "unavailable", False):
-                await tracker.guild_available(self.voice_snapshot())
+                await tracker.guild_available(self.voice_snapshot)
         await tracker.checkpoint()
 
     async def _maintenance_loop(self) -> None:
@@ -274,7 +276,7 @@ class TrackerClient(discord.Client):
         if guild is None or getattr(guild, "unavailable", False):
             return
         if not was_connected or not tracker.guild_is_available or not tracker.collection_ready:
-            await tracker.ready(self.voice_snapshot())
+            await tracker.ready(self.voice_snapshot)
 
     async def on_ready(self) -> None:
         try:
@@ -323,7 +325,7 @@ class TrackerClient(discord.Client):
         if tracker is None:
             return
         try:
-            await tracker.guild_available(self.voice_snapshot())
+            await tracker.guild_available(self.voice_snapshot)
         except Exception:
             logger.exception("Could not reconcile collection after guild recovery")
 
@@ -358,7 +360,7 @@ class TrackerClient(discord.Client):
         if tracker is None:
             return
         try:
-            await tracker.guild_available(self.voice_snapshot())
+            await tracker.guild_available(self.voice_snapshot)
         except Exception:
             logger.exception("Could not reconcile collection after joining configured guild")
 

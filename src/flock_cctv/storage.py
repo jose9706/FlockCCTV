@@ -56,6 +56,11 @@ def _is_managed_backup(name: str) -> bool:
     return bool(name in _NAMED_BACKUPS or _BACKUP_RE.fullmatch(name) or _BACKUP_TEMP_RE.fullmatch(name))
 
 
+# Company member ID that replaces a person whose data was deleted, in other
+# people's history. 0 is the alone slice; real Discord IDs are positive.
+DELETED_COMPANION_ID = "-2"
+
+
 class StoreError(RuntimeError):
     """Base error for invalid or unavailable store operations."""
 
@@ -368,13 +373,27 @@ class Store:
             "ORDER BY interval_id DESC LIMIT 1"
         ).fetchone()
 
-    @staticmethod
-    def _advance_checkpoint(conn: sqlite3.Connection, at: float) -> None:
-        """Move the reliable-coverage checkpoint forward, never back.
+    def _advance_checkpoint(self, conn: sqlite3.Connection, at: float) -> None:
+        """Bring every open segment and the shared coverage checkpoint up to ``at``.
 
-        Several people's events share one coverage interval, so a person with
-        a lagging segment must not pull the shared checkpoint behind another's.
+        Several people share one coverage interval. When one person's event
+        advances it, everyone else's open segment is credited through the same
+        moment (their rosters did not change in between), exactly as the
+        periodic checkpoint does. Otherwise a restart would close a lagging
+        segment before the coverage end: watched time without its voice time.
+        Nothing moves backwards.
         """
+        for segment in self._open_segments(conn):
+            checkpoint = float(segment["checkpoint"])
+            if checkpoint >= at:
+                continue
+            user_text = str(segment["user_id"])
+            self._add_voice_time(conn, user_text, int(segment["visit_id"]), checkpoint, at)
+            conn.execute(
+                "UPDATE voice_segments SET checkpoint = ? WHERE segment_id = ?",
+                (at, int(segment["segment_id"])),
+            )
+            self._record_last_voice(conn, user_text, str(segment["channel_id"]), at)
         conn.execute(
             "UPDATE coverage_intervals SET checkpoint = MAX(checkpoint, ?) "
             "WHERE ended_at IS NULL",
@@ -885,7 +904,7 @@ class Store:
             conn = self._conn()
 
             def action() -> bool:
-                self._settings(conn)
+                settings = self._settings(conn)
                 row = self._tracked_row(conn, user_text)
                 if row is None or not bool(row["active"]):
                     return False
@@ -896,6 +915,8 @@ class Store:
                     self._finish_visit(
                         conn, int(segment["visit_id"]), ended, complete_end=False
                     )
+                    if bool(settings["connected"]) and not bool(settings["paused"]):
+                        self._advance_checkpoint(conn, ended)
                 conn.execute(
                     "DELETE FROM voice_company_current WHERE user_id = ?", (user_text,)
                 )
@@ -1098,9 +1119,11 @@ class Store:
     ) -> None:
         """Update every tracked roster in a channel at an observed join or leave.
 
-        Each other person whose open segment and roster are in ``channel_id``
-        is attributed time through ``now`` first; a roster that already
-        matches is skipped, and the member's own segment is never touched.
+        Every open segment is first credited through ``now`` with the rosters
+        that applied until then; each other person whose open segment and
+        roster are in ``channel_id`` then gains or loses ``member_id``. A
+        roster that already matches is skipped, and the member's own segment
+        is never touched.
         """
         now = self._timestamp(now)
         channel_text = str(int(channel_id))
@@ -1113,6 +1136,8 @@ class Store:
                 settings = self._settings(conn)
                 if bool(settings["paused"]) or not bool(settings["connected"]):
                     return
+                self._advance_checkpoint(conn, now)
+                # Fetch after crediting so every checkpoint read below is current.
                 for segment in self._open_segments(conn):
                     user_text = str(segment["user_id"])
                     if user_text == member_text or str(segment["channel_id"]) != channel_text:
@@ -1125,16 +1150,8 @@ class Store:
                     members = set(json.loads(company["member_ids"]))
                     if (member_text in members) == joined:
                         continue
+                    # A checkpoint ahead of ``now`` (clock step) keeps its later time.
                     at = max(now, float(segment["checkpoint"]))
-                    self._add_voice_time(
-                        conn, user_text, int(segment["visit_id"]),
-                        float(segment["checkpoint"]), at,
-                    )
-                    conn.execute(
-                        "UPDATE voice_segments SET checkpoint = ? WHERE segment_id = ?",
-                        (at, int(segment["segment_id"])),
-                    )
-                    self._record_last_voice(conn, user_text, channel_text, at)
                     if joined:
                         members.add(member_text)
                     else:
@@ -1144,7 +1161,6 @@ class Store:
                         "WHERE user_id = ?",
                         (json.dumps(sorted(members)), at, user_text),
                     )
-                    self._advance_checkpoint(conn, at)
 
             self._transaction(conn, action)
 
@@ -1981,9 +1997,10 @@ class Store:
         """Erase one person's statistics and tracked-list row, leaving others untouched.
 
         Managed backups are removed first because they hold this person's data.
-        Rows where the person appears only as a companion in someone else's
-        company belong to that other person and stay. Global collection is not
-        paused. ``reset_legacy_modes`` also switches the Leland-only evil and
+        Time they shared with someone else stays in that person's company
+        history, credited to ``DELETED_COMPANION_ID`` instead of their ID, so
+        other people's slices still add up. A live roster is current state, not
+        history, and is left alone. Global collection is not paused. ``reset_legacy_modes`` also switches the Leland-only evil and
         reaction modes off. Returns False when nothing existed for the person.
         """
         self._timestamp(now)
@@ -2001,7 +2018,9 @@ class Store:
                     "voice_visits", "voice_company_current", "voice_company_daily",
                     "last_voice", "records",
                 )
-            )
+            ) or conn.execute(
+                "SELECT 1 FROM voice_company_daily WHERE member_id = ? LIMIT 1", (user_text,)
+            ).fetchone() is not None
             if existed:
                 # As with global deletion: erase backups before the live rows, and
                 # keep the database intact if a managed backup cannot be removed.
@@ -2018,6 +2037,20 @@ class Store:
                 conn.execute("DELETE FROM records WHERE user_id = ?", (user_text,))
                 conn.execute("DELETE FROM tracking_intervals WHERE user_id = ?", (user_text,))
                 conn.execute("DELETE FROM tracked_users WHERE user_id = ?", (user_text,))
+                # Other people's company history keeps the shared time, so their
+                # slices still add up, but no longer names this person.
+                conn.execute(
+                    """INSERT INTO voice_company_daily(
+                           user_id, day, channel_id, member_id, seconds, full_seconds
+                       )
+                       SELECT user_id, day, channel_id, ?, seconds, full_seconds
+                       FROM voice_company_daily WHERE member_id = ?
+                       ON CONFLICT(user_id, day, channel_id, member_id) DO UPDATE SET
+                           seconds = seconds + excluded.seconds,
+                           full_seconds = full_seconds + excluded.full_seconds""",
+                    (DELETED_COMPANION_ID, user_text),
+                )
+                conn.execute("DELETE FROM voice_company_daily WHERE member_id = ?", (user_text,))
                 if reset_legacy_modes:
                     conn.execute(
                         "UPDATE settings SET evil_mode = 0, reaction_mode = 0, "
@@ -2121,4 +2154,4 @@ class Store:
         await self._run(operation)
 
 
-__all__ = ["Store", "StoreError"]
+__all__ = ["DELETED_COMPANION_ID", "Store", "StoreError"]

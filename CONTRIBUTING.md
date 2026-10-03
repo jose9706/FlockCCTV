@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve Leland Tracker. Small fixes and focused features are
+Thanks for helping improve Flock CCTV. Small fixes and focused features are
 welcome. For a larger change, open an issue first so we can agree on its scope.
 
 1. Fork the repository and open a pull request against `main`. Describe what

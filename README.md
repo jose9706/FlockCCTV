@@ -1,14 +1,32 @@
-# Leland Tracker
+# Flock CCTV
 
-Leland Tracker is a small Discord bot that counts the configured user's messages
-and measures observed time in configured voice channels. It stores statistics in
-SQLite and is designed to run as a systemd service on the Raspberry Pi.
-It requires Python 3.11 or newer; the pinned dependencies were checked on
-Debian 13, aarch64, with Python 3.13.
+Flock CCTV (Flock for short) is a small Discord bot that counts the messages of
+an admin-managed list of people and measures their observed time in configured
+voice channels. It stores statistics in SQLite and is designed to run as a
+systemd service on the Raspberry Pi. It requires Python 3.11 or newer; the
+pinned dependencies were checked on Debian 13, aarch64, with Python 3.13.
+This is release 1.0.0. It replaces the single-person Leland Tracker; existing
+Leland Tracker data moves over once with the import in
+[Migrating from Leland Tracker](#migrating-from-leland-tracker).
 
 The product scope and measurement definitions are in [DESIGN.md](DESIGN.md).
 The implementation interfaces are in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 To propose a change, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Who is tracked
+
+Nobody is tracked by default. The owner and tracker admins choose who is
+tracked in Discord with `/flock track add user:@member` and stop with
+`/flock track remove user_id:ID`; `/flock track list` shows everyone. Counting
+starts at the moment someone is added and stops the moment they are removed.
+Removing someone keeps their recorded history, and adding them again resumes
+into it. The time in between is shown as missing coverage, never as quiet time.
+Bots cannot be tracked.
+
+Tell people before you track them. The bot records message counts and voice
+connection time for each tracked person, and any server member can see those
+reports. A person can ask an admin to stop tracking them or to erase their data
+with `/flock delete-data user:@member` (or `user_id:` after they leave).
 
 ## Configure Discord
 
@@ -18,59 +36,67 @@ To propose a change, see [CONTRIBUTING.md](CONTRIBUTING.md).
 3. Under **Installation**, enable **Guild Install** and choose the `bot` and
    `applications.commands` scopes. Use the install link to add the bot to the
    configured server.
-4. Give it View Channel in the channels to collect from, plus Add Reactions
-   wherever reaction mode should work, and Send Messages
-   wherever it may reply to a direct mention or repost Evil Leland text. Embed
-   Links is needed in a configured report channel. Reposting inside threads
-   additionally needs Send Messages in Threads for those threads. Read Message
-   History is needed only for `/leland tldr`, in the text channels it may
-   summarize.
+4. Give it View Channel in the channels to collect from. Embed Links is needed
+   in a configured report channel. For the optional Leland-only features (see
+   [Leland-only legacy features](#leland-only-legacy-features)), add Add
+   Reactions wherever reaction mode should work, and Send Messages wherever the
+   bot may reply to a direct mention or repost Evil Leland text. Reposting inside
+   threads additionally needs Send Messages in Threads for those threads. The
+   bot does not need Administrator.
 
 These portal steps follow [Discord's setup guide](https://docs.discord.com/developers/quick-start/getting-started).
 The bot uses the `GUILDS`, `GUILD_MESSAGES`, `GUILD_VOICE_STATES`, and privileged
-`GUILD_PRESENCES` and `MESSAGE_CONTENT` Gateway intents. Enable **Presence Intent**
-and **Message Content Intent** on the app's **Bot** page in the Developer Portal.
-The bot does not need server-members access. It reads message text to create
-Evil Leland reposts and checks mention metadata for its fixed mention reply.
-Message bodies are not saved to SQLite or logs.
+`GUILD_PRESENCES` Gateway intents. Enable **Presence Intent** on the app's **Bot**
+page in the Developer Portal. With `LELAND_USER_ID` set it also requests the
+privileged `MESSAGE_CONTENT` intent, so enable **Message Content Intent** too in
+that case; it reads message text only to create Evil Leland reposts. Without
+`LELAND_USER_ID` the bot never requests message text. The fixed mention reply
+uses mention metadata. The bot does not need server-members access. Message
+bodies are not saved to SQLite or logs.
 
-Create a private `.env` file once from `.env.example` and set `DISCORD_TOKEN`, `GUILD_ID`,
-`TARGET_USER_ID`, and `OWNER_USER_ID`. Set `ADMIN_USER_IDS` to a comma-separated
-list of other trusted Discord user IDs, or leave it blank. Only the owner and
-effective extra admins can pause, resume, delete data, or toggle Evil Leland and
-reaction modes.
-Discord server permissions do not grant tracker control. The target user ID
-cannot be listed as an admin.
+Create a private `.env` file once from `.env.example` and set `DISCORD_TOKEN`,
+`GUILD_ID`, and `OWNER_USER_ID`. Set `ADMIN_USER_IDS` to a comma-separated list
+of other trusted Discord user IDs, or leave it blank. Only the owner and
+effective extra admins can pause, resume, delete data, manage the tracked list,
+or toggle Leland's modes. Discord server permissions do not grant tracker
+control. Admins may themselves be tracked.
 The configured owner can grant a server member access immediately with
-`/leland admin add user:@member`, revoke any extra admin with
-`/leland admin remove user_id:ID`, and see the owner and current admins, by display name, username, and ID, with
-`/leland admin list`. These replies are private. Grants and revocations are
-stored in SQLite and survive restarts. A revocation takes precedence over
-`ADMIN_USER_IDS`; the configured owner cannot be revoked. Data deletion retains
-admin settings, while restoring an older database backup restores the admin
-settings captured in that backup. Keep `OWNER_USER_ID` in the private environment
-file as the recovery owner.
+`/flock admin add user:@member`, revoke any extra admin with
+`/flock admin remove user_id:ID`, and see the owner and current admins, by
+display name, username, and ID, with `/flock admin list`. These replies are
+private. Grants and revocations are stored in SQLite and survive restarts. A
+revocation takes precedence over `ADMIN_USER_IDS`; the configured owner cannot
+be revoked. Data deletion retains admin settings and the tracked list, while
+restoring an older database backup restores the admin settings and tracked list
+captured in that backup. Keep `OWNER_USER_ID` in the private environment file as
+the recovery owner.
+
+`LELAND_USER_ID` is optional. Set it to Leland's Discord user ID to keep the
+features that only ever applied to him; leave it blank otherwise. Leland cannot
+be the owner or an admin, and he must also be added with `/flock track add` for
+his messages to count. A leftover `TARGET_USER_ID` from Leland Tracker is
+ignored.
+
 The example collects in all text and voice channels the bot
 can see. Set `TEXT_CHANNEL_IDS` and `VOICE_CHANNEL_IDS` to comma-separated
 channel IDs to narrow collection. Stats and records omit per-channel totals and
-names; `/leland where` follows the visibility rules described below.
-`/leland company` charts observed time shared with human companions in those
-voice channels. Each minute is divided evenly among everyone else present;
-time alone is a separate slice. It starts collecting when this update runs,
-so earlier companion time cannot be reconstructed.
+names; `/flock where` follows the visibility rules described below.
+`/flock company` charts observed time a tracked person shared with human
+companions in those voice channels. Each minute is divided evenly among everyone
+else present, tracked or not; time alone is a separate slice. A person's company
+is recorded only while they are tracked, so earlier companion time cannot be
+reconstructed.
 
 Commands work anywhere in the configured server when `OUTPUT_CHANNEL_ID` is
 blank. Set `PUBLIC_REPORT_CHANNEL_IDS` to comma-separated channel IDs to make
-`/leland stats`, `records`, `where`, `company`, `leaderboard`, `trends`, `roast`, `tldr`, and `help` public only when called in those
+`/flock stats`, `records`, `where`, `company`, `leaderboard`, `trends`, `roast`,
+`top`, and `help` public only when called in those
 channels; other channels get private replies. Set it to `*` for public reports
 in every channel. The legacy `OUTPUT_CHANNEL_ID` setting restricts all commands to one
-channel and makes general reports public there. `/leland online`, `/leland
-about`, `/leland version`, and the admin controls are always private.
+channel and makes general reports public there. `/flock online`, `/flock about`,
+`/flock version`, `/flock track` and `/flock admin` commands, and the admin
+controls are always private.
 The report timezone defaults to `America/Costa_Rica`.
-`TLDR_MODEL_URL` optionally points `/leland tldr` at a local llama-server
-(for example `http://127.0.0.1:8089`); it must be `localhost` or a loopback
-address so message text never leaves the machine. Leave it blank to disable TL;DR. See
-[Local TL;DR model](#local-tldr-model-optional).
 
 ## Quick start (local)
 
@@ -102,7 +128,8 @@ export BACKUP_DIR=data/backups
 
 The template uses service paths under `/var/lib/flock-cctv`; the overrides
 above keep a foreground run's database and backups inside the ignored `data/`
-directory. Stop the foreground process with Ctrl-C.
+directory. Stop the foreground process with Ctrl-C. Once it is running, add
+people with `/flock track add`.
 
 Never add the filled-in environment file to Git. `.gitignore` excludes it,
 runtime data, SQLite files, backups, and Python build artifacts.
@@ -137,20 +164,29 @@ sudoedit /etc/flock-cctv.env
 
 The template sets the database and managed backup directory under
 `/var/lib/flock-cctv`. systemd creates that state directory with access for
-the service account. Install the recovery helper outside the code tree, then
-install and start the service:
+the service account. Install the recovery helper outside the code tree and the
+service unit:
 
 ```sh
 sudo install -d -o root -g root -m 0755 /usr/local/libexec
 sudo install -o root -g root -m 0755 /opt/flock-cctv/deploy/update.py /usr/local/libexec/flock-cctv-update.py
 sudo install -o root -g root -m 0644 /opt/flock-cctv/deploy/flock-cctv.service /etc/systemd/system/flock-cctv.service
 sudo systemctl daemon-reload
+```
+
+Replacing a running Leland Tracker? Stop here and do
+[Migrating from Leland Tracker](#migrating-from-leland-tracker) before the first
+start: the import refuses to write into a database that already exists. For a
+fresh install, start the service:
+
+```sh
 sudo systemctl enable --now flock-cctv.service
 sudo systemctl status flock-cctv.service
 ```
 
 The first startup registers guild-scoped slash commands. Check the service
-logs, then run `/leland about` in the configured server:
+logs, then run `/flock about` in the configured server and add the first people
+with `/flock track add`:
 
 ```sh
 sudo journalctl -u flock-cctv.service -n 100 --no-pager
@@ -160,67 +196,149 @@ sudo journalctl -u flock-cctv.service -f
 The bot makes an outbound Discord Gateway connection. It does not require a
 public web server, inbound port, or port forwarding.
 
-The bot mirrors the target's current server avatar with inverted colours. It
-checks when it connects and then every hour. It also refreshes the avatar if the
-bot profile was changed manually; animated source avatars use their first frame.
-This task runs independently of collection pause and data deletion. A small
-marker file beside the database prevents repeating an unchanged profile edit.
+## Leland-only legacy features
 
-## Local TL;DR model (optional)
+When `LELAND_USER_ID` is set, these features that came from Leland Tracker work
+for that one user and for nobody else. Without it they are off, the two toggle
+commands reply that Leland mode isn't configured, and `/flock help` and
+`/flock about` leave them out.
 
-`/leland tldr` sends up to 40 of Leland's latest message texts to a model
-running on the same machine. Nothing leaves the Pi, and neither the texts nor
-the summary are stored or logged.
+- Evil mode (`/flock evil-mode`) reposts upside-down versions of his new text
+  messages.
+- Reaction mode (`/flock reaction-mode`) occasionally reacts to his newly counted
+  ordinary messages.
+- The bot mirrors his current server avatar with inverted colours. It checks when
+  it connects and then every hour. It also refreshes the avatar if the bot
+  profile was changed manually; animated source avatars use their first frame.
+  This task runs independently of collection pause and data deletion. A small
+  marker file beside the database prevents repeating an unchanged profile edit.
+- A direct mention of the bot gets the fixed reply described under
+  [Commands](#commands).
 
-The recommended model is **Qwen3-4B-Instruct-2507** at `Q4_K_M` quantization
-(about 2.5 GB). On a Pi 5 it needs about 3.4 GB of RAM and takes roughly
-45–60 seconds for a typical week and up to about two and a half minutes when
-every message is long. The bot caps the prompt at 40 messages and 4,000
-characters. Smaller models (Llama 3.2 3B, Qwen2.5 1.5B/3B) are faster but
-produce flatter summaries. Use the Pi 5's active cooler: a TL;DR is a short
-burst of full CPU load, and long back-to-back runs can reach the 80 °C soft
-throttling limit.
+Both modes act only on messages that are counted, so Leland must be tracked, and
+they stop while collection is paused. Deleting everyone's data, or deleting
+Leland's data, turns both modes off.
 
-Build llama.cpp's `llama-server` and install it under `/opt/llama.cpp`:
+## Migrating from Leland Tracker
 
-```sh
-sudo apt install -y build-essential cmake git
-git clone https://github.com/ggml-org/llama.cpp ~/llama.cpp
-cmake -S ~/llama.cpp -B ~/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF
-cmake --build ~/llama.cpp/build --config Release -j3 --target llama-server
-sudo install -D -m 0755 ~/llama.cpp/build/bin/llama-server /opt/llama.cpp/bin/llama-server
-```
+This is a one-time move on the Pi from the old single-person bot to Flock. The
+import copies the old database into a new Flock database; the old database file
+is never modified, so the old install stays available as a rollback until you
+delete it. The paths and unit names below are the Leland Tracker defaults
+(`leland-tracker`, `/var/lib/leland-tracker`, `/etc/leland-tracker.env`); adjust
+them if your install differs. Only a schema version 9 Leland Tracker database
+can be imported. If you reuse the old Discord application and token, the old
+`/leland` commands disappear from the server the first time Flock starts.
 
-The static build produces one self-contained binary. The build takes roughly
-15–20 minutes on a Pi 5.
+1. Install Flock as described in [Install the systemd service](#install-the-systemd-service)
+   up to and including `daemon-reload`, but do not start it. Fill in
+   `/etc/flock-cctv.env`: copy `DISCORD_TOKEN`, `GUILD_ID`, `OWNER_USER_ID`,
+   `ADMIN_USER_IDS`, the channel settings, and `TIMEZONE` from the old file, and
+   set `LELAND_USER_ID` to the old `TARGET_USER_ID`. `TIMEZONE` and `GUILD_ID`
+   must match the old database. Environment admins live in the file, not the
+   database, so copy `ADMIN_USER_IDS` too. Do not add `TARGET_USER_ID`.
 
-Download the model and install it:
+2. Stop the old bot and everything that could restart it or run it again. Two
+   bots must not share one token, and the old updater must not redeploy the old
+   code:
 
-```sh
-curl -L -o model.gguf https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
-sudo install -d -m 0700 /var/lib/private
-sudo install -d -m 0755 /var/lib/private/flock-cctv-llm
-sudo install -m 0644 ./model.gguf /var/lib/private/flock-cctv-llm/model.gguf
-```
+   ```sh
+   sudo systemctl disable --now leland-tracker-update.timer leland-tracker-update.path
+   sudo systemctl stop leland-tracker-update.service
+   sudo systemctl disable --now leland-tracker.service leland-tracker-llm.service
+   systemctl list-units 'leland-tracker*'
+   ```
 
-With `DynamicUser=yes`, systemd keeps the state directory at
-`/var/lib/private/flock-cctv-llm` and exposes it to the service as
-`/var/lib/flock-cctv-llm`, so the unit reads
-`/var/lib/flock-cctv-llm/model.gguf`. Install and start the unit, then
-enable TL;DR in the bot's environment:
+3. Snapshot the old database with SQLite's backup API as the old service
+   account, copy it into Flock's state directory, and check it. The snapshot is
+   a second copy of Leland's data, so delete both copies when the migration is
+   done. Keep it outside `BACKUP_DIR`, which `/flock delete-data` manages.
 
-```sh
-sudo install -o root -g root -m 0644 deploy/flock-cctv-llm.service /etc/systemd/system/flock-cctv-llm.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now flock-cctv-llm.service
-curl -s http://127.0.0.1:8089/health
-sudoedit /etc/flock-cctv.env   # set TLDR_MODEL_URL=http://127.0.0.1:8089
-sudo systemctl restart flock-cctv.service
-```
+   ```sh
+   sudo -u leland-tracker python3 - <<'PY'
+   import sqlite3
 
-The server listens only on `127.0.0.1`, runs at lower CPU priority, and is
-capped at 4.5 GB of memory. It loads the model into RAM rather than memory-mapping it and
-disables thinking mode and the extra RAM prompt cache.
+   source = sqlite3.connect("/var/lib/leland-tracker/tracker.sqlite3")
+   destination = sqlite3.connect("/var/lib/leland-tracker/leland-snapshot.sqlite3")
+   source.backup(destination)
+   destination.close()
+   source.close()
+   PY
+   sudo install -o flock-cctv -g flock-cctv -m 0640 /var/lib/leland-tracker/leland-snapshot.sqlite3 /var/lib/flock-cctv/leland-snapshot.sqlite3
+   sudo rm /var/lib/leland-tracker/leland-snapshot.sqlite3
+   sudo sqlite3 -readonly /var/lib/flock-cctv/leland-snapshot.sqlite3 'PRAGMA integrity_check; PRAGMA user_version;'
+   ```
+
+   The first line printed must be `ok` and the second `9`.
+
+4. Run the import as the service account with a dry run first. It validates the
+   snapshot and prints row counts without writing anything:
+
+   ```sh
+   sudo -u flock-cctv sh -c 'set -a; . /etc/flock-cctv.env; set +a; exec /opt/flock-cctv/.venv/bin/python -m flock_cctv.legacy_import --source /var/lib/flock-cctv/leland-snapshot.sqlite3 --dry-run'
+   ```
+
+   If the counts look right, run the same command without `--dry-run`. The tool
+   takes `--source` (required), `--database`, `--backups`, `--guild-id`,
+   `--leland-user-id`, `--timezone`, and `--dry-run`. Apart from `--source`, each
+   option falls back to the `DATABASE_PATH`, `BACKUP_DIR`, `GUILD_ID`,
+   `LELAND_USER_ID`, and `TIMEZONE` environment variables, which is what the
+   command above uses. To pass them explicitly (the IDs here are made up):
+
+   ```sh
+   sudo -u flock-cctv /opt/flock-cctv/.venv/bin/python -m flock_cctv.legacy_import \
+     --source /var/lib/flock-cctv/leland-snapshot.sqlite3 \
+     --database /var/lib/flock-cctv/tracker.sqlite3 --backups /var/lib/flock-cctv/backups \
+     --guild-id 111111111111111111 --leland-user-id 222222222222222222 \
+     --timezone America/Costa_Rica
+   ```
+
+   It exits 0 and prints only counts: never IDs or message data. It exits
+   non-zero with a message, and removes a database it had just created, when the
+   source is not schema version 9, when its guild, tracked user, or timezone
+   differ from the arguments, when the destination already holds a Flock
+   database (it never merges), or when a copy or row-count check fails. A failed
+   import can be rerun after fixing the cause.
+
+5. Start Flock and check it:
+
+   ```sh
+   sudo systemctl enable --now flock-cctv.service
+   sudo journalctl -u flock-cctv.service -n 100 --no-pager
+   ```
+
+   In Discord, `/flock about` should show one tracked person, and
+   `/flock stats user:@Leland period:all` should show his old totals. The first
+   `/flock` sync replaces the server's command list, so `/leland` is gone and
+   `/flock` takes its place.
+
+6. Set up automatic updates for the new repository with the steps in
+   [Automatically update from the default branch](#automatically-update-from-the-default-branch).
+   Leland Tracker's deploy key cannot be reused: GitHub deploy keys belong to one
+   repository, so FlockCCTV needs its own new read-only key.
+
+7. When Flock has run correctly for a while, delete the snapshot
+   (`sudo rm /var/lib/flock-cctv/leland-snapshot.sqlite3`) and remove the old
+   service files, `/etc/leland-tracker.env`, `/opt/leland-tracker`, the old
+   deploy key, the old backups, and `/var/lib/leland-tracker`. Those copies
+   hold Leland's data and the old bot token, and Flock's deletion commands do
+   not manage them.
+
+What the import copies, all for Leland and keeping record IDs:
+
+- Leland becomes a tracked person, active since the old database's tracking
+  start, with an open tracking interval from that moment.
+- His whole history: message metadata and daily totals, voice visits and
+  segments, voice company (current roster and daily rows, including the whole
+  shared time), last voice observation, and records.
+- Collector state: coverage intervals and gaps, the pause state and who paused,
+  checkpoints, the pruning boundary, and the retention setting.
+- Owner-issued admin grants and revocations, and the evil-mode and reaction-mode
+  settings, including the reaction countdown.
+
+Anything the old bot had open when it stopped is closed by Flock's normal
+startup recovery at its last checkpoint and marked incomplete; the summary
+reports how many open voice segments that affects.
 
 ## Tests
 
@@ -234,8 +352,9 @@ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 
 The bot uses SQLite's backup API for managed daily backups and retains the
 seven most recent daily copies. These backups are stored in the configured
-`BACKUP_DIR`. Make sure the Pi has enough free space and that its clock stays
-synchronized. Backups run at startup and every 24 hours thereafter.
+`BACKUP_DIR` as `flock-cctv-YYYY-MM-DD.sqlite3`. Make sure the Pi has enough
+free space and that its clock stays synchronized. Backups run at startup and
+every 24 hours thereafter.
 
 To make an additional consistent copy while the service is running, use
 SQLite's backup API:
@@ -286,10 +405,13 @@ sudo systemctl start flock-cctv.service
 sudo systemctl status flock-cctv.service
 ```
 
-The two named copies above remain until overwritten or deleted. `/leland delete-data`
-removes them, the daily backups, and temporary backup files along with the tracked
-statistics. Keep these exact filenames in `BACKUP_DIR` so they remain covered by
-deletion. Copies placed elsewhere are operator-managed and need separate deletion.
+The two named copies above remain until overwritten or deleted. `/flock delete-data`
+removes them, the daily backups, and temporary backup files along with the
+tracked statistics, whether it erases everyone's data or one person's, because
+every backup contains that person's data. Keep these exact filenames in
+`BACKUP_DIR` so they remain covered by deletion. Copies placed elsewhere are
+operator-managed and need separate deletion. Restoring a backup also restores
+the tracked list and each person's history as they were when it was taken.
 
 ## Update and rollback
 
@@ -331,10 +453,12 @@ Pi needs outbound access to GitHub (SSH) and PyPI.
 
 ### Deploy key
 
-The repository is private, so the updater reads it with a dedicated read-only
-deploy key. Create the key on the Pi, pin GitHub's SSH host keys, then add the
-public key to the repository (**Settings → Deploy keys**, read-only, or with
-`gh repo deploy-key add`):
+The repository (`git@github.com:jose9706/FlockCCTV.git`) is private, so the
+updater reads it with a dedicated read-only deploy key. Create the key on the Pi,
+pin GitHub's SSH host keys, then add the public key to the repository
+(**Settings → Deploy keys**, read-only, or with `gh repo deploy-key add`). GitHub
+deploy keys belong to a single repository, so a key created for another
+repository, including Leland Tracker's, cannot be reused here:
 
 ```sh
 sudo install -d -o root -g root -m 0700 /etc/flock-cctv-deploy
@@ -367,7 +491,7 @@ sudo systemctl list-timers flock-cctv-update.timer
 sudo journalctl -u flock-cctv-update.service -n 100 --no-pager
 ```
 
-The path unit lets `/leland update` start a check without waiting for the
+The path unit lets `/flock update` start a check without waiting for the
 timer. The bot only writes `update-requested.json` in its state directory;
 systemd sees it and starts the same updater service, which deletes the file when
 it starts. A request made during a run starts one more run after it. The bot
@@ -409,9 +533,9 @@ The deployed commit is recorded in `/opt/flock-cctv/.deployed-revision`.
 
 After every run the updater writes `update-status.json` beside the database: the
 result, deployed commit, consecutive failures, and a short error. It holds no
-statistics or credentials. `/leland about` shows it, and the bot sends the
+statistics or credentials. `/flock about` shows it, and the bot sends the
 configured owner one DM when a run of failures starts (not on every failed
-poll). If the owner's DMs are closed, only `/leland about` and the journal
+poll). If the owner's DMs are closed, only `/flock about` and the journal
 show it.
 
 ### Roll back to an older commit
@@ -426,7 +550,7 @@ sudo GIT_SSH_COMMAND="ssh -i /etc/flock-cctv-deploy/id_ed25519 -o IdentitiesOnly
 sudo systemctl start flock-cctv-update.timer
 ```
 
-The hold survives restarts and `/leland about` shows it. Resume normal
+The hold survives restarts and `/flock about` shows it. Resume normal
 updates with the same command using `--release` instead of `--revision ...`.
 If the older commit cannot open a newer database schema, its startup check fails
 and the updater rolls back to the current code.
@@ -436,9 +560,9 @@ and the updater rolls back to the current code.
 The release number lives in `src/flock_cctv/__init__.py` (`__version__`,
 semantic versioning) and is bumped by hand in the pull request that changes
 behavior. The updater also stamps the deployed commit into the installed package,
-so the running version is `release (short commit)`, for example `0.2.0 (1a2b3c4)`:
+so the running version is `release (short commit)`, for example `1.0.0 (1a2b3c4)`:
 
-- `/leland version` replies privately with it; `/leland about` also shows it on its first line.
+- `/flock version` replies privately with it; `/flock about` also shows it on its second line.
 - The service journal logs `Starting flock-cctv <version>` at every start.
 - `/opt/flock-cctv/.venv/bin/python -m flock_cctv --version` prints it
   without needing the bot's environment file.
@@ -454,7 +578,7 @@ deploy/update.py` step above, auto-deploys report `revision unknown`;
 `/opt/flock-cctv/.deployed-revision` still holds the true commit.
 
 The backup is `flock-cctv-before-update.sqlite3` in `BACKUP_DIR`; it is
-replaced at the next update and `/leland delete-data` removes it. Temporary
+replaced at the next update and `/flock delete-data` removes it. Temporary
 SQLite backups from an interrupted update are also removed by that command.
 The bot token and database stay outside the installed code tree. If you use
 nondefault `DATABASE_PATH` or `BACKUP_DIR`, add matching `--database` and
@@ -471,74 +595,96 @@ though never as root.
 
 - **Service exits on startup:** check `systemctl status` and the journal above.
   Common causes are a missing or invalid token/ID, invalid timezone, missing
-  Python dependencies, or state-directory permissions.
+  Python dependencies, a `LELAND_USER_ID` that is also the owner or listed in
+  `ADMIN_USER_IDS`, or state-directory permissions.
 - **Slash commands are missing:** check the startup log and configured guild ID;
   confirm the app was installed with `bot` and `applications.commands` scopes.
   Presence and Message Content intents must be enabled in the portal.
-- **Counts or voice time stop changing:** check `/leland about`, confirm
-  collection is not paused, and check the channel allowlists and View Channel
-  access. Voice time is observed connection time, and the server AFK channel is
-  excluded.
-- **Database identity or timezone error:** use the original `GUILD_ID`,
-  `TARGET_USER_ID`, and `TIMEZONE` for that database. Changing timezone requires
-  a fresh database; it does not regroup existing statistics.
+- **Someone's counts or voice time are not recorded:** run `/flock track list`.
+  Only people on the tracked list are counted, and only from the moment they
+  were added. Bots cannot be tracked. A report about someone who was never added
+  says they aren't tracked.
+- **Counts or voice time stop changing for everyone:** check `/flock about`,
+  confirm collection is not paused, and check the channel allowlists and View
+  Channel access. Voice time is observed connection time, and the server AFK
+  channel is excluded.
+- **Database identity or timezone error:** use the original `GUILD_ID` and
+  `TIMEZONE` for that database. Changing timezone requires a fresh database; it
+  does not regroup existing statistics.
 - **Database instance lock:** run only one bot process against a database. Stop
   a duplicate foreground process or service; do not delete the `.lock` file to
   bypass the lock.
-- **Evil Leland does not repost:** confirm the mode is on, collection is
-  unpaused, the message is in a collected text channel, and the bot can send
-  messages there. It reposts text only; text is still reposted when the source
-  message also has attachments. Mentions and embeds are suppressed.
-- **The bot does not answer a direct mention:** replies work independently of
-  collection pause and channel allowlists, but the bot must receive the server
-  message and have permission to send in that channel.
-- **Avatar does not refresh:** check that the target is still in the configured
-  server and inspect the service journal for avatar update errors.
-- **TL;DR says the kitchen is closed:** the local model did not answer. Check
-  `systemctl status flock-cctv-llm.service`, its journal, and
-  `curl -s http://127.0.0.1:8089/health`; confirm `TLDR_MODEL_URL` matches the
-  server's host and port. The first request after a start can be slow while the
-  model loads.
+- **The import was refused:** read the message it printed. The usual causes are
+  a source that is not a schema version 9 Leland Tracker database, a
+  `--guild-id`, `--leland-user-id`, or `--timezone` that differs from the old
+  database, or a destination that already holds a Flock database. The import
+  never merges into an existing database.
+- **`/flock evil-mode` says Leland mode isn't configured:** set `LELAND_USER_ID`
+  in `/etc/flock-cctv.env` and restart the service.
+- **Evil Leland does not repost:** confirm `LELAND_USER_ID` is set, Leland is
+  tracked, the mode is on, collection is unpaused, the message is in a collected
+  text channel, and the bot can send messages there. It reposts text only; text
+  is still reposted when the source message also has attachments. Mentions and
+  embeds are suppressed.
+- **The bot does not answer a direct mention:** the reply exists only when
+  `LELAND_USER_ID` is set. It works independently of collection pause and
+  channel allowlists, but the bot must receive the server message and have
+  permission to send in that channel.
+- **Avatar does not refresh:** avatar mirroring needs `LELAND_USER_ID`. Check
+  that he is still in the configured server and inspect the service journal for
+  avatar update errors.
 
 ## Commands
 
-- `/leland stats` reports message totals, observed voice time, active days,
-  voice visits, and missing coverage for today, this week, this month, or all
-  time. The default period is this week.
-- `/leland records` shows the busiest message day, the longest fully observed
+All commands live under `/flock`. These reports take an optional `user` option
+("Whose activity to show"); omit it to see your own: `stats`, `records`,
+`where`, `company`, `leaderboard`, `trends`, `online`, and `roast`. A bot gets a
+private "Bots aren't tracked." reply, and someone who was never tracked gets a
+private reply saying so and pointing to `/flock track add`. For someone who was
+tracked and is no longer, the report works from their kept history and adds a
+"no longer tracked" line (`online` needs a currently tracked person). Titles and
+text use the person's display name, never a mention. Every period choice is
+today, this week, this month, or all time unless stated otherwise.
+
+- `/flock stats period: user:` reports message totals, observed voice time,
+  active days, voice visits, and missing coverage for the period. The default
+  period is this week. Each person has their own tracking start and gaps:
+  missing coverage includes the time they were not on the tracked list.
+- `/flock records user:` shows the busiest message day, the longest fully observed
   voice visit, how long a visit in progress has been observed so far, and the
   top voice companion since companion tracking began (same split-time measure
-  and channel visibility rules as `/leland company`).
-- `/leland where` shows the last observed voice channel and time, or that Leland
-  is currently in voice. It is public in configured report channels and private
-  elsewhere. A public reply names the voice channel only if the `@everyone` role
-  can view it;
+  and channel visibility rules as `/flock company`).
+- `/flock where user:` shows the last observed voice channel and time, or that the
+  person is currently in voice. It is public in configured report channels and
+  private elsewhere. A public reply names the voice channel only if the
+  `@everyone` role can view it;
   a private reply names it only if the requester can view it.
-- `/leland company` attaches a pie chart of observed voice time with each person
-  or alone for today, this week, this month, or all time. The default is this
-  week. Its image legend and text list show names, percentages, and durations.
+- `/flock company period: user:` attaches a pie chart of the person's observed
+  voice time with each companion or alone. The default is this week. Companions
+  are all humans in the same voice channel, tracked or not. Its image legend and
+  text list show names, percentages, and durations.
   Names are looked up from Discord when absent from the bot's cache; if Discord
   cannot provide a name, the report shows the user ID. Names are not stored.
   The chart includes only source voice channels visible to the requester
   for private replies or to `@everyone` for public replies. Time lost during
-  outages is never estimated. Member IDs and daily attributed totals are stored
-  in SQLite and managed backups; `/leland delete-data` erases them.
-- `/leland leaderboard` ranks the top 10 people by the whole observed voice
-  time they spent in a tracked channel with Leland. Unlike `/leland company`,
-  time is not split: an hour in a call with three people counts as an hour for
-  each of them. It uses the same channel visibility rules and name lookup as
-  `/leland company`. Time alone is shown but not ranked, and anyone past the
-  top 10 is counted on one line. Periods are today, this week, this month, or
-  all time; the default is all time. Company time recorded before whole shared
-  time was tracked counts as its split share, since the group size at the time
-  was not stored.
-- `/leland trends period: kind:` attaches a chart of how activity changes. The
+  outages is never estimated. Companion member IDs and daily attributed totals
+  are stored in SQLite and managed backups; deletion erases the subject's rows.
+- `/flock leaderboard period: user:` ranks the top 10 people by the whole observed
+  voice time they spent in a tracked channel with the person. Unlike
+  `/flock company`, time is not split: an hour in a call with three people counts
+  as an hour for each of them. It uses the same channel visibility rules and name
+  lookup as `/flock company`. Time alone is shown but not ranked, and anyone past
+  the top 10 is counted on one line. The default period is all time. Company
+  time recorded before whole shared time was tracked counts as its split share,
+  since the group size at the time was not stored.
+- `/flock trends period: kind: user:` attaches a chart of how activity changes. The
   default period is the last 7 days (today and the six days before it); pick
   `This week` to start on Monday instead. Kinds:
   - `daily` (default): messages and observed voice time per day (grouped by
     week or month for long periods), busiest day, active-day streaks, and ghost
-    days. A ghost day is a finished day the tracker watched in full with no
-    messages or voice; days it was disconnected or paused are never ghost days.
+    days. A ghost day is a finished day the tracker watched in full, while the
+    person was tracked, with no messages or voice; days it was disconnected or
+    paused, or the person was not tracked, are never ghost days.
   - `compare`: this period so far against the previous day, week, 7 days, or month up
     to the same point, from retained detail. It declines for all time, when
     tracking began during the previous period, or when that period is older
@@ -549,69 +695,93 @@ though never as root.
     activity or fully watched by the tracker; unwatched quiet days are left out.
   - `company`: stacked bars of companion time per day, week, or month with the
     top companion for recent buckets, under the same channel visibility rules
-    and name lookup as `/leland company`.
+    and name lookup as `/flock company`.
   - `bursts`: runs of messages sent within two minutes of each other, with the
     biggest burst, the average size, and the share in bursts of five or more.
   `hours`, `bursts`, and `compare` need message send times or voice sessions,
   which exist only within `RETENTION_DAYS`; replies say when a period reaches
-  past that. Other kinds use daily totals, which match `/leland stats` and do
+  past that. Other kinds use daily totals, which match `/flock stats` and do
   not filter by channel. Unobserved time is never filled in.
-- `/leland online` checks Leland's current Discord status. Online, Away, and Do
-  Not Disturb count as online. Offline may also mean Invisible. The reply is
-  private and no presence history is stored.
-- `/leland roast` produces a short joke from a real statistic and uses a
-  shared cooldown.
-- `/leland tldr` posts an AI-cooked, playful summary of Leland's latest messages
-  (this week by default, up to 40 messages). It fetches their text from Discord
-  on demand, only from channels and public threads visible to the requester for
-  private replies or to `@everyone` for public replies (never private threads),
-  and only messages the tracker
-  counted in the period. It runs on the local model set by `TLDR_MODEL_URL`,
-  stores nothing, is off while collection is paused, handles one request at a
-  time, and has a shared one-minute cooldown.
-- `/leland help` explains the measurements and available commands.
-- `/leland about` privately shows the bot version, connection health, collector
-  state, last checkpoint, recorded coverage gaps, and the last automatic update
-  result. All commands live under `/leland`; the old `/tracker` group was merged
-  into it in 0.5.0 and disappears from Discord when the bot next syncs commands
-  at startup.
-- `/leland version` privately shows the release number and deployed commit.
-- `/leland update` lets the configured owner and extra admins make the Pi check
+- `/flock online user:` checks a currently tracked person's Discord status.
+  Online, Away, and Do Not Disturb count as online. Offline may also mean
+  Invisible. The reply is private and no presence history is stored.
+- `/flock roast period: user:` produces a short joke from a real statistic about
+  the person (this week by default) and uses a shared cooldown.
+- `/flock top period: metric:` ranks the tracked people, top 10, by `Messages`
+  (the default), `Voice time`, or `Active days` for the period (this week by
+  default). People with nothing for that metric are left out, a former person
+  appears only if they have activity in the period and is marked as no longer
+  tracked, and the rest are counted on one line. It follows the general report
+  visibility rules and names no channels.
+- `/flock help` explains the measurements and available commands.
+- `/flock about` privately shows the bot version, connection health, collector
+  state, number of tracked people, last checkpoint, recorded coverage gaps, and
+  the last automatic update result. With `LELAND_USER_ID` set it also shows the
+  evil and reaction mode state. Coverage gaps here are the collector's global
+  outages.
+- `/flock version` privately shows the release number and deployed commit.
+- `/flock update` lets the configured owner and extra admins make the Pi check
   GitHub for a new commit now instead of waiting for the 15-minute poll. It
-  needs the update path unit from "Install the timer" below; without it the
+  needs the update path unit from "Install the timer" above; without it the
   request is picked up at the next scheduled poll.
-- `/leland pause`, `/leland resume`, and `/leland delete-data` control
+- `/flock pause`, `/flock resume`, and `/flock delete-data` control
   collection. Only the configured owner and extra admins can use these controls.
-  Data deletion requires an ephemeral confirmation and checks access again.
-- `/leland evil-mode mode:on/off` lets those admins enable or disable Evil Leland
-  mode. When on, the bot posts upside-down Unicode versions of Leland's new text
+  Pausing and resuming apply to everyone.
+- `/flock delete-data user:` (or `user_id:` with an ID or mention, which also
+  works after someone leaves the server) requires an ephemeral confirmation and
+  checks access again. Without either option it erases the statistics of
+  everyone and all managed local backups, then pauses collection; the tracked
+  list is kept, so everyone who was tracked starts a fresh history when
+  collection resumes. With one it erases only that person's statistics and
+  managed backups and removes them from the tracked list, while collection for
+  everyone else continues. Time the erased person shared with others stays in
+  those people's company reports, so their totals still add up, but it is
+  credited to "Deleted person" instead of their ID and is never ranked on a
+  leaderboard or named as a top companion. If the person is still in a call
+  with someone tracked, that call keeps counting them as company, as it does
+  for any human present. The confirmation says which of the two it will do.
+- `/flock track add user:@member` starts tracking a server member, and
+  `/flock track remove user_id:ID` stops tracking someone by ID or mention,
+  including after they leave the server; their history is kept. Only the
+  configured owner and extra admins can use them, and the replies are private.
+  `/flock track list` privately shows who is tracked (with the date they were
+  added) and, separately, former people whose history is still kept (with the date
+  they stopped). Anyone in the server can use `list`.
+- `/flock admin add user:@member`, `/flock admin remove user_id:ID`, and
+  `/flock admin list` let only the configured owner manage tracker admins.
+  Removal also accepts a user mention and works after someone leaves the server.
+  Adding rejects bots, the owner, and the configured Leland user. The list and
+  the add/remove confirmations show each person's display name and
+  username next to their ID, or "Unknown user" when Discord cannot resolve the
+  account.
+- `/flock evil-mode mode:on/off` lets admins enable or disable Evil Leland mode.
+  When on, the bot posts upside-down Unicode versions of Leland's new text
   messages in the same channel. It does not repost attachment files, though text
   accompanying an attachment is still reposted. Empty text is skipped. Mentions
   and embeds are suppressed, and message bodies are not stored. Pausing collection
   stops reposts; deleting data turns this mode off. The toggle persists across
-  restarts.
-- `/leland reaction-mode mode:on/off` lets those admins enable or disable
-  occasional reactions to Leland's newly counted ordinary messages. When on,
+  restarts. Nobody else's messages are reposted.
+- `/flock reaction-mode mode:on/off` lets admins enable or disable occasional
+  reactions to Leland's newly counted ordinary messages. When on,
   the bot picks a new interval of 15–25 messages, then reacts with either 😂 or
   👸 and picks another interval. The setting and current interval survive a
   restart. Pausing collection stops the counter; deleting data turns it off.
   The bot needs Add Reactions permission in tracked text channels. Reactions
   may be missed if Discord rejects one or the bot stops between counting and
   reacting.
-- `/leland admin add user:@member`, `/leland admin remove user_id:ID`, and
-  `/leland admin list` let only the configured owner manage tracker admins.
-  Removal also accepts a user mention and works after someone leaves the server.
-  The list and the add/remove confirmations show each person's display name and
-  username next to their ID, or "Unknown user" when Discord cannot resolve the
-  account.
 
-When someone directly mentions the bot in the configured server, it responds
-with “I am evil Leland, more gay than the original”. This reply works whether
-Evil Leland mode is on or off, even while collection is paused or the channel is
-outside the text allowlist, and never mentions anyone.
+Both mode commands reply privately that Leland mode isn't configured when
+`LELAND_USER_ID` is unset.
+
+When `LELAND_USER_ID` is set and someone directly mentions the bot in the
+configured server, it responds with “I am evil Leland, more gay than the
+original”. This reply works whether Evil Leland mode is on or off, even while
+collection is paused or the channel is outside the text allowlist, and never
+mentions anyone.
 
 Voice time measures observed connection time, not speaking. Visits already in
-progress when observation begins are marked incomplete and cannot set the
-longest-visit record. A brief tracker reconnect or restart (up to two
-minutes) while Leland stays in the same channel does not split his visit; the
+progress when observation begins, including when someone is added to the tracked
+list while in voice, are marked incomplete and cannot set the longest-visit
+record. A brief tracker reconnect or restart (up to two
+minutes) while a person stays in the same channel does not split their visit; the
 unobserved interval is excluded from its length. See [DESIGN.md](DESIGN.md) for coverage and recovery rules.
