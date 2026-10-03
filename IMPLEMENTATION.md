@@ -291,7 +291,11 @@ collection is live and not paused.
 
 `message` and `message_with_reaction` accept a message only when its author is in
 `tracked_ids`, in addition to the guild, channel allowlist, bot, pause, and
-observation-boundary checks, and forward the author ID as `user_id`. `message_with_reaction`
+observation-boundary checks, and forward the author ID as `user_id`. The tracker
+applies the boundary only it knows (when the current collection run started);
+`Store` applies the pause and tracking-start filtering for messages, voice and
+companion transitions inside its own transaction, so the tracker does not read
+`Store.state()` per event. `message_with_reaction`
 is used only for `Config.leland_user_id`; the reaction countdown is global.
 `voice` ignores bots entirely and returns when the eligible previous and current
 channels are equal. If the member is tracked it calls `Store.voice_transition`
