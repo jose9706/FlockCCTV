@@ -212,6 +212,30 @@ class UpdateTests(unittest.TestCase):
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual(connection.execute("SELECT value FROM tracker").fetchone(), ("kept",))
 
+    def test_restore_keeps_journals_until_the_copy_is_durable(self) -> None:
+        backup = self.updater.backup_database()
+        original_stat = self.database.stat()
+        owner = {
+            "uid": original_stat.st_uid,
+            "gid": original_stat.st_gid,
+            "mode": stat.S_IMODE(original_stat.st_mode),
+        }
+        wal = self.database.with_name(self.database.name + "-wal")
+        wal.write_bytes(b"existing state")
+        with mock.patch("deploy.update.os.fsync", side_effect=OSError("fsync failed")):
+            with self.assertRaisesRegex(OSError, "fsync failed"):
+                self.updater.restore_database(backup, owner)
+        self.assertEqual(wal.read_bytes(), b"existing state")
+        self.assertEqual(list(self.database.parent.glob(".*.update-restore-*.tmp")), [])
+        wal.unlink()
+
+    def test_hold_file_is_replaced_atomically_and_readable(self) -> None:
+        self.updater.set_hold(OLD)
+        self.updater.set_hold(NEW)
+        self.assertEqual(self.updater.hold.read_text(encoding="ascii"), NEW + "\n")
+        self.assertEqual(stat.S_IMODE(self.updater.hold.stat().st_mode), 0o644)
+        self.assertEqual(list(self.updater.hold.parent.glob(".flock-cctv-hold-*")), [])
+
     def test_verified_candidate_is_kept_after_interrupted_cleanup(self) -> None:
         self.interrupted_swap(candidate_installed=True)
         owner, _, digest = self.updater.read_pending()
