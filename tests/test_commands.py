@@ -116,6 +116,14 @@ class FakeStore:
         self.comparison = {"current": {}, "previous": None, "reason": "all"}
         self.admin_decisions = {}
         self.paused = False
+        self.uptime_calls = []
+        self.uptime_result = {
+            "start": 1_699_400_000.0, "end": 1_700_000_000.0, "days": [], "observed": 0.0,
+            "outage": 0.0, "idle": 0.0, "outages": [], "paused": False,
+        }
+        self.error_result = {"recent": [], "day": 0, "week": 0, "total": 0}
+        self.alert_minutes = 15
+        self.person_debug_result = {"known": False}
 
     async def tracked_users(self):
         return [dict(row) for row in self.tracked]
@@ -188,6 +196,32 @@ class FakeStore:
         self.include_live = include_live
         return {}
 
+    async def uptime(self, period, now, *, include_live=True):
+        self.uptime_calls.append((period, include_live))
+        return self.uptime_result
+
+    async def error_log(self, now, limit=15):
+        return self.error_result
+
+    async def outage_alert_minutes(self):
+        return self.alert_minutes
+
+    async def set_outage_alert_minutes(self, minutes):
+        self.alert_minutes = minutes
+
+    async def files_summary(self):
+        return {
+            "database_bytes": 5 * 1024 * 1024, "wal_bytes": 0,
+            "backups": [{"name": "flock-cctv-2023-11-14.sqlite3", "modified": 1_699_990_000.0,
+                         "bytes": 10, "daily": True}],
+            "disk_free": 1024 ** 3, "disk_total": 32 * 1024 ** 3,
+            "retention_days": 90, "pruned_before": None, "tracking_since": 1_690_000_000.0,
+        }
+
+    async def person_debug(self, user_id, now, *, include_live=True):
+        self.user_ids.append(user_id)
+        return self.person_debug_result
+
     async def state(self):
         return {
             "paused": self.paused, "evil_mode": False, "reaction_mode": False, "paused_by": None,
@@ -255,8 +289,13 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             {
                 "stats", "records", "where", "company", "leaderboard", "trends", "online", "roast",
                 "top", "help", "about", "version", "update", "pause", "resume", "delete-data",
-                "evil-mode", "reaction-mode", "admin", "track",
+                "evil-mode", "reaction-mode", "admin", "track", "debug",
             },
+        )
+        debug = next(command for command in flock.commands if command.name == "debug")
+        self.assertEqual(
+            {command.name for command in debug.commands},
+            {"health", "uptime", "errors", "person", "alerts"},
         )
         admin = next(command for command in flock.commands if command.name == "admin")
         self.assertEqual({command.name for command in admin.commands}, {"add", "remove", "list"})
@@ -2354,6 +2393,169 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             report = await _status_text(self.bot)
         self.assertIn("tracked people count is temporarily unavailable", report)
         self.assertIn("Collection: **running**", report)
+
+
+    # -- /flock debug -------------------------------------------------------------
+
+    async def run_debug(self, name, *args, user_id=31):
+        command = self.command(name, "debug")
+        interaction = FakeInteraction(user=SimpleNamespace(id=user_id))
+        await command.callback(interaction, *args)
+        sent = (interaction.response.sent + interaction.followup.sent)[0]
+        self.assertTrue(sent["ephemeral"])
+        return sent
+
+    async def test_debug_commands_are_admin_only_and_private(self):
+        self.bot.store.person_debug_result = {"known": False}
+        target = _user(41, "Alice")
+        for name, args in (
+            ("health", ()), ("uptime", ("last7",)), ("errors", ()),
+            ("person", (target,)), ("alerts", (None,)),
+        ):
+            for user_id in (40, 30):  # Not an admin, and the Leland user.
+                with self.subTest(command=name, user=user_id):
+                    sent = await self.run_debug(name, *args, user_id=user_id)
+                    self.assertEqual(
+                        sent["content"], "Only configured tracker admins can change tracker settings."
+                    )
+            with self.subTest(command=name, user="admin"):
+                sent = await self.run_debug(name, *args, user_id=33)
+                self.assertNotIn("Only configured tracker admins", sent["content"])
+        self.assertEqual(self.bot.store.uptime_calls, [("last7", True)])
+        uptime = self.command("uptime", "debug")
+        self.assertEqual(inspect.signature(uptime.callback).parameters["period"].default, "last7")
+
+    async def test_debug_health_reports_process_storage_and_alerts(self):
+        self.bot.started_at = 1_699_000_000.0
+        self.bot.tracker.collection_since = 1_699_500_000.0
+        self.bot.tracker.collection_ready = True
+        self.bot.tracker.last_error = "checkpoint failed (OperationalError)"
+        self.bot.store.error_result = {"recent": [], "day": 2, "week": 5, "total": 9}
+        self.bot.flush_error_log = AsyncMock()
+        self.config.checkpoint_seconds = 60
+        with patch.object(commands_module.time, "time", return_value=1_700_000_000.0):
+            content = (await self.run_debug("health"))["content"]
+        self.bot.flush_error_log.assert_awaited()
+        self.assertIn("Bot process: up **11d 13h 46m**", content)
+        self.assertIn("Collection: **running** for 5d 18h 53m", content)
+        self.assertIn("Current error: **checkpoint failed (OperationalError)**", content)
+        self.assertIn("Logged problems: **2** in the last day, 5 in the last week", content)
+        self.assertIn("Database: **5.0 MB**; disk free **1.0 GB** of 32.0 GB ⚠️ less than 10% left.", content)
+        self.assertIn("Backups: **1** daily", content)
+        self.assertIn("**90 days**", content)
+        self.assertIn("outages of **15m** or longer", content)
+        self.assertNotIn("older than expected", content)  # Checkpoint is current.
+        self.bot.store.alert_minutes = 0
+        with patch.object(commands_module.time, "time", return_value=1_700_000_400.0):
+            content = (await self.run_debug("health"))["content"]
+        self.assertIn("Outage alerts: **off**.", content)
+        self.assertIn("older than expected", content)
+
+    async def test_debug_uptime_lists_outages_and_charts_each_day(self):
+        self.bot.store.uptime_result = {
+            "start": 1_699_920_000.0, "end": 1_700_092_800.0,
+            "days": [
+                {"day": "2023-11-14", "observed": 80_000.0, "outage": 3_000.0, "idle": 3_400.0},
+                {"day": "2023-11-15", "observed": 86_400.0, "outage": 0.0, "idle": 0.0},
+            ],
+            "observed": 166_400.0, "outage": 3_000.0, "idle": 3_400.0,
+            "outages": [
+                {"started_at": 1_699_950_000.0, "ended_at": 1_699_952_400.0,
+                 "reason": "process_restart", "seconds": 2_400.0},
+                {"started_at": 1_699_960_000.0, "ended_at": 1_699_960_600.0,
+                 "reason": "disconnect", "seconds": 600.0},
+            ],
+            "paused": False,
+        }
+        sent = await self.run_debug("uptime", "week")
+        content = sent["content"]
+        self.assertIn("**Flock uptime — this week**", content)
+        self.assertIn("Watching: **96.3%**", content)
+        self.assertIn("Outages: **2**, totalling 50m; longest 40m (bot stopped or restarted).", content)
+        self.assertIn("Paused or not collecting: 56m.", content)
+        self.assertLess(content.index("Discord connection lost"), content.index("— 40m, bot stopped"))
+        self.assertEqual(sent["file"].filename, "flock-uptime.png")
+        image = Image.open(BytesIO(sent["file"].fp.read()))
+        self.assertEqual(image.width, 900)
+
+    async def test_debug_uptime_with_nothing_recorded_yet(self):
+        self.bot.store.uptime_result["end"] = self.bot.store.uptime_result["start"]
+        sent = await self.run_debug("uptime", "today")
+        self.assertIn("Nothing to report yet", sent["content"])
+        self.assertNotIn("file", sent)
+
+    async def test_debug_errors_lists_entries_without_pinging_anyone(self):
+        content = (await self.run_debug("errors"))["content"]
+        self.assertIn("No warnings or errors have been logged.", content)
+        self.bot.store.error_result = {
+            "recent": [
+                {"at": 1_700_000_000.0, "level": "ERROR", "source": "commands",
+                 "summary": "Slash command flock *stats* failed @everyone (KeyError)"},
+            ],
+            "day": 1, "week": 1, "total": 1,
+        }
+        content = (await self.run_debug("errors"))["content"]
+        self.assertIn("**1** in the last day, 1 in the last week, 1 kept in total.", content)
+        self.assertIn("error in commands: Slash command flock \\*stats\\* failed @\u200beveryone (KeyError)", content)
+
+    async def test_debug_person_summarizes_tracking_and_storage(self):
+        self.bot.store.person_debug_result = {
+            "known": True, "active": True, "tracking_since": 1_699_000_000.0, "added_by": 31,
+            "updated_at": 1_699_500_000.0,
+            "intervals": [(1_699_000_000.0, 1_699_100_000.0), (1_699_500_000.0, None)],
+            "elapsed_seconds": 1_000_000.0, "tracked_seconds": 600_000.0,
+            "watched_seconds": 590_000.0, "outage_seconds": 6_000.0, "idle_seconds": 4_000.0,
+            "untracked_seconds": 400_000.0,
+            "outages": [{"started_at": 1_699_600_000.0, "ended_at": 1_699_606_000.0,
+                         "reason": "disconnect", "seconds": 6_000.0}],
+            "messages": 120, "first_message_at": 1_699_000_100.0, "daily_rows": 9, "active_days": 7,
+            "voice_visits": 4, "visits_seen_start": 3, "visits_seen_end": 3, "visits_complete": 2,
+            "voice_segments": 6, "company_rows": 3, "records": 2, "open_visit": None,
+            "last_voice_at": 1_699_900_000.0, "detail_since": 1_699_000_000.0,
+            "pruned_before": None, "retention_days": 90, "paused": False,
+        }
+        guild = _fake_guild(self.bot, {31: _user(31, "Owner")})
+        interaction = FakeInteraction(user=SimpleNamespace(id=31))
+        interaction.guild = guild
+        await self.command("person", "debug").callback(interaction, _user(41, "Alice *A*"))
+        content = interaction.followup.sent[0]["content"]
+        self.assertEqual(self.bot.store.user_ids, [41])
+        self.assertIn("**Debug: Alice \\*A\\*** (41)", content)
+        self.assertIn("last added by Owner (@owner) — 31", content)
+        self.assertIn("Tracked-list stretches: **2**", content)
+        self.assertIn("Watched: **6d 19h 53m** of 11d 13h 46m since first tracked (**59.0%**).", content)
+        self.assertIn("Missing coverage: 1h 40m outages, 1h 6m paused or not collecting, 4d 15h 6m off the tracked list.", content)
+        self.assertIn("Outages while tracked: **1**, longest 1h 40m (Discord connection lost", content)
+        self.assertIn("120 message records, 4 voice visits (2 watched start to end, 1 already in progress when seen)", content)
+        self.assertIn("In voice now: no; last seen in voice", content)
+
+    async def test_debug_person_for_someone_never_tracked_or_a_bot(self):
+        content = (await self.run_debug("person", _user(45, "Stranger")))["content"]
+        self.assertIn("Stranger has never been tracked", content)
+        sent = await self.run_debug("person", _user(46, "Robot", bot=True))
+        self.assertEqual(sent["content"], "Bots aren't tracked.")
+
+    async def test_debug_alerts_shows_and_sets_the_threshold(self):
+        content = (await self.run_debug("alerts", None))["content"]
+        self.assertIn("**15m** or longer", content)
+        content = (await self.run_debug("alerts", 60))["content"]
+        self.assertEqual(self.bot.store.alert_minutes, 60)
+        self.assertIn("**1h 0m** or longer", content)
+        content = (await self.run_debug("alerts", 0))["content"]
+        self.assertEqual(content, "Outage alerts are now **off**.")
+        content = (await self.run_debug("alerts", None))["content"]
+        self.assertIn("Outage alerts are **off**", content)
+
+    def test_outage_alert_text_names_the_cause_and_time(self):
+        gap = {"started_at": 1_700_000_000.0, "ended_at": 1_700_002_520.0,
+               "reason": "process_restart", "seconds": 2_520.0}
+        text = commands_module.outage_alert_text([gap], "UTC")
+        self.assertIn("**Flock was not watching for 42m** (bot stopped or restarted), "
+                      "Nov 14, 2023 22:13 – 22:55 UTC.", text)
+        self.assertIn("missing coverage, not quiet time", text)
+        text = commands_module.outage_alert_text([gap, {**gap, "reason": "disconnect"}], "UTC")
+        self.assertIn("**Flock had 2 outages:**", text)
+        self.assertIn("Discord connection lost", text)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -412,6 +413,40 @@ class GracefulSignalTests(unittest.IsolatedAsyncioTestCase):
                 await bot._maintenance_loop()
         store.maintenance.assert_awaited_once()
         tracker.report_recovered.assert_called_once_with("maintenance")
+
+
+    async def test_error_log_flush_writes_buffered_entries_and_keeps_them_on_failure(self):
+        with TemporaryDirectory() as directory:
+            bot = create_bot(make_config(Path(directory)))
+        bot.store = SimpleNamespace(record_errors=AsyncMock(side_effect=OSError("disk")))
+        logger = logging.getLogger("flock_cctv.bot")
+        logging.getLogger("flock_cctv").addHandler(bot.error_log)
+        try:
+            logger.error("Checkpoint failed")
+            await bot.flush_error_log()
+            self.assertEqual(len(bot.error_log.drain()), 1)  # Kept after the failed write.
+            logger.error("Checkpoint failed")
+            bot.store.record_errors = AsyncMock()
+            await bot.flush_error_log()
+        finally:
+            logging.getLogger("flock_cctv").removeHandler(bot.error_log)
+        entries = bot.store.record_errors.await_args.args[0]
+        self.assertEqual([entry[1:] for entry in entries], [("ERROR", "bot", "Checkpoint failed")])
+        self.assertEqual(bot.error_log.drain(), [])
+
+    async def test_long_outages_are_sent_to_the_owner_once(self):
+        with TemporaryDirectory() as directory:
+            bot = create_bot(make_config(Path(directory)))
+        gap = {"started_at": 100.0, "ended_at": 2_000.0, "reason": "disconnect", "seconds": 1_900.0}
+        bot.store = SimpleNamespace(due_outage_alerts=AsyncMock(side_effect=[[gap], []]))
+        owner = SimpleNamespace(send=AsyncMock())
+        bot.fetch_user = AsyncMock(return_value=owner)
+        await bot._alert_outages()
+        await bot._alert_outages()
+        bot.fetch_user.assert_awaited_once_with(99)
+        owner.send.assert_awaited_once()
+        self.assertIn("Flock was not watching for 31m", owner.send.await_args.args[0])
+        self.assertFalse(owner.send.await_args.kwargs["allowed_mentions"].users)
 
 
 if __name__ == "__main__":

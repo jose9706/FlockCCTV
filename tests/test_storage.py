@@ -1614,3 +1614,191 @@ class MultiPersonStoreTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DebugStoreTests(unittest.IsolatedAsyncioTestCase):
+    """Admin debugging reads: uptime, error log, outage alerts, and per-person checks."""
+
+    async def asyncSetUp(self) -> None:
+        self.temp = TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.db = self.root / "tracker.sqlite3"
+        self.store = Store(self.db, self.root / "backups", "UTC")
+        await self.store.initialize(100.0, 11)
+        await self.store.track_user(USER, 99, 100.0)
+
+    async def asyncTearDown(self) -> None:
+        await self.store.close()
+        self.temp.cleanup()
+
+    def rows(self, sql: str) -> list[tuple]:
+        with closing(sqlite3.connect(self.db)) as conn:
+            return conn.execute(sql).fetchall()
+
+    async def test_uptime_splits_time_into_observed_outage_and_idle(self) -> None:
+        await self.store.connect(100.0)
+        await self.store.checkpoint(160.0)
+        await self.store.disconnect(200.0)  # Outage from the 160 checkpoint.
+        await self.store.connect(220.0)
+        await self.store.checkpoint(300.0)
+        await self.store.set_paused(True, 99, 300.0)
+        result = await self.store.uptime("all", 400.0)
+        self.assertEqual((result["start"], result["end"]), (100.0, 400.0))
+        self.assertEqual(
+            (result["observed"], result["outage"], result["idle"]), (140.0, 60.0, 100.0)
+        )
+        self.assertEqual(result["days"], [
+            {"day": "1970-01-01", "observed": 140.0, "outage": 60.0, "idle": 100.0}
+        ])
+        self.assertEqual(
+            [(gap["started_at"], gap["ended_at"], gap["reason"], gap["seconds"]) for gap in result["outages"]],
+            [(160.0, 220.0, "disconnect", 60.0)],
+        )
+        self.assertTrue(result["paused"])
+
+    async def test_uptime_counts_live_coverage_and_an_open_outage_through_now(self) -> None:
+        await self.store.connect(100.0)
+        await self.store.checkpoint(150.0)
+        live = await self.store.uptime("all", 400.0)
+        self.assertEqual((live["observed"], live["outage"], live["idle"]), (300.0, 0.0, 0.0))
+        not_live = await self.store.uptime("all", 400.0, include_live=False)
+        self.assertEqual((not_live["observed"], not_live["idle"]), (50.0, 250.0))
+        await self.store.disconnect(400.0)
+        down = await self.store.uptime("all", 500.0)
+        self.assertEqual((down["observed"], down["outage"]), (50.0, 350.0))
+        self.assertIsNone(down["outages"][0]["ended_at"])
+
+    async def test_bot_shutdown_gaps_are_labelled_restarts(self) -> None:
+        await self.store.connect(100.0)
+        await self.store.disconnect(150.0, reason="process_restart")
+        await self.store.connect(200.0)
+        self.assertEqual(
+            self.rows("SELECT started_at, ended_at, reason FROM coverage_gaps"),
+            [(100.0, 200.0, "process_restart")],
+        )
+        with self.assertRaises(ValueError):
+            await self.store.disconnect(250.0, reason="guess")
+
+    async def test_restart_gaps_still_bridge_a_visit(self) -> None:
+        await self.store.connect(100.0)
+        await self.store.voice_transition(USER, 30, 100.0)
+        await self.store.checkpoint(160.0)
+        await self.store.disconnect(170.0, reason="process_restart")
+        await self.store.connect(200.0)
+        await self.store.voice_transition(USER, 30, 200.0, complete_start=False)
+        await self.store.voice_transition(USER, None, 300.0)
+        records = await self.store.records(USER, 300.0)
+        self.assertEqual(records["longest_visit_seconds"], 160.0)
+
+    async def test_error_log_counts_trims_and_follows_retention(self) -> None:
+        day = 86_400.0
+        now = 20 * day
+        await self.store.record_errors([
+            (now - 10 * day, "ERROR", "bot", "Checkpoint failed (OperationalError)"),
+            (now - 3 * day, "WARNING", "bot", "Could not DM the owner"),
+            (now - 60.0, "ERROR", "commands", "Slash command flock stats failed (KeyError)"),
+        ])
+        result = await self.store.error_log(now)
+        self.assertEqual((result["day"], result["week"], result["total"]), (1, 2, 3))
+        self.assertEqual(
+            [entry["summary"] for entry in result["recent"]],
+            [
+                "Slash command flock stats failed (KeyError)",
+                "Could not DM the owner",
+                "Checkpoint failed (OperationalError)",
+            ],
+        )
+        with patch.object(Store, "ERROR_LOG_LIMIT", 2):
+            await self.store.record_errors([(now, "ERROR", "bot", "Newest")])
+        self.assertEqual((await self.store.error_log(now))["total"], 2)
+        await self.store.maintenance(now, 1)
+        self.assertEqual(
+            [entry["summary"] for entry in (await self.store.error_log(now))["recent"]],
+            ["Newest", "Slash command flock stats failed (KeyError)"],
+        )
+
+    async def test_outage_alerts_fire_once_for_long_finished_outages(self) -> None:
+        self.assertEqual(await self.store.outage_alert_minutes(), 15)
+        await self.store.connect(100.0)
+        await self.store.disconnect(160.0)
+        self.assertEqual(await self.store.due_outage_alerts(), [])  # Still open.
+        await self.store.connect(2_000.0)
+        due = await self.store.due_outage_alerts()
+        self.assertEqual(
+            [(gap["started_at"], gap["ended_at"], gap["reason"]) for gap in due],
+            [(100.0, 2_000.0, "disconnect")],
+        )
+        self.assertEqual(await self.store.due_outage_alerts(), [])
+        await self.store.disconnect(2_100.0)
+        await self.store.connect(2_200.0)  # Shorter than the threshold.
+        self.assertEqual(await self.store.due_outage_alerts(), [])
+        await self.store.set_outage_alert_minutes(0)
+        await self.store.disconnect(2_300.0)
+        await self.store.connect(9_000.0)
+        self.assertEqual(await self.store.due_outage_alerts(), [])
+
+    async def test_changing_the_alert_threshold_skips_earlier_outages(self) -> None:
+        await self.store.connect(100.0)
+        await self.store.disconnect(160.0)
+        await self.store.connect(5_000.0)
+        await self.store.set_outage_alert_minutes(5)
+        self.assertEqual(await self.store.outage_alert_minutes(), 5)
+        self.assertEqual(await self.store.due_outage_alerts(), [])
+        with self.assertRaises(ValueError):
+            await self.store.set_outage_alert_minutes(-1)
+
+    async def test_outages_before_alerts_existed_are_not_announced(self) -> None:
+        await self.store.connect(100.0)
+        await self.store.disconnect(160.0)
+        await self.store.connect(5_000.0)
+        await self.store.close()
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("DROP TABLE outage_alerts")
+            conn.commit()
+        self.store = Store(self.db, self.root / "backups", "UTC")
+        await self.store.initialize(5_100.0, 11)
+        self.assertEqual(await self.store.due_outage_alerts(), [])
+
+    async def test_person_debug_reports_tracking_coverage_and_stored_rows(self) -> None:
+        await self.store.connect(100.0)
+        self.assertTrue(await self.store.add_message(USER, 1, 30, 120.0))
+        await self.store.checkpoint(160.0)
+        await self.store.disconnect(200.0)
+        await self.store.connect(220.0)
+        await self.store.untrack_user(USER, 99, 250.0)
+        await self.store.track_user(USER, 98, 300.0)
+        await self.store.voice_transition(USER, 30, 350.0)
+        result = await self.store.person_debug(USER, 400.0)
+        self.assertTrue(result["known"])
+        self.assertTrue(result["active"])
+        self.assertEqual(result["added_by"], 98)
+        self.assertEqual(result["intervals"], [(100.0, 250.0), (300.0, None)])
+        self.assertEqual(result["elapsed_seconds"], 300.0)
+        self.assertEqual(result["watched_seconds"], 190.0)
+        self.assertEqual(result["outage_seconds"], 60.0)
+        self.assertEqual(result["untracked_seconds"], 50.0)
+        self.assertEqual(result["idle_seconds"], 0.0)
+        self.assertEqual(len(result["outages"]), 1)
+        self.assertEqual(result["messages"], 1)
+        self.assertEqual(result["first_message_at"], 120.0)
+        self.assertEqual(result["voice_visits"], 1)
+        self.assertEqual(result["open_visit"], {"started_at": 350.0, "complete_start": True})
+        unknown = await self.store.person_debug(OTHER, 400.0)
+        self.assertFalse(unknown["known"])
+        self.assertEqual(unknown["messages"], 0)
+
+    async def test_person_debug_forgets_a_deleted_person(self) -> None:
+        await self.store.connect(100.0)
+        await self.store.add_message(USER, 1, 30, 120.0)
+        await self.store.delete_user_data(USER, 99, 200.0)
+        result = await self.store.person_debug(USER, 300.0)
+        self.assertFalse(result["known"])
+        self.assertEqual((result["messages"], result["voice_visits"]), (0, 0))
+
+    async def test_files_summary_reports_database_and_backups(self) -> None:
+        await self.store.maintenance(86_400.0 * 3, 90)
+        files = await self.store.files_summary()
+        self.assertGreater(files["database_bytes"], 0)
+        self.assertEqual([item["daily"] for item in files["backups"]], [True])
+        self.assertEqual(files["retention_days"], 90)
+        self.assertIsNotNone(files["disk_free"])

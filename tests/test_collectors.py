@@ -35,6 +35,7 @@ class FakeStore:
         self.companions: dict[int, frozenset[int]] = {}
         self.company_transitions: list[tuple[int, int, bool, float]] = []
         self.disconnections: list[float] = []
+        self.disconnect_reasons: list[str] = []
         self.checkpoints: list[float] = []
         self.connections: list[float] = []
         self.track_calls: list[tuple[int, int, float]] = []
@@ -58,8 +59,9 @@ class FakeStore:
         if not self.paused:
             self.connections.append(now)
 
-    async def disconnect(self, now):
+    async def disconnect(self, now, reason="disconnect"):
         self.disconnections.append(now)
+        self.disconnect_reasons.append(reason)
 
     async def voice_transition(
         self, user_id, channel_id, now, complete_start=True, companions=frozenset()
@@ -138,7 +140,7 @@ class RecoveringStore(FakeStore):
             self.connections.append(now)
             self.store_connected = True
 
-    async def disconnect(self, now):
+    async def disconnect(self, now, reason="disconnect"):
         self.operations.append("disconnect")
         if self.fail_next_disconnect:
             self.fail_next_disconnect = False
@@ -679,9 +681,13 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
             await tracker.shutdown()
         self.assertEqual(store.checkpoints, [180.0])
         self.assertEqual(store.disconnections, [150.0, 180.0])
+        # Startup clears a stale session as a lost connection; the bot's own
+        # shutdown is labelled a restart.
+        self.assertEqual(store.disconnect_reasons, ["disconnect", "process_restart"])
         self.assertEqual(store.transitions, [(20, 40, 150.0, False)])
         self.assertTrue(store.closed)
         self.assertEqual(tracker.last_error, "maintenance failed (OSError)")
+        self.assertIsNone(tracker.collection_since)
 
 
 class TrackedListTests(unittest.IsolatedAsyncioTestCase):

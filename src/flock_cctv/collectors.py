@@ -74,6 +74,11 @@ class Tracker:
         # collection starts and after every track, untrack, or deletion.
         self.tracked_ids: frozenset[int] = frozenset()
 
+    @property
+    def collection_since(self) -> float | None:
+        """When guild collection last (re)started, or None while it is stopped."""
+        return self._collection_since
+
     def _record_error(self, operation: str, exc: BaseException) -> None:
         # Error text from a dependency can include implementation details. Keep
         # status concise and safe; the adapter logs the traceback separately.
@@ -525,8 +530,9 @@ class Tracker:
                 # Also retry closure after a prior disconnect failure. A process
                 # boundary ends coverage; keep any active visit incomplete so it
                 # cannot claim a longest-visit record when a tracked person may
-                # still be connected.
-                await self.store.disconnect(current)
+                # still be connected. The gap is the bot's own downtime, so it
+                # is labelled a restart rather than a lost Discord connection.
+                await self.store.disconnect(current, reason="process_restart")
             except Exception as exc:
                 self._record_error("shutdown", exc)
                 raise
