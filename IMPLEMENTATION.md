@@ -437,23 +437,9 @@ still exceeds the canvas width.
 `evil-mode` and `reaction-mode` check admin access, then reply privately that Leland
 mode isn't configured when `leland_user_id` is unset.
 
-`flock_cctv.legacy_import` is the one-time Leland Tracker import, run as
-`python -m flock_cctv.legacy_import --source OLD [--database NEW] [--backups DIR]
-[--guild-id G] [--leland-user-id L] [--timezone TZ] [--dry-run]`; every option
-except `--source` falls back to `DATABASE_PATH`, `BACKUP_DIR`, `GUILD_ID`,
-`LELAND_USER_ID`, and `TIMEZONE`. `import_legacy(source, database, backups, guild_id,
-leland_user_id, timezone, *, dry_run=False) -> dict[str, int]` snapshots the source
-into memory with the SQLite backup API (read-only, never modifying it), validates
-`PRAGMA user_version == 9` and the source's guild, tracked user, and timezone,
-refuses a destination that already has a `settings` row, creates the schema through
-`Store.initialize(source tracking start, guild_id)`, then copies in one transaction:
-the settings fields (including pause, retention, and Leland modes), a `tracked_users`
-row and an open tracking interval for Leland from the source tracking start, his
-rows in the per-person tables (visit and segment IDs kept), and coverage and admin
-overrides verbatim. After commit it reopens through `Store.initialize` so normal
-recovery closes anything left open, verifies row counts, and prints counts only.
-`main()` returns 0 on success and 1 on a `LegacyImportError`, with a usage error
-exiting 2; a new destination is removed when the import fails.
+There is no Leland Tracker import. `Store.initialize` raises `StoreError` for a
+database whose `settings` table has `target_user_id` (the single-target Leland
+schema), so an old database is archived and Flock starts from a new file.
 
 Run the standard-library tests with `PYTHONPATH=src .venv/bin/python -m unittest
 discover -s tests -v`.

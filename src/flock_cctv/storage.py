@@ -134,11 +134,12 @@ class Store:
     def _create_schema(self, conn: sqlite3.Connection) -> None:
         # A single-target Leland database shares table names with this schema but
         # not their shape; refuse it clearly instead of failing on a missing column.
+        # Flock starts with fresh data, so such a database is archived, not converted.
         settings_columns = {row[1] for row in conn.execute("PRAGMA table_info(settings)")}
         if "target_user_id" in settings_columns:
             raise StoreError(
                 "database uses the single-target Leland schema; "
-                "convert it with the one-time legacy import tool"
+                "start Flock with a new database file"
             )
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         if version > self.SCHEMA_VERSION:

@@ -721,6 +721,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("**Bob** — 1h 0m (66.7% of observed time)", content)
         self.assertIn("**Alone** — 30m (33.3% of observed time)", content)
         self.assertIn("slices overlap", content)
+        self.assertNotIn("split share", content)
         self.assertTrue(png.startswith(b"\x89PNG"))
 
         # People past the top slices are combined without a share of observed time.
@@ -788,6 +789,8 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lines[2], "🥈 **Cara** — 1h 0m")
         self.assertEqual(lines[3], "🥉 **Bob** — 50m")
         self.assertEqual(lines[4], "Time alone (not ranked): 10h 0m.")
+        self.assertIn("group calls count fully for everyone.", lines[5])
+        self.assertNotIn("split", content)
         self.assertNotIn("Hidden", content)
         self.assertNotIn("P45", content)
         self.assertTrue(self.bot.store.include_live)

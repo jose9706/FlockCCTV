@@ -5,9 +5,9 @@ an admin-managed list of people and measures their observed time in configured
 voice channels. It stores statistics in SQLite and is designed to run as a
 systemd service on the Raspberry Pi. It requires Python 3.11 or newer; the
 pinned dependencies were checked on Debian 13, aarch64, with Python 3.13.
-This is release 1.0.1. It replaces the single-person Leland Tracker; existing
-Leland Tracker data moves over once with the import in
-[Migrating from Leland Tracker](#migrating-from-leland-tracker).
+This is release 1.0.1. It replaces the single-person Leland Tracker and starts
+with fresh data: the old database is archived, not imported. See
+[Replacing Leland Tracker](#replacing-leland-tracker).
 
 The product scope and measurement definitions are in [DESIGN.md](DESIGN.md).
 The implementation interfaces are in [IMPLEMENTATION.md](IMPLEMENTATION.md).
@@ -174,10 +174,9 @@ sudo install -o root -g root -m 0644 /opt/flock-cctv/deploy/flock-cctv.service /
 sudo systemctl daemon-reload
 ```
 
-Replacing a running Leland Tracker? Stop here and do
-[Migrating from Leland Tracker](#migrating-from-leland-tracker) before the first
-start: the import refuses to write into a database that already exists. For a
-fresh install, start the service:
+Replacing a running Leland Tracker? Stop here and do steps 1 and 2 of
+[Replacing Leland Tracker](#replacing-leland-tracker) before the first start, so
+the two bots never share a token. Then start the service:
 
 ```sh
 sudo systemctl enable --now flock-cctv.service
@@ -214,26 +213,19 @@ Both modes act only on messages that are counted, so Leland must be tracked, and
 they stop while collection is paused. Deleting everyone's data, or deleting
 Leland's data, turns both modes off.
 
-## Migrating from Leland Tracker
+## Replacing Leland Tracker
 
-This is a one-time move on the Pi from the old single-person bot to Flock. The
-import copies the old database into a new Flock database; the old database file
-is never modified, so the old install stays available as a rollback until you
-delete it. The paths and unit names below are the Leland Tracker defaults
-(`leland-tracker`, `/var/lib/leland-tracker`, `/etc/leland-tracker.env`); adjust
-them if your install differs. Only a schema version 9 Leland Tracker database
-can be imported. If you reuse the old Discord application and token, the old
-`/leland` commands disappear from the server the first time Flock starts.
+This is a one-time move on the Pi from the old single-person bot to Flock.
+Flock does not import the old data: Leland Tracker used to record each shared
+voice minute as an even split among the people present, so its company totals
+cannot be compared with Flock's. The old database is archived as a backup and
+Flock starts counting from the day it first runs. The paths and unit names below
+are the Leland Tracker defaults (`leland-tracker`, `/var/lib/leland-tracker`,
+`/etc/leland-tracker.env`); adjust them if your install differs. If you reuse
+the old Discord application and token, the old `/leland` commands disappear from
+the server the first time Flock starts.
 
-1. Install Flock as described in [Install the systemd service](#install-the-systemd-service)
-   up to and including `daemon-reload`, but do not start it. Fill in
-   `/etc/flock-cctv.env`: copy `DISCORD_TOKEN`, `GUILD_ID`, `OWNER_USER_ID`,
-   `ADMIN_USER_IDS`, the channel settings, and `TIMEZONE` from the old file, and
-   set `LELAND_USER_ID` to the old `TARGET_USER_ID`. `TIMEZONE` and `GUILD_ID`
-   must match the old database. Environment admins live in the file, not the
-   database, so copy `ADMIN_USER_IDS` too. Do not add `TARGET_USER_ID`.
-
-2. Stop the old bot and everything that could restart it or run it again. Two
+1. Stop the old bot and everything that could restart it or run it again. Two
    bots must not share one token, and the old updater must not redeploy the old
    code:
 
@@ -244,96 +236,54 @@ can be imported. If you reuse the old Discord application and token, the old
    systemctl list-units 'leland-tracker*'
    ```
 
-3. Snapshot the old database with SQLite's backup API as the old service
-   account, copy it into Flock's state directory, and check it. The snapshot is
-   a second copy of Leland's data, so delete both copies when the migration is
-   done. Keep it outside `BACKUP_DIR`, which `/flock delete-data` manages.
+2. Archive the old database with SQLite's backup API into a root-only directory
+   and check it. Stop here unless it prints `ok`:
 
    ```sh
+   sudo install -d -o root -g root -m 0700 /var/backups/flock-cctv-archive
    sudo -u leland-tracker python3 - <<'PY'
    import sqlite3
 
    source = sqlite3.connect("/var/lib/leland-tracker/tracker.sqlite3")
-   destination = sqlite3.connect("/var/lib/leland-tracker/leland-snapshot.sqlite3")
+   destination = sqlite3.connect("/var/lib/leland-tracker/archive.sqlite3.tmp")
    source.backup(destination)
    destination.close()
    source.close()
    PY
-   sudo install -o flock-cctv -g flock-cctv -m 0640 /var/lib/leland-tracker/leland-snapshot.sqlite3 /var/lib/flock-cctv/leland-snapshot.sqlite3
-   sudo rm /var/lib/leland-tracker/leland-snapshot.sqlite3
-   sudo sqlite3 -readonly /var/lib/flock-cctv/leland-snapshot.sqlite3 'PRAGMA integrity_check; PRAGMA user_version;'
+   sudo install -o root -g root -m 0600 /var/lib/leland-tracker/archive.sqlite3.tmp /var/backups/flock-cctv-archive/leland-tracker-final.sqlite3
+   sudo rm /var/lib/leland-tracker/archive.sqlite3.tmp
+   sudo sqlite3 -readonly /var/backups/flock-cctv-archive/leland-tracker-final.sqlite3 'PRAGMA integrity_check;'
    ```
 
-   The first line printed must be `ok` and the second `9`.
+3. Install and start Flock as described in
+   [Install the systemd service](#install-the-systemd-service). Fill in
+   `/etc/flock-cctv.env`: copy `DISCORD_TOKEN`, `GUILD_ID`, `OWNER_USER_ID`,
+   `ADMIN_USER_IDS`, the channel settings, and `TIMEZONE` from the old file, and
+   set `LELAND_USER_ID` to the old `TARGET_USER_ID`. Do not add
+   `TARGET_USER_ID`. Never point `DATABASE_PATH` at the old database: Flock
+   refuses to open a Leland Tracker database.
 
-4. Run the import as the service account with a dry run first. It validates the
-   snapshot and prints row counts without writing anything:
-
-   ```sh
-   sudo -u flock-cctv sh -c 'set -a; . /etc/flock-cctv.env; set +a; exec /opt/flock-cctv/.venv/bin/python -m flock_cctv.legacy_import --source /var/lib/flock-cctv/leland-snapshot.sqlite3 --dry-run'
-   ```
-
-   If the counts look right, run the same command without `--dry-run`. The tool
-   takes `--source` (required), `--database`, `--backups`, `--guild-id`,
-   `--leland-user-id`, `--timezone`, and `--dry-run`. Apart from `--source`, each
-   option falls back to the `DATABASE_PATH`, `BACKUP_DIR`, `GUILD_ID`,
-   `LELAND_USER_ID`, and `TIMEZONE` environment variables, which is what the
-   command above uses. To pass them explicitly (the IDs here are made up):
+4. Check the logs, then add the people to track with `/flock track add`. Their
+   history starts when they are added:
 
    ```sh
-   sudo -u flock-cctv /opt/flock-cctv/.venv/bin/python -m flock_cctv.legacy_import \
-     --source /var/lib/flock-cctv/leland-snapshot.sqlite3 \
-     --database /var/lib/flock-cctv/tracker.sqlite3 --backups /var/lib/flock-cctv/backups \
-     --guild-id 111111111111111111 --leland-user-id 222222222222222222 \
-     --timezone America/Costa_Rica
-   ```
-
-   It exits 0 and prints only counts: never IDs or message data. It exits
-   non-zero with a message, and removes a database it had just created, when the
-   source is not schema version 9, when its guild, tracked user, or timezone
-   differ from the arguments, when the destination already holds a Flock
-   database (it never merges), or when a copy or row-count check fails. A failed
-   import can be rerun after fixing the cause.
-
-5. Start Flock and check it:
-
-   ```sh
-   sudo systemctl enable --now flock-cctv.service
    sudo journalctl -u flock-cctv.service -n 100 --no-pager
    ```
 
-   In Discord, `/flock about` should show one tracked person, and
-   `/flock stats user:@Leland period:all` should show his old totals. The first
-   `/flock` sync replaces the server's command list, so `/leland` is gone and
-   `/flock` takes its place.
-
-6. Set up automatic updates for the new repository with the steps in
+5. Set up automatic updates for the new repository with the steps in
    [Automatically update from the default branch](#automatically-update-from-the-default-branch).
    Leland Tracker's deploy key cannot be reused: GitHub deploy keys belong to one
    repository, so FlockCCTV needs its own new read-only key.
 
-7. When Flock has run correctly for a while, delete the snapshot
-   (`sudo rm /var/lib/flock-cctv/leland-snapshot.sqlite3`) and remove the old
-   service files, `/etc/leland-tracker.env`, `/opt/leland-tracker`, the old
-   deploy key, the old backups, and `/var/lib/leland-tracker`. Those copies
-   hold Leland's data and the old bot token, and Flock's deletion commands do
-   not manage them.
+6. When Flock has run correctly for a while, remove the old service files,
+   `/etc/leland-tracker.env`, `/opt/leland-tracker`, the old deploy key, the old
+   backups, and `/var/lib/leland-tracker`. Those copies hold Leland's data and
+   the old bot token.
 
-What the import copies, all for Leland and keeping record IDs:
-
-- Leland becomes a tracked person, active since the old database's tracking
-  start, with an open tracking interval from that moment.
-- His whole history: message metadata and daily totals, voice visits and
-  segments, voice company (current roster and daily rows, including the whole
-  shared time), last voice observation, and records.
-- Collector state: coverage intervals and gaps, the pause state and who paused,
-  checkpoints, the pruning boundary, and the retention setting.
-- Owner-issued admin grants and revocations, and the evil-mode and reaction-mode
-  settings, including the reaction countdown.
-
-Anything the old bot had open when it stopped is closed by Flock's normal
-startup recovery at its last checkpoint and marked incomplete; the summary
-reports how many open voice segments that affects.
+The archive in `/var/backups/flock-cctv-archive` is operator-managed: Flock never
+reads it, and `/flock delete-data` does not remove it. It holds Leland's old
+message metadata and voice history, so delete it with `sudo rm` when it is no
+longer wanted, and include it if someone asks for their data to be erased.
 
 ## Tests
 
@@ -409,6 +359,37 @@ updater restore snapshots beside the database: `<database-name>.update-restore`
 and `.<database-name>.update-restore-*.tmp`. Copies placed elsewhere are
 operator-managed and need separate deletion. Restoring a backup also restores
 the tracked list and each person's history as they were when it was taken.
+
+### Start over with fresh data
+
+To keep everything recorded so far as an archive and then count from zero,
+archive the database outside `BACKUP_DIR` first, because `/flock delete-data`
+erases every managed backup:
+
+```sh
+ARCHIVE="/var/backups/flock-cctv-archive/flock-cctv-$(date +%F).sqlite3"
+sudo install -d -o root -g root -m 0700 /var/backups/flock-cctv-archive
+sudo -u flock-cctv python3 - <<'PY'
+import sqlite3
+
+source = sqlite3.connect("/var/lib/flock-cctv/tracker.sqlite3")
+destination = sqlite3.connect("/var/lib/flock-cctv/archive.sqlite3.tmp")
+source.backup(destination)
+destination.close()
+source.close()
+PY
+sudo install -o root -g root -m 0600 /var/lib/flock-cctv/archive.sqlite3.tmp "$ARCHIVE"
+sudo rm /var/lib/flock-cctv/archive.sqlite3.tmp
+sudo sqlite3 -readonly "$ARCHIVE" 'PRAGMA integrity_check;'
+```
+
+Continue only if the check prints `ok`. Then run `/flock delete-data` without a
+user in Discord, confirm, and run `/flock resume`. The tracked list and admin
+settings are kept, and every tracked person's history restarts at that moment.
+The archive is operator-managed, like the one from
+[Replacing Leland Tracker](#replacing-leland-tracker): delete it
+with `sudo rm` when it is no longer wanted. Restoring it follows the restore
+steps above, using the archive in place of `flock-cctv-manual.sqlite3`.
 
 ## Update and rollback
 
@@ -616,11 +597,9 @@ though never as root.
 - **Database instance lock:** run only one bot process against a database. Stop
   a duplicate foreground process or service; do not delete the `.lock` file to
   bypass the lock.
-- **The import was refused:** read the message it printed. The usual causes are
-  a source that is not a schema version 9 Leland Tracker database, a
-  `--guild-id`, `--leland-user-id`, or `--timezone` that differs from the old
-  database, or a destination that already holds a Flock database. The import
-  never merges into an existing database.
+- **"database uses the single-target Leland schema":** `DATABASE_PATH` points
+  at an old Leland Tracker database. Archive it as in
+  [Replacing Leland Tracker](#replacing-leland-tracker) and use a new path.
 - **`/flock evil-mode` says Leland mode isn't configured:** set `LELAND_USER_ID`
   in `/etc/flock-cctv.env` and restart the service.
 - **Evil Leland does not repost:** confirm `LELAND_USER_ID` is set, Leland is
@@ -670,9 +649,7 @@ today, this week, this month, or all time unless stated otherwise.
   with several people is counted: `split` (default) splits each shared minute
   evenly so the slices add up to the observed time; `full` credits each person
   with the whole minute, as `/flock leaderboard` does, so slices overlap,
-  percentages are of observed time, and the chart shows relative shares. With
-  `full`, company time recorded before whole shared time was tracked counts as
-  its split share.
+  percentages are of observed time, and the chart shows relative shares.
   Names are looked up from Discord when absent from the bot's cache; if Discord
   cannot provide a name, the report shows the user ID. Names are not stored.
   The chart includes only source voice channels visible to the requester
@@ -684,9 +661,7 @@ today, this week, this month, or all time unless stated otherwise.
   `/flock company`, time is not split: an hour in a call with three people counts
   as an hour for each of them. It uses the same channel visibility rules and name
   lookup as `/flock company`. Time alone is shown but not ranked, and anyone past
-  the top 10 is counted on one line. The default period is all time. Company
-  time recorded before whole shared time was tracked counts as its split share,
-  since the group size at the time was not stored.
+  the top 10 is counted on one line. The default period is all time.
 - `/flock trends period: kind: count: user:` attaches a chart of how activity changes. The
   default period is the last 7 days (today and the six days before it); pick
   `This week` to start on Monday instead. Kinds:

@@ -642,8 +642,7 @@ async def _company_report(
         lines.append(
             "Each person is credited with every minute they shared, so slices overlap: percentages are "
             "of observed time and the chart shows relative shares. Time alone has its own slice. "
-            "Only observed time since companion tracking began is included, and time recorded before "
-            "whole shared time was tracked counts as its split share."
+            "Only observed time since companion tracking began is included."
         )
     else:
         lines.append(
@@ -687,8 +686,7 @@ async def _leaderboard_text(
         lines.append(f"Time alone (not ranked): {_duration(full_by_member[0])}.")
     lines.append(
         f"Each person gets the whole time they were in a tracked voice channel with {person.safe}, so "
-        "group calls count fully for everyone. Time recorded before that change counts as its "
-        "even split, as in `/flock company`."
+        "group calls count fully for everyone."
     )
     return "\n".join(lines)
 
