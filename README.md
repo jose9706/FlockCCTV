@@ -635,8 +635,9 @@ today, this week, this month, or all time unless stated otherwise.
   missing coverage includes the time they were not on the tracked list.
 - `/flock records user:` shows the busiest message day, the longest fully observed
   voice visit, how long a visit in progress has been observed so far, and the
-  top voice companion since companion tracking began (same split-time measure
-  and channel visibility rules as `/flock company`).
+  top voice companion since companion tracking began (whole shared time, as
+  `/flock leaderboard` counts it, under the same channel visibility rules as
+  `/flock company`).
 - `/flock where user:` shows the last observed voice channel and time, or that the
   person is currently in voice. It is public in configured report channels and
   private elsewhere. A public reply names the voice channel only if the

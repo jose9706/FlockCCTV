@@ -81,7 +81,7 @@ recorded only while a person is tracked; earlier company cannot be
 reconstructed. Bots are excluded. Each observed minute is split evenly among
 the people present, so slices plus time alone sum to the observed, attributable
 voice time. Each person's whole shared time is also stored, without the split,
-for the leaderboard and for company reports run with `count:full`.
+for the leaderboard, the records' top companion, and for company reports run with `count:full`.
 When someone joins or leaves a channel, every tracked person in it gets the
 change applied to their own roster at that moment. An outage ends attribution at
 the last reliable checkpoint.
