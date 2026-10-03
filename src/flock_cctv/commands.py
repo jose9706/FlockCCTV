@@ -50,6 +50,7 @@ COMPANY_COUNT_CHOICES = [
 ]
 
 _ROAST_COOLDOWN = SharedRoastCooldown(seconds=30)
+_INTRODUCE_COOLDOWN = SharedRoastCooldown(seconds=300)
 # Company member ID that stands in for people whose data was deleted.
 _DELETED_COMPANION = int(DELETED_COMPANION_ID)
 # Seconds a pre-acknowledgement store read may take (Discord allows three).
@@ -1599,6 +1600,18 @@ async def _tracked_list_text(bot: Any) -> str:
     return "\n".join(lines)
 
 
+def _introduction_text(bot: Any) -> str:
+    parts = [
+        "Hi, I'm **Flock CCTV**, the security camera bolted to the corner of this server.",
+        "I keep an eye on a short list of people, counting their messages and timing how long they hang around in voice "
+        "(I never keep what anyone actually says), and I turn it all into stats, charts, leaderboards, and the occasional roast.",
+    ]
+    if _leland_id(bot) is not None:
+        parts.append("Also, I hate Leland. Nothing personal, it's in my firmware.")
+    parts.append("Type `/flock help` to see everything I can do.")
+    return " ".join(parts)
+
+
 def _help_text(bot: Any) -> str:
     timezone = bot.config.timezone
     lines = [
@@ -1615,7 +1628,7 @@ def _help_text(bot: Any) -> str:
         "`/flock top` — ranks everyone tracked by messages, voice time, or active days (this week by default).",
         "`/flock track list` — who is tracked now, plus former people whose history is kept.",
         "`/flock track add` and `remove` — tracker admins choose who is tracked; untracking keeps history.",
-        "`/flock help`, `/flock about`, and `/flock version` — this guide, status with tracked people, and release number.",
+        "`/flock help`, `about`, and `version` — this guide, status, and release; `/flock introduce` says hi publicly.",
         "`/flock update`, `/flock pause`, and `/flock resume` — tracker admins check for updates or pause and resume collection.",
         "`/flock delete-data` — tracker admins erase one person's statistics (with `user`) or everyone's, after confirmation.",
     ]
@@ -2061,6 +2074,26 @@ def register_commands(bot: Any) -> None:
             "flock top",
             lambda: _top_text(bot, period, metric),
             ephemeral=_report_is_ephemeral(bot, interaction),
+        )
+
+    @flock.command(name="introduce", description="Have the bot introduce itself in this channel")
+    async def introduce_command(interaction: discord.Interaction) -> None:
+        if not await _scope_ok(interaction, bot):
+            return
+        remaining = await _INTRODUCE_COOLDOWN.consume()
+        if remaining > 0:
+            await _send(
+                interaction,
+                f"I just introduced myself. Try again in {max(1, int(remaining + 0.99))} seconds.",
+                ephemeral=True,
+            )
+            return
+        await _execute_after_scope(
+            interaction,
+            bot,
+            "flock introduce",
+            _async_value(_introduction_text(bot)),
+            ephemeral=False,
         )
 
     @flock.command(name="help", description="Explain commands and what the bot measures")

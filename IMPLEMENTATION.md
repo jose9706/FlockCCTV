@@ -336,7 +336,7 @@ staging) or, in a development checkout, from `git rev-parse`.
 
 `register_commands(bot)` installs the single `/flock` group on `bot.tree`
 for the configured guild, with `admin` and `track` subgroups. Implement stats,
-records, where, company, leaderboard, trends, online, roast, top, help, about,
+records, where, company, leaderboard, trends, online, roast, top, introduce, help, about,
 version, update, pause, resume, delete-data, evil-mode, reaction-mode, `admin`
 add/remove/list (owner only), and `track` add/remove/list.
 Runtime checks enforce the guild and optional output channel; only the configured
@@ -376,7 +376,9 @@ Period choices are `today`, `week`, `month`, `all` (plus `last7` for trends).
 General reports (`stats`, `records`, `where`, `company`, `leaderboard`, `trends`,
 `roast`, `top`, `help`) are public in report channels and private elsewhere;
 `online`, `about`, `version`, `update`, `admin`, `track`, and controls are always
-private. Deletion confirmation is private, restricted to its requester, rechecks
+private. `introduce` always posts publicly in the invoking channel (after the
+guild and output-channel checks) and shares a 300-second process-wide cooldown;
+its Leland sentence appears only with `leland_user_id`. Deletion confirmation is private, restricted to its requester, rechecks
 access when confirmed, expires, and says exactly whether it erases everyone's data
 or one named person's. Without `user` it calls `tracker.delete_data` and the tracked
 list is kept; with `user` it calls `tracker.delete_user_data` and that person is

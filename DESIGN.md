@@ -131,6 +131,7 @@ activity to show (defaults to you)”; omitted, it is the requester.
 | `/flock online user:` | Current Discord status of a currently tracked person; idle and Do Not Disturb count as online |
 | `/flock roast period:week user:` | A short template joke using a real statistic about the person |
 | `/flock top period:week metric:messages` | Ranks the tracked people by messages, voice time, or active days; top 10 plus a count of the rest |
+| `/flock introduce` | Public one-paragraph introduction in the current channel (a security camera that tracks the list; hates Leland only with `LELAND_USER_ID`); five-minute shared cooldown |
 | `/flock help` | Commands and what the bot measures |
 | `/flock about` | Bot version, connection health, enabled collectors, tracked people count, last checkpoint and gaps, last automatic update result |
 | `/flock version` | Release number and deployed commit of the running bot |

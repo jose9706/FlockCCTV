@@ -254,7 +254,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             {command.name for command in flock.commands},
             {
                 "stats", "records", "where", "company", "leaderboard", "trends", "online", "roast",
-                "top", "help", "about", "version", "update", "pause", "resume", "delete-data",
+                "top", "introduce", "help", "about", "version", "update", "pause", "resume", "delete-data",
                 "evil-mode", "reaction-mode", "admin", "track",
             },
         )
@@ -294,7 +294,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(parameter.type, discord.AppCommandOptionType.user)
                 self.assertEqual(parameter.description, "Whose activity to show (defaults to you)")
                 self.assertIsNone(inspect.signature(command.callback).parameters["user"].default)
-        for name in ("top", "help", "about", "version", "update", "pause", "resume"):
+        for name in ("top", "introduce", "help", "about", "version", "update", "pause", "resume"):
             with self.subTest(command=name):
                 command = next(command for command in flock.commands if command.name == name)
                 self.assertNotIn("user", [item.name for item in command.parameters])
@@ -935,6 +935,37 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         sent = interaction.followup.sent[0]
         self.assertIn(flock_cctv.version_string(), sent["content"])
         self.assertTrue(sent["ephemeral"])
+
+    async def test_introduce_posts_publicly_with_a_shared_cooldown(self):
+        register_commands(self.bot)
+        flock = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+        introduce = next(command for command in flock.commands if command.name == "introduce")
+        with patch.object(commands_module, "_INTRODUCE_COOLDOWN", SharedRoastCooldown(seconds=300)):
+            first = FakeInteraction(user=SimpleNamespace(id=31))
+            await introduce.callback(first)
+            sent = first.followup.sent[0]
+            self.assertFalse(sent["ephemeral"])
+            self.assertIn("Flock CCTV", sent["content"])
+            self.assertIn("I hate Leland", sent["content"])
+            self.assertIn("/flock help", sent["content"])
+            self.assertNotIn("\n", sent["content"])
+            second = FakeInteraction(user=SimpleNamespace(id=32))
+            await introduce.callback(second)
+            self.assertTrue(second.response.sent[0]["ephemeral"])
+            self.assertIn("just introduced myself", second.response.sent[0]["content"])
+        self.config.leland_user_id = None
+        self.assertNotIn("Leland", commands_module._introduction_text(self.bot))
+
+    async def test_introduce_respects_the_configured_server(self):
+        register_commands(self.bot)
+        flock = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+        introduce = next(command for command in flock.commands if command.name == "introduce")
+        with patch.object(commands_module, "_INTRODUCE_COOLDOWN", SharedRoastCooldown(seconds=300)):
+            elsewhere = FakeInteraction(guild_id=999, user=SimpleNamespace(id=31))
+            await introduce.callback(elsewhere)
+            self.assertTrue(elsewhere.response.sent[0]["ephemeral"])
+            self.assertIn("configured server", elsewhere.response.sent[0]["content"])
+            self.assertEqual(await commands_module._INTRODUCE_COOLDOWN.consume(), 0)
 
     async def test_about_command_replies_privately_with_status(self):
         register_commands(self.bot)
@@ -2294,7 +2325,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         for expected in (
             "/flock stats", "/flock records", "/flock where", "/flock company", "/flock leaderboard",
             "/flock trends", "/flock online", "/flock roast", "/flock top", "/flock track list",
-            "/flock track add", "/flock help", "/flock about", "/flock version", "/flock update",
+            "/flock track add", "/flock introduce", "/flock help", "`about`", "`version`", "/flock update",
             "/flock pause", "/flock resume", "/flock delete-data", "/flock admin add",
             "optional `user`", "/flock evil-mode", "/flock reaction-mode", "America/Costa_Rica",
             "**Flock commands**",

@@ -701,6 +701,10 @@ today, this week, this month, or all time unless stated otherwise.
   appears only if they have activity in the period and is marked as no longer
   tracked, and the rest are counted on one line. It follows the general report
   visibility rules and names no channels.
+- `/flock introduce` has the bot post a short public introduction in the
+  channel where it is run, even outside report channels. Its dig at Leland
+  appears only with `LELAND_USER_ID` set, and a shared five-minute cooldown
+  keeps it from being spammed.
 - `/flock help` explains the measurements and available commands.
 - `/flock about` privately shows the bot version, connection health, collector
   state, number of tracked people, last checkpoint, recorded coverage gaps, and
