@@ -337,6 +337,20 @@ class GracefulSignalTests(unittest.IsolatedAsyncioTestCase):
         await bot.on_guild_available(SimpleNamespace(id=11, unavailable=False))
         tracker.guild_available.assert_not_awaited()
 
+    async def test_guild_loss_events_stop_collection_only_for_configured_guild(self):
+        with TemporaryDirectory() as directory:
+            bot = create_bot(make_config(Path(directory)))
+        tracker = SimpleNamespace(guild_unavailable=AsyncMock(side_effect=OSError("disk")))
+        bot.tracker = tracker
+        with self.assertLogs("flock_cctv.bot", level="ERROR") as logs:
+            await bot.on_guild_unavailable(SimpleNamespace(id=10, unavailable=True))
+            await bot.on_guild_remove(SimpleNamespace(id=10, unavailable=False))
+        self.assertEqual(tracker.guild_unavailable.await_count, 2)
+        self.assertIn("guild became unavailable", logs.output[0])
+        self.assertIn("left configured guild", logs.output[1])
+        await bot.on_guild_remove(SimpleNamespace(id=11, unavailable=False))
+        self.assertEqual(tracker.guild_unavailable.await_count, 2)
+
     async def _run_on_ready(self, bot):
         bot._reconcile_gateway_ready = AsyncMock()
         bot._profile_loop = AsyncMock()

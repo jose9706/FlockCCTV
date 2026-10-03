@@ -274,17 +274,21 @@ and after every track, untrack, or deletion), and async methods:
 `untrack_user(user_id: int, actor_id: int) -> bool`,
 `delete_user_data(user_id: int, actor_id: int) -> bool`, `shutdown()`.
 `report_error(operation, exc)` and `report_recovered(operation)` let the adapter
-publish and clear its own failures. `collection_since: float | None` is when
-guild collection last started (None while stopped). `shutdown()` records its gap
+publish and clear its own failures; `last_error` reads `"<operation> failed
+(<exception type>)"` and a later success of that same operation (or, for a
+connection or voice failure, a successful collection start) clears it.
+`collection_since: float | None` is when guild collection last started (None
+while stopped). `shutdown()` records its gap
 as `process_restart`.
 
 `VoiceSnapshot` is either a mapping or a zero-argument function returning one; a
 function is called only once the tracker holds its lock. A *voice snapshot*
 is `Mapping[int, int]`: member ID to the eligible channel ID of
 every non-bot member currently in an eligible voice channel (allowlist applied,
-AFK excluded). The adapter builds it; the tracker derives each tracked person's
-companions as the other members the snapshot places in the same channel. Starting
-guild collection refreshes `tracked_ids`, retries `Store.disconnect`, calls
+AFK excluded). The adapter builds it with `eligible_voice_channel_id(config,
+guild, channel)`, the same channel check live voice events use; the tracker
+derives each tracked person's companions as the other members the snapshot
+places in the same channel. Starting guild collection refreshes `tracked_ids`, retries `Store.disconnect`, calls
 `Store.connect`, then starts an incomplete-start visit for each tracked person in
 the snapshot. `track_user` starts one for a newly added person the same way when
 collection is live and not paused.

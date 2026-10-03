@@ -51,6 +51,31 @@ def _take_snapshot(snapshot: VoiceSnapshot) -> Mapping[int, int]:
     return snapshot() if callable(snapshot) else snapshot
 
 
+def _allowed_voice_channel(config: Config, channel_id: int | None) -> int | None:
+    if channel_id is None:
+        return None
+    allowlist = config.voice_channel_ids
+    return channel_id if allowlist is None or channel_id in allowlist else None
+
+
+def eligible_voice_channel_id(config: Config, guild: Any, channel: Any) -> int | None:
+    """Return ``channel``'s ID when it is an eligible voice channel, else None.
+
+    ``guild`` is the guild the channel was seen through. Eligible means both
+    belong to the configured guild, the channel is not that guild's AFK
+    channel, and it is inside ``VOICE_CHANNEL_IDS`` when an allowlist is set.
+    """
+    channel_id = _id(channel)
+    if channel_id is None or _id(guild) != config.guild_id:
+        return None
+    channel_guild_id = _id(getattr(channel, "guild", None))
+    if channel_guild_id is not None and channel_guild_id != config.guild_id:
+        return None
+    if _id(getattr(guild, "afk_channel", None)) == channel_id:
+        return None
+    return _allowed_voice_channel(config, channel_id)
+
+
 # Operation names published in ``Tracker.last_error`` as "<operation> failed (...)".
 OP_READY = "ready"
 OP_GUILD_RECOVERY = "guild recovery"
@@ -145,12 +170,6 @@ class Tracker:
     def _now(now: float | None) -> float:
         return time.time() if now is None else float(now)
 
-    def _eligible_voice_channel(self, channel_id: int | None) -> int | None:
-        if channel_id is None:
-            return None
-        allowlist = self.config.voice_channel_ids
-        return channel_id if allowlist is None or channel_id in allowlist else None
-
     async def _refresh_tracked(self) -> None:
         self.tracked_ids = frozenset(await self.store.active_user_ids())
 
@@ -168,7 +187,7 @@ class Tracker:
         self, user_id: int, snapshot: Mapping[int, int], now: float
     ) -> None:
         """Begin an incomplete-start visit when the snapshot places a person in voice."""
-        channel_id = self._eligible_voice_channel(snapshot.get(user_id))
+        channel_id = _allowed_voice_channel(self.config, snapshot.get(user_id))
         if channel_id is None:
             return
         await self.store.voice_transition(
@@ -309,21 +328,9 @@ class Tracker:
                 return inserted, False
 
     def _channel_id_for_state(self, member: Any, state: Any) -> int | None:
-        channel = getattr(state, "channel", None)
-        channel_id = _id(channel)
-        if channel_id is None:
-            return None
-        guild = getattr(member, "guild", None)
-        guild_id = _id(guild)
-        channel_guild_id = _id(getattr(channel, "guild", None))
-        if guild_id != self.config.guild_id:
-            return None
-        if channel_guild_id is not None and channel_guild_id != self.config.guild_id:
-            return None
-        afk_id = _id(getattr(guild, "afk_channel", None))
-        if afk_id == channel_id:
-            return None
-        return self._eligible_voice_channel(channel_id)
+        return eligible_voice_channel_id(
+            self.config, getattr(member, "guild", None), getattr(state, "channel", None)
+        )
 
     @staticmethod
     def _companions(channel: Any, member_id: int) -> frozenset[int]:
