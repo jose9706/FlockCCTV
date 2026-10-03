@@ -1,24 +1,22 @@
-"""Small, deterministic avatar image transformation."""
+"""The bot's fixed Discord profile: name, description, and bundled avatar."""
 
 from __future__ import annotations
 
-from io import BytesIO
+import hashlib
+from importlib import resources
 
-from PIL import Image, ImageOps
+BOT_USERNAME = "Flock CCTV"
+BOT_DESCRIPTION = (
+    "Flock CCTV keeps an eye on the server. It tracks an admin-managed list of "
+    "people, counting their messages and their time in voice, and turns that "
+    "into reports, trends and leaderboards. It never stores what anyone writes."
+)
 
 
-def invert_avatar(data: bytes) -> bytes:
-    """Invert RGB colours, preserving transparency, and return a square PNG."""
-    if len(data) > 4 * 1024 * 1024:
-        raise ValueError("Avatar image is too large")
-    with Image.open(BytesIO(data)) as source:
-        source.seek(0)  # Animated avatars use their first frame.
-        frame = ImageOps.exif_transpose(source).convert("RGBA")
-        frame = ImageOps.fit(frame, (256, 256), method=Image.Resampling.LANCZOS)
-        red, green, blue, alpha = frame.split()
-        inverted = Image.merge("RGB", (red, green, blue))
-        inverted = ImageOps.invert(inverted).convert("RGBA")
-        inverted.putalpha(alpha)
-        output = BytesIO()
-        inverted.save(output, format="PNG", optimize=True)
-        return output.getvalue()
+def profile_avatar() -> bytes:
+    """Return the bundled Flock camera avatar image."""
+    return resources.files(__package__).joinpath("assets/avatar.jpg").read_bytes()
+
+
+def avatar_digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()

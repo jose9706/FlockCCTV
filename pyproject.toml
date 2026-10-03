@@ -17,3 +17,6 @@ version = {attr = "flock_cctv.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+flock_cctv = ["assets/*.jpg"]

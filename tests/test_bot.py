@@ -338,35 +338,20 @@ class GracefulSignalTests(unittest.IsolatedAsyncioTestCase):
 
     async def _run_on_ready(self, bot):
         bot._reconcile_gateway_ready = AsyncMock()
-        bot._avatar_loop = AsyncMock()
+        bot._profile_loop = AsyncMock()
         bot._update_watch_loop = AsyncMock()
         with patch("flock_cctv.bot.update_status.write_ready"):
             await bot.on_ready()
         await asyncio.sleep(0)
 
-    async def test_avatar_task_starts_only_when_leland_is_configured(self):
+    async def test_profile_task_starts_with_or_without_leland(self):
         with TemporaryDirectory() as directory:
-            bot = create_bot(make_config(Path(directory)))
-            await self._run_on_ready(bot)
-            self.assertIsNotNone(bot._avatar_task)
-            bot._avatar_loop.assert_awaited_once()
-
-            without = create_bot(make_config(Path(directory), leland_user_id=None))
-            await self._run_on_ready(without)
-            self.assertIsNone(without._avatar_task)
-            without._avatar_loop.assert_not_awaited()
-            # The rest of start-up (update watch) still runs.
-            self.assertIsNotNone(without._update_watch_task)
-
-    async def test_sync_avatar_does_nothing_without_a_configured_leland(self):
-        with TemporaryDirectory() as directory:
-            bot = create_bot(make_config(Path(directory), leland_user_id=None))
-        guild = SimpleNamespace(fetch_member=AsyncMock())
-        bot.get_guild = lambda guild_id: guild
-        bot._connection.user = SimpleNamespace(avatar=None, edit=AsyncMock())
-        await bot._sync_avatar()
-        guild.fetch_member.assert_not_awaited()
-        bot.user.edit.assert_not_awaited()
+            for leland_user_id in (20, None):
+                bot = create_bot(make_config(Path(directory), leland_user_id=leland_user_id))
+                await self._run_on_ready(bot)
+                self.assertIsNotNone(bot._profile_task)
+                bot._profile_loop.assert_awaited_once()
+                self.assertIsNotNone(bot._update_watch_task)
 
     async def test_sigterm_path_closes_client_and_waits_for_gateway(self):
         stopping = asyncio.Event()
