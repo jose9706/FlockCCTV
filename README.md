@@ -710,12 +710,37 @@ today, this week, this month, or all time unless stated otherwise.
   state, number of tracked people, last checkpoint, recorded coverage gaps, and
   the last automatic update result. With `LELAND_USER_ID` set it also shows the
   evil and reaction mode state. Coverage gaps here are the collector's global
-  outages.
+  outages; admins can see each one with `/flock debug uptime`.
 - `/flock version` privately shows the release number and deployed commit.
 - `/flock update` lets the configured owner and extra admins make the Pi check
   GitHub for a new commit now instead of waiting for the 15-minute poll. It
   needs the update path unit from "Install the timer" above; without it the
   request is picked up at the next scheduled poll.
+- `/flock debug` commands help the configured owner and extra admins check on
+  the bot. Every reply is private.
+  - `/flock debug health` shows how long the bot process and collection have
+    been running, how old the last checkpoint is, the current error, how many
+    problems were logged in the last day and week, database size and free disk
+    space, the newest daily backup, retention, the outage alert setting, and the
+    last automatic update result. It flags a stale checkpoint, under 10% free
+    disk, or no backup in two days.
+  - `/flock debug uptime period:` (last 7 days by default) shows the share of
+    time the bot was watching, every outage with its start, length and cause
+    ("Discord connection lost" or "bot stopped or restarted"), time paused, and
+    a stacked chart of watching, outage, and paused time per day.
+  - `/flock debug errors` lists the newest warnings and errors the bot logged.
+    Only the bot's own log line and the error type are kept (never message text
+    or error details), for the retention period and at most 500 entries; the
+    journal still has full tracebacks.
+  - `/flock debug person user:` shows one person's tracking history: when they
+    were tracked and by whom, how much of that time the bot was watching,
+    missing coverage split into outages, pauses, and time off the tracked list,
+    the outages that hit them, counts of stored records, what retention pruned,
+    and whether they are in voice now. It never names voice channels.
+  - `/flock debug alerts minutes:` shows or sets how long an outage must last
+    before the owner gets a DM about it once the bot is back. The default is 15
+    minutes and 0 turns alerts off. Outages that ended before a change are not
+    announced.
 - `/flock pause`, `/flock resume`, and `/flock delete-data` control
   collection. Only the configured owner and extra admins can use these controls.
   Pausing and resuming apply to everyone.

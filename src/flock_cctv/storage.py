@@ -14,6 +14,7 @@ import math
 import os
 import random
 import re
+import shutil
 import sqlite3
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +29,7 @@ from .stats import (
     local_date,
     local_day,
     local_midnight,
+    merge_intervals,
     period_bounds,
     previous_period_bounds,
     split_interval_by_day,
@@ -75,6 +77,11 @@ class Store:
     # afterwards, the visit continues instead of splitting into two incomplete
     # visits. The uncovered interval is still a coverage gap and is never counted.
     VISIT_BRIDGE_SECONDS = 120.0
+    # The owner is told about an outage this long once collection is back;
+    # admins change it with /flock debug alerts, and 0 turns alerts off.
+    DEFAULT_OUTAGE_ALERT_MINUTES = 15
+    # Newest error log rows kept, on top of the retention window.
+    ERROR_LOG_LIMIT = 500
 
     def __init__(self, path: Path, backup_dir: Path, timezone: str) -> None:
         self.path = Path(path)
@@ -282,6 +289,23 @@ class Store:
             CREATE TABLE IF NOT EXISTS admin_overrides (
                 user_id TEXT PRIMARY KEY,
                 enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+            );
+
+            -- Admin debugging. Summaries are the bot's own log lines and
+            -- exception type names, never message text or exception details.
+            CREATE TABLE IF NOT EXISTS error_log (
+                error_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at REAL NOT NULL,
+                level TEXT NOT NULL,
+                source TEXT NOT NULL,
+                summary TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS error_log_at_idx ON error_log(at);
+
+            CREATE TABLE IF NOT EXISTS outage_alerts (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                minutes INTEGER NOT NULL CHECK (minutes >= 0),
+                last_gap_id INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -586,11 +610,13 @@ class Store:
                            ) VALUES (1, ?, ?, ?, ?)""",
                         (guild_id_text, self.timezone, now, now),
                     )
+                    self._ensure_outage_alerts(conn)
                     return
                 if row["guild_id"] != guild_id_text:
                     raise StoreError("database belongs to a different guild")
                 if row["timezone"] != self.timezone:
                     raise StoreError("database timezone differs from configured timezone")
+                self._ensure_outage_alerts(conn)
 
                 was_connected = bool(row["connected"])
                 intentionally_paused = bool(row["paused"])
@@ -1261,9 +1287,15 @@ class Store:
 
         await self._run(operation)
 
-    async def disconnect(self, now: float) -> None:
-        """Close observed state at last checkpoint and record uncertain time as a gap."""
+    async def disconnect(self, now: float, reason: str = "disconnect") -> None:
+        """Close observed state at last checkpoint and record uncertain time as a gap.
+
+        ``reason`` labels the gap: ``disconnect`` for a lost Discord
+        connection or server, ``process_restart`` when the bot itself stops.
+        """
         now = self._timestamp(now)
+        if reason not in ("disconnect", "process_restart"):
+            raise ValueError(f"unsupported gap reason: {reason}")
 
         def operation() -> None:
             conn = self._conn()
@@ -1305,7 +1337,7 @@ class Store:
                     checkpoint = min(checkpoint, coverage_checkpoint)
 
                 if not bool(settings["paused"]):
-                    self._start_gap(conn, checkpoint, "disconnect")
+                    self._start_gap(conn, checkpoint, reason)
                 conn.execute(
                     "UPDATE settings SET connected = 0, last_checkpoint = ? WHERE singleton = 1",
                     (checkpoint,),
@@ -1932,6 +1964,407 @@ class Store:
 
     # -- Deletion -----------------------------------------------------------
 
+    # -- Admin debugging ----------------------------------------------------
+
+    @staticmethod
+    def _ensure_outage_alerts(conn: sqlite3.Connection) -> None:
+        """Create the alert row once; outages recorded before it are never announced."""
+        conn.execute(
+            "INSERT OR IGNORE INTO outage_alerts(singleton, minutes, last_gap_id) "
+            "VALUES (1, ?, (SELECT COALESCE(MAX(gap_id), 0) FROM coverage_gaps))",
+            (Store.DEFAULT_OUTAGE_ALERT_MINUTES,),
+        )
+
+    @staticmethod
+    def _gaps_between(
+        conn: sqlite3.Connection, start: float, end: float
+    ) -> list[dict[str, Any]]:
+        """Return recorded gaps overlapping ``[start, end)``; an open one runs to ``end``."""
+        return [
+            {
+                "gap_id": int(row["gap_id"]),
+                "started_at": float(row["started_at"]),
+                "ended_at": None if row["ended_at"] is None else float(row["ended_at"]),
+                "reason": str(row["reason"]),
+                "seconds": max(
+                    0.0,
+                    (end if row["ended_at"] is None else float(row["ended_at"]))
+                    - float(row["started_at"]),
+                ),
+            }
+            for row in conn.execute(
+                "SELECT * FROM coverage_gaps WHERE started_at < ? "
+                "AND COALESCE(ended_at, ?) > ? ORDER BY started_at, gap_id",
+                (end, end, start),
+            )
+        ]
+
+    def _observed_pieces(
+        self, conn: sqlite3.Connection, start: float, end: float, live_until: float | None
+    ) -> list[tuple[float, float]]:
+        """Return the collector's observed coverage clipped to ``[start, end)``."""
+        pieces: list[tuple[float, float]] = []
+        for row in conn.execute(
+            "SELECT started_at, ended_at, checkpoint FROM coverage_intervals "
+            "WHERE started_at < ? AND (ended_at IS NULL OR ended_at > ?)",
+            (end, start),
+        ):
+            if row["ended_at"] is not None:
+                interval_end = float(row["ended_at"])
+            elif live_until is not None:
+                interval_end = max(float(row["checkpoint"]), live_until)
+            else:
+                interval_end = float(row["checkpoint"])
+            pieces.append((max(start, float(row["started_at"])), min(end, interval_end)))
+        return merge_intervals(pieces)
+
+    async def uptime(
+        self, period: str, now: float, *, include_live: bool = True
+    ) -> dict[str, Any]:
+        """Split a period into observed, outage, and idle seconds per local day.
+
+        Outages are the recorded coverage gaps (lost connection or a bot
+        restart). Idle is everything else the collector was not observing,
+        such as a pause. Time before the database clock began is left out.
+        """
+        now = self._timestamp(now)
+
+        def operation() -> dict[str, Any]:
+            conn = self._conn()
+            settings = self._settings(conn)
+            since = float(settings["tracking_since"])
+            start, end = period_bounds(period, now, self.timezone, since)
+            start = max(start, since)
+            end = max(end, start)
+            live_until = now if self._is_live(settings, include_live) else None
+            observed = self._observed_pieces(conn, start, end, live_until)
+            gaps = self._gaps_between(conn, start, end)
+            gap_pieces = merge_intervals(
+                (
+                    max(start, gap["started_at"]),
+                    min(end, end if gap["ended_at"] is None else gap["ended_at"]),
+                )
+                for gap in gaps
+            )
+            days: dict[str, dict[str, float]] = {}
+
+            def add(pieces: list[tuple[float, float]], field: str) -> None:
+                for piece_start, piece_end in pieces:
+                    for day, seconds in split_interval_by_day(piece_start, piece_end, self.timezone):
+                        days.setdefault(day, {"observed": 0.0, "outage": 0.0, "idle": 0.0})
+                        days[day][field] += seconds
+
+            add([(start, end)], "idle")
+            add(observed, "observed")
+            add(gap_pieces, "outage")
+            for totals in days.values():
+                # Whatever was neither observed nor an outage was idle.
+                totals["idle"] = max(0.0, totals["idle"] - totals["observed"] - totals["outage"])
+            series = [{"day": day, **days[day]} for day in sorted(days)]
+            return {
+                "start": start,
+                "end": end,
+                "days": series,
+                "observed": sum(entry["observed"] for entry in series),
+                "outage": sum(entry["outage"] for entry in series),
+                "idle": sum(entry["idle"] for entry in series),
+                "outages": gaps,
+                "paused": bool(settings["paused"]),
+            }
+
+        return await self._run(operation)
+
+    async def record_errors(self, entries: list[tuple[float, str, str, str]]) -> None:
+        """Append ``(at, level, source, summary)`` rows and keep the newest ones."""
+        rows = [
+            (self._timestamp(at), str(level)[:16], str(source)[:64], str(summary)[:300])
+            for at, level, source, summary in entries
+        ]
+        if not rows:
+            return
+
+        def operation() -> None:
+            conn = self._conn()
+
+            def action() -> None:
+                self._settings(conn)
+                conn.executemany(
+                    "INSERT INTO error_log(at, level, source, summary) VALUES (?, ?, ?, ?)", rows
+                )
+                conn.execute(
+                    "DELETE FROM error_log WHERE error_id NOT IN "
+                    "(SELECT error_id FROM error_log ORDER BY at DESC, error_id DESC LIMIT ?)",
+                    (self.ERROR_LOG_LIMIT,),
+                )
+
+            self._transaction(conn, action)
+
+        await self._run(operation)
+
+    async def error_log(self, now: float, limit: int = 15) -> dict[str, Any]:
+        """Return the newest logged problems and how many fell in the last day and week."""
+        now = self._timestamp(now)
+
+        def operation() -> dict[str, Any]:
+            conn = self._conn()
+            self._settings(conn)
+
+            def count(since: float | None) -> int:
+                if since is None:
+                    return int(conn.execute("SELECT COUNT(*) FROM error_log").fetchone()[0])
+                return int(conn.execute(
+                    "SELECT COUNT(*) FROM error_log WHERE at >= ?", (since,)
+                ).fetchone()[0])
+
+            return {
+                "recent": [
+                    {
+                        "at": float(row["at"]),
+                        "level": str(row["level"]),
+                        "source": str(row["source"]),
+                        "summary": str(row["summary"]),
+                    }
+                    for row in conn.execute(
+                        "SELECT * FROM error_log ORDER BY at DESC, error_id DESC LIMIT ?",
+                        (int(limit),),
+                    )
+                ],
+                "day": count(now - 86_400.0),
+                "week": count(now - 7 * 86_400.0),
+                "total": count(None),
+            }
+
+        return await self._run(operation)
+
+    async def outage_alert_minutes(self) -> int:
+        def operation() -> int:
+            conn = self._conn()
+            self._settings(conn)
+            row = conn.execute("SELECT minutes FROM outage_alerts WHERE singleton = 1").fetchone()
+            return self.DEFAULT_OUTAGE_ALERT_MINUTES if row is None else int(row["minutes"])
+
+        return await self._run(operation)
+
+    async def set_outage_alert_minutes(self, minutes: int) -> None:
+        """Change the alert threshold; outages that already ended are not announced."""
+        if isinstance(minutes, bool) or int(minutes) < 0:
+            raise ValueError("minutes must not be negative")
+
+        def operation() -> None:
+            conn = self._conn()
+
+            def action() -> None:
+                self._settings(conn)
+                self._ensure_outage_alerts(conn)
+                conn.execute(
+                    "UPDATE outage_alerts SET minutes = ?, last_gap_id = MAX(last_gap_id, "
+                    "(SELECT COALESCE(MAX(gap_id), 0) FROM coverage_gaps WHERE ended_at IS NOT NULL)) "
+                    "WHERE singleton = 1",
+                    (int(minutes),),
+                )
+
+            self._transaction(conn, action)
+
+        await self._run(operation)
+
+    async def due_outage_alerts(self) -> list[dict[str, Any]]:
+        """Return finished outages long enough to announce, marking them announced.
+
+        Each outage is returned at most once. An outage still in progress waits
+        until collection is back and it has an end.
+        """
+
+        def operation() -> list[dict[str, Any]]:
+            conn = self._conn()
+
+            def action() -> list[dict[str, Any]]:
+                self._settings(conn)
+                self._ensure_outage_alerts(conn)
+                alerts = conn.execute(
+                    "SELECT minutes, last_gap_id FROM outage_alerts WHERE singleton = 1"
+                ).fetchone()
+                rows = conn.execute(
+                    "SELECT * FROM coverage_gaps WHERE gap_id > ? AND ended_at IS NOT NULL "
+                    "ORDER BY gap_id",
+                    (int(alerts["last_gap_id"]),),
+                ).fetchall()
+                if not rows:
+                    return []
+                # An open gap is never skipped: rows are only finished ones, and
+                # gap IDs grow, so an older open gap cannot sit behind a newer one.
+                conn.execute(
+                    "UPDATE outage_alerts SET last_gap_id = ? WHERE singleton = 1",
+                    (max(int(row["gap_id"]) for row in rows),),
+                )
+                minutes = int(alerts["minutes"])
+                if minutes <= 0:
+                    return []
+                return [
+                    {
+                        "started_at": float(row["started_at"]),
+                        "ended_at": float(row["ended_at"]),
+                        "reason": str(row["reason"]),
+                        "seconds": float(row["ended_at"]) - float(row["started_at"]),
+                    }
+                    for row in rows
+                    if float(row["ended_at"]) - float(row["started_at"]) >= minutes * 60
+                ]
+
+            return self._transaction(conn, action)
+
+        return await self._run(operation)
+
+    async def files_summary(self) -> dict[str, Any]:
+        """Return database, backup, and disk sizes for the health report."""
+
+        def operation() -> dict[str, Any]:
+            conn = self._conn()
+            settings = self._settings(conn)
+
+            def size(path: Path) -> int:
+                try:
+                    return path.stat().st_size
+                except OSError:
+                    return 0
+
+            backups: list[dict[str, Any]] = []
+            if self.backup_dir.is_dir():
+                for path in self.backup_dir.iterdir():
+                    if _BACKUP_RE.fullmatch(path.name) or path.name in _NAMED_BACKUPS:
+                        try:
+                            stat = path.stat()
+                        except OSError:
+                            continue
+                        backups.append({
+                            "name": path.name,
+                            "modified": stat.st_mtime,
+                            "bytes": stat.st_size,
+                            "daily": _BACKUP_RE.fullmatch(path.name) is not None,
+                        })
+            backups.sort(key=lambda item: item["modified"], reverse=True)
+            try:
+                disk = shutil.disk_usage(self.path.parent)
+                free, total = disk.free, disk.total
+            except OSError:
+                free = total = None
+            return {
+                "database_bytes": size(self.path),
+                "wal_bytes": size(self.path.with_name(self.path.name + "-wal")),
+                "backups": backups,
+                "disk_free": free,
+                "disk_total": total,
+                "retention_days": int(settings["retention_days"]),
+                "pruned_before": (
+                    None if settings["pruned_before"] is None else float(settings["pruned_before"])
+                ),
+                "tracking_since": float(settings["tracking_since"]),
+            }
+
+        return await self._run(operation)
+
+    async def person_debug(
+        self, user_id: int, now: float, *, include_live: bool = True
+    ) -> dict[str, Any]:
+        """Return one person's tracking history, coverage, and stored record counts."""
+        now = self._timestamp(now)
+        user_text = str(int(user_id))
+
+        def operation() -> dict[str, Any]:
+            conn = self._conn()
+            settings = self._settings(conn)
+            tracked = self._tracked_row(conn, user_text)
+            since = self._person_since(settings, tracked)
+            end = max(now, since)
+            intervals = self._tracking_intervals(conn, user_text)
+            clipped = intersect_intervals([(since, end)], intervals)
+            tracked_seconds = sum(b - a for a, b in clipped)
+            live_until = now if self._is_live(settings, include_live) else None
+            watched_pieces = intersect_intervals(
+                self._observed_pieces(conn, since, end, live_until), intervals
+            )
+            watched = sum(b - a for a, b in watched_pieces)
+            outages = []
+            for gap in self._gaps_between(conn, since, end):
+                gap_end = end if gap["ended_at"] is None else gap["ended_at"]
+                overlap = sum(
+                    b - a for a, b in intersect_intervals([(gap["started_at"], gap_end)], clipped)
+                )
+                if overlap > 0:
+                    outages.append({**gap, "seconds": overlap})
+            outage_seconds = sum(gap["seconds"] for gap in outages)
+
+            def count(sql: str) -> int:
+                return int(conn.execute(sql, (user_text,)).fetchone()[0])
+
+            visits = conn.execute(
+                """SELECT COUNT(*) AS total,
+                          COALESCE(SUM(complete_start), 0) AS seen_start,
+                          COALESCE(SUM(complete_end), 0) AS seen_end,
+                          COALESCE(SUM(complete_start * complete_end), 0) AS complete
+                   FROM voice_visits WHERE user_id = ?""",
+                (user_text,),
+            ).fetchone()
+            first_message = conn.execute(
+                "SELECT MIN(created_at) FROM messages WHERE user_id = ?", (user_text,)
+            ).fetchone()[0]
+            open_segment = self._live_segment(conn, settings, user_text, include_live)
+            open_visit = None
+            if open_segment is not None:
+                visit = conn.execute(
+                    "SELECT started_at, complete_start FROM voice_visits WHERE visit_id = ?",
+                    (int(open_segment["visit_id"]),),
+                ).fetchone()
+                if visit is not None:
+                    open_visit = {
+                        "started_at": float(visit["started_at"]),
+                        "complete_start": bool(visit["complete_start"]),
+                    }
+            last_voice = conn.execute(
+                "SELECT seen_at FROM last_voice WHERE user_id = ?", (user_text,)
+            ).fetchone()
+            pruned = settings["pruned_before"]
+            return {
+                "known": tracked is not None or bool(intervals),
+                "active": tracked is not None and bool(tracked["active"]),
+                "tracking_since": since,
+                "added_by": (
+                    None if tracked is None or tracked["added_by"] is None
+                    else int(tracked["added_by"])
+                ),
+                "updated_at": None if tracked is None else float(tracked["updated_at"]),
+                "intervals": [
+                    (start, None if math.isinf(stop) else stop) for start, stop in intervals
+                ],
+                "elapsed_seconds": end - since,
+                "tracked_seconds": tracked_seconds,
+                "watched_seconds": watched,
+                "outage_seconds": outage_seconds,
+                "idle_seconds": max(0.0, tracked_seconds - watched - outage_seconds),
+                "untracked_seconds": max(0.0, end - since - tracked_seconds),
+                "outages": outages,
+                "messages": count("SELECT COUNT(*) FROM messages WHERE user_id = ?"),
+                "first_message_at": None if first_message is None else float(first_message),
+                "daily_rows": count("SELECT COUNT(*) FROM daily_stats WHERE user_id = ?"),
+                "active_days": count(
+                    "SELECT COUNT(*) FROM daily_stats WHERE user_id = ? AND active = 1"
+                ),
+                "voice_visits": int(visits["total"]),
+                "visits_seen_start": int(visits["seen_start"]),
+                "visits_seen_end": int(visits["seen_end"]),
+                "visits_complete": int(visits["complete"]),
+                "voice_segments": count("SELECT COUNT(*) FROM voice_segments WHERE user_id = ?"),
+                "company_rows": count("SELECT COUNT(*) FROM voice_company_daily WHERE user_id = ?"),
+                "records": count("SELECT COUNT(*) FROM records WHERE user_id = ?"),
+                "open_visit": open_visit,
+                "last_voice_at": None if last_voice is None else float(last_voice["seen_at"]),
+                "detail_since": self._detail_since(settings, since, since),
+                "pruned_before": None if pruned is None else float(pruned),
+                "retention_days": int(settings["retention_days"]),
+                "paused": bool(settings["paused"]),
+            }
+
+        return await self._run(operation)
+
     async def delete_data(self, actor_id: int, now: float) -> None:
         """Erase everyone's statistics and all managed backups, then pause collection.
 
@@ -2155,6 +2588,7 @@ class Store:
                     "DELETE FROM voice_visits WHERE ended_at IS NOT NULL AND ended_at < ?",
                     (effective_cutoff,),
                 )
+                conn.execute("DELETE FROM error_log WHERE at < ?", (cutoff,))
                 conn.execute(
                     "UPDATE settings SET pruned_before = ?, retention_days = ? "
                     "WHERE singleton = 1",

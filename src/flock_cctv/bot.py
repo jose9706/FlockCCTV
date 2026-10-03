@@ -18,6 +18,7 @@ from .collectors import Tracker
 from .config import Config
 from .storage import Store
 from .avatar import BOT_DESCRIPTION, BOT_USERNAME, avatar_digest, profile_avatar
+from .error_log import ErrorLogBuffer
 from .evil import evil_messages
 from . import update_status
 
@@ -71,12 +72,16 @@ class TrackerClient(discord.Client):
         self._update_watch_task: asyncio.Task[None] | None = None
         self._setup_complete = False
         self._closing = False
+        # When this process started, for the admin health report.
+        self.started_at = time.time()
+        self.error_log = ErrorLogBuffer()
         self._close_lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
         if self._setup_complete:
             return
         self._instance_lock = _InstanceLock(self.config.database_path)
+        logging.getLogger("flock_cctv").addHandler(self.error_log)
         try:
             self.store = Store(
                 self.config.database_path,
@@ -116,6 +121,7 @@ class TrackerClient(discord.Client):
             if self._instance_lock is not None:
                 self._instance_lock.release()
                 self._instance_lock = None
+            logging.getLogger("flock_cctv").removeHandler(self.error_log)
             raise
 
     async def _checkpoint_loop(self) -> None:
@@ -130,6 +136,50 @@ class TrackerClient(discord.Client):
                 raise
             except Exception:
                 logger.exception("Checkpoint failed")
+            try:
+                await self._alert_outages()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Could not check for outages to report")
+            await self.flush_error_log()
+
+    async def flush_error_log(self) -> None:
+        """Write buffered warnings and errors to the Store for /flock debug errors."""
+        store = self.store
+        entries = self.error_log.drain()
+        if store is None or not entries:
+            self.error_log.restore(entries)
+            return
+        try:
+            await store.record_errors(entries)
+        except asyncio.CancelledError:
+            self.error_log.restore(entries)
+            raise
+        except Exception:
+            # Logging here would only add to the buffer that could not be saved;
+            # the journal already has every entry.
+            self.error_log.restore(entries)
+
+    async def _alert_outages(self) -> None:
+        """DM the owner about each long outage once collection is back."""
+        store = self.store
+        if store is None or self._closing:
+            return
+        outages = await store.due_outage_alerts()
+        if not outages:
+            return
+        from .commands import outage_alert_text
+
+        try:
+            owner = await self.fetch_user(self.config.owner_user_id)
+            await owner.send(
+                outage_alert_text(outages, self.config.timezone),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.Forbidden:
+            # Closed DMs will not open by retrying; /flock debug uptime lists it.
+            logger.warning("Could not DM the owner about an outage (DMs are closed)")
 
     async def _checkpoint_once(self) -> None:
         tracker = self.tracker
@@ -454,6 +504,8 @@ class TrackerClient(discord.Client):
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            await self.flush_error_log()
+            logging.getLogger("flock_cctv").removeHandler(self.error_log)
             try:
                 if self.tracker is not None:
                     await self.tracker.shutdown()

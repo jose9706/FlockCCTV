@@ -1618,9 +1618,9 @@ def _help_text(bot: Any) -> str:
         "**Flock commands**",
         "Flock tracks an admin-managed list of people. Per-person reports take an optional `user` (default: you).",
         "`/flock stats` — messages, observed voice time, active days, visits, and coverage gaps (week by default).",
-        "`/flock records` — busiest message day, longest fully observed voice visit, and top voice companion.",
+        "`/flock records` — busiest day, longest observed voice visit, and top companion.",
         "`/flock where` — last observed voice channel and time.",
-        "`/flock company` — pie chart of who shared observed voice time, or time alone; `count:full` credits each person with whole group calls.",
+        "`/flock company` — pie chart of who shared observed voice time; `count:full` credits whole group calls.",
         "`/flock leaderboard` — who spent the most voice time with someone, counting whole group calls (all time by default).",
         "`/flock trends` — day by day, versus last period, time of day, day of week, company, or message bursts (last 7 days by default).",
         "`/flock online` — Discord status of a tracked person; away counts as online.",
@@ -1630,6 +1630,7 @@ def _help_text(bot: Any) -> str:
         "`/flock track add` and `remove` — tracker admins choose who is tracked; untracking keeps history.",
         "`/flock help`, `about`, and `version` — this guide, status, and release; `/flock introduce` says hi publicly.",
         "`/flock update`, `/flock pause`, and `/flock resume` — tracker admins check for updates or pause and resume collection.",
+        "`/flock debug` — admin health, uptime, errors, people, alerts.",
         "`/flock delete-data` — tracker admins erase one person's statistics (with `user`) or everyone's, after confirmation.",
     ]
     if _leland_id(bot) is not None:
@@ -1700,10 +1701,347 @@ async def _status_text(bot: Any) -> str:
             discord.utils.escape_mentions(update_status.status_line(status, timezone))
         )
     if getattr(tracker, "last_error", None):
-        lines.append("Last tracker error: **recorded**; inspect the service logs for details.")
+        lines.append("Last tracker error: **recorded**; admins can see it with `/flock debug errors`.")
     if paused and state.get("paused_by") is not None:
         lines.append("Pause remains in effect across restarts.")
     return "\n".join(lines)
+
+
+_GAP_REASONS = {
+    "disconnect": "Discord connection lost",
+    "process_restart": "bot stopped or restarted",
+}
+_UPTIME_COLORS = (_PIE_COLORS[2], _PIE_COLORS[7], _BASELINE)
+_UPTIME_OUTAGES_SHOWN = 8
+_ERRORS_SHOWN = 15
+
+
+def _gap_reason(reason: str) -> str:
+    return _GAP_REASONS.get(reason, discord.utils.escape_markdown(reason))
+
+
+def _ago(seconds: float) -> str:
+    return f"{_duration(seconds)} ago"
+
+
+def _size(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    amount = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if amount < 1024 or unit == "GB":
+            return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{amount:.1f} TB"
+
+
+def _percent(part: float, whole: float) -> str:
+    return "n/a" if whole <= 0 else f"{100 * part / whole:.1f}%"
+
+
+def _gap_span(gap: dict[str, Any], timezone: str) -> str:
+    start = _local_time(gap["started_at"], timezone)
+    if gap.get("ended_at") is None:
+        return f"{start} – still open"
+    zone = ZoneInfo(timezone)
+    began = datetime.fromtimestamp(float(gap["started_at"]), tz=zone)
+    ended = datetime.fromtimestamp(float(gap["ended_at"]), tz=zone)
+    if began.date() == ended.date():
+        return f"{began.strftime('%b %-d, %Y %H:%M')} – {ended.strftime('%H:%M %Z')}"
+    return f"{start} – {_local_time(gap['ended_at'], timezone)}"
+
+
+def outage_alert_text(outages: list[dict[str, Any]], timezone: str) -> str:
+    """The owner's DM about outages that ended since the last alert."""
+    if len(outages) == 1:
+        gap = outages[0]
+        lines = [
+            f"**Flock was not watching for {_duration(gap['seconds'])}** "
+            f"({_gap_reason(gap['reason'])}), {_gap_span(gap, timezone)}."
+        ]
+    else:
+        lines = [f"**Flock had {len(outages)} outages:**"]
+        lines.extend(
+            f"• {_duration(gap['seconds'])} ({_gap_reason(gap['reason'])}), {_gap_span(gap, timezone)}"
+            for gap in outages[-10:]
+        )
+    lines.append(
+        "That time counts as missing coverage, not quiet time. "
+        "`/flock debug uptime` has the details; `/flock debug alerts` changes the threshold."
+    )
+    return "\n".join(lines)
+
+
+async def _health_text(bot: Any) -> str:
+    now = time.time()
+    timezone = bot.config.timezone
+    tracker = bot.tracker
+    state = await bot.store.state()
+    lines = ["**Flock health**"]
+    started = getattr(bot, "started_at", None)
+    if started is not None:
+        lines.append(
+            f"Bot process: up **{_duration(now - started)}** (since {_local_time(started, timezone)})."
+        )
+    since = getattr(tracker, "collection_since", None)
+    if state.get("paused", False):
+        lines.append("Collection: **paused** by an admin.")
+    elif _collection_reliable(bot) and since is not None:
+        lines.append(
+            f"Collection: **running** for {_duration(now - since)} "
+            f"(since {_local_time(since, timezone)})."
+        )
+    else:
+        reason = "the Discord connection is down" if not getattr(tracker, "connected", False) else (
+            "the configured server is unavailable"
+            if not getattr(tracker, "guild_is_available", True) else "collection is still starting"
+        )
+        lines.append(f"Collection: **not running**; {reason}.")
+    checkpoint = state.get("last_checkpoint")
+    if checkpoint is None:
+        lines.append("Last checkpoint: not recorded yet.")
+    else:
+        age = max(0.0, now - float(checkpoint))
+        line = f"Last checkpoint: {_local_time(checkpoint, timezone)} ({_ago(age)})."
+        expected = 3 * float(getattr(bot.config, "checkpoint_seconds", 60))
+        if _collection_reliable(bot) and not state.get("paused", False) and age > expected:
+            line += " ⚠️ That is older than expected; checkpoints may be failing."
+        lines.append(line)
+    error = getattr(tracker, "last_error", None)
+    lines.append(
+        f"Current error: **{discord.utils.escape_markdown(error)}**." if error else "Current error: none."
+    )
+    if hasattr(bot, "flush_error_log"):
+        await bot.flush_error_log()
+    errors = await bot.store.error_log(now, limit=0)
+    lines.append(
+        f"Logged problems: **{errors['day']:,}** in the last day, {errors['week']:,} in the last week "
+        "(`/flock debug errors` lists them)."
+    )
+    files = await bot.store.files_summary()
+    database = f"Database: **{_size(files['database_bytes'])}**"
+    if files["wal_bytes"]:
+        database += f" (+{_size(files['wal_bytes'])} write-ahead log)"
+    if files["disk_free"] is not None:
+        database += f"; disk free **{_size(files['disk_free'])}** of {_size(files['disk_total'])}"
+        if files["disk_total"] and files["disk_free"] / files["disk_total"] < 0.1:
+            database += " ⚠️ less than 10% left"
+    lines.append(database + ".")
+    daily = [item for item in files["backups"] if item["daily"]]
+    if daily:
+        newest = daily[0]["modified"]
+        line = (
+            f"Backups: **{len(daily)}** daily, newest {_local_time(newest, timezone)} ({_ago(now - newest)})."
+        )
+        if now - newest > 2 * 86_400:
+            line += " ⚠️ No backup in over two days."
+        lines.append(line)
+    else:
+        lines.append("Backups: **none yet**; the first one is written by daily maintenance.")
+    pruned = files["pruned_before"]
+    retention = f"Retention: message and visit detail kept for **{files['retention_days']} days**"
+    if pruned is not None and pruned > files["tracking_since"]:
+        retention += f" (detail before {_local_time(pruned, timezone, date_only=True)} pruned)"
+    lines.append(retention + ".")
+    minutes = await bot.store.outage_alert_minutes()
+    lines.append(
+        f"Outage alerts: the owner gets a DM after outages of **{_duration(minutes * 60)}** or longer."
+        if minutes else "Outage alerts: **off**."
+    )
+    database_path = getattr(bot.config, "database_path", None)
+    if database_path is not None:
+        status = await asyncio.to_thread(update_status.read_status, database_path)
+        lines.append(discord.utils.escape_mentions(update_status.status_line(status, timezone)))
+    return "\n".join(lines)
+
+
+async def _uptime_report(bot: Any, period: str) -> tuple[str, bytes | None]:
+    timezone = bot.config.timezone
+    label = _period_label(period)
+    result = await bot.store.uptime(period, time.time(), include_live=_collection_reliable(bot))
+    elapsed = float(result["end"]) - float(result["start"])
+    lines = [f"**Flock uptime — {label}**"]
+    if elapsed <= 0 or not result["days"]:
+        lines.append("Nothing to report yet for this period.")
+        return "\n".join(lines), None
+    observed, outage, idle = float(result["observed"]), float(result["outage"]), float(result["idle"])
+    lines.append(
+        f"Watching: **{_percent(observed, elapsed)}** of the time "
+        f"({_duration(observed)} of {_duration(elapsed)}, since {_local_time(result['start'], timezone)})."
+    )
+    outages = result["outages"]
+    if outages:
+        longest = max(outages, key=lambda gap: gap["seconds"])
+        lines.append(
+            f"Outages: **{len(outages)}**, totalling {_duration(outage)}; longest "
+            f"{_duration(longest['seconds'])} ({_gap_reason(longest['reason'])})."
+        )
+    else:
+        lines.append("Outages: **none**.")
+    if idle > 0:
+        lines.append(f"Paused or not collecting: {_duration(idle)}.")
+    if outages:
+        lines.append("Most recent outages:")
+        for gap in reversed(outages[-_UPTIME_OUTAGES_SHOWN:]):
+            lines.append(
+                f"• {_gap_span(gap, timezone)} — {_duration(gap['seconds'])}, {_gap_reason(gap['reason'])}"
+            )
+        if len(outages) > _UPTIME_OUTAGES_SHOWN:
+            lines.append(f"…and {len(outages) - _UPTIME_OUTAGES_SHOWN:,} earlier")
+    lines.append("Outages count as missing coverage in every report, never as quiet time.")
+    days = result["days"]
+    unit = _bucket_unit(len(days))
+    buckets: dict[date, list[float]] = {}
+    for entry in days:
+        totals = buckets.setdefault(_bucket_key(date.fromisoformat(entry["day"]), unit), [0.0, 0.0, 0.0])
+        totals[0] += float(entry["observed"])
+        totals[1] += float(entry["outage"])
+        totals[2] += float(entry["idle"])
+    keys = sorted(buckets)
+    png = _stacked_png(
+        f"Flock uptime — {label}",
+        f"Time per {unit}",
+        [_bucket_label(key, unit, len(days)) for key in keys],
+        [
+            (name, [buckets[key][index] for key in keys], colour)
+            for index, (name, colour) in enumerate(
+                zip(("Watching", "Outage", "Paused"), _UPTIME_COLORS)
+            )
+        ],
+    )
+    return "\n".join(lines), png
+
+
+async def _errors_text(bot: Any) -> str:
+    timezone = bot.config.timezone
+    if hasattr(bot, "flush_error_log"):
+        await bot.flush_error_log()
+    result = await bot.store.error_log(time.time(), limit=_ERRORS_SHOWN)
+    lines = ["**Flock error log**"]
+    error = getattr(bot.tracker, "last_error", None)
+    if error:
+        lines.append(f"Current error: **{discord.utils.escape_markdown(error)}**.")
+    if not result["recent"]:
+        lines.append("No warnings or errors have been logged. 🎉")
+        return "\n".join(lines)
+    lines.append(
+        f"**{result['day']:,}** in the last day, {result['week']:,} in the last week, "
+        f"{result['total']:,} kept in total. Newest first:"
+    )
+    for entry in result["recent"]:
+        line = (
+            f"`{_local_time(entry['at'], timezone)}` {entry['level'].lower()} in "
+            f"{discord.utils.escape_markdown(entry['source'])}: "
+            f"{discord.utils.escape_mentions(discord.utils.escape_markdown(entry['summary']))}"
+        )
+        if len("\n".join((*lines, line))) > 1850:
+            lines.append("…older entries left out to fit Discord's limit")
+            break
+        lines.append(line)
+    lines.append("Only log lines and error types are kept; the service journal has full tracebacks.")
+    return "\n".join(lines)
+
+
+async def _person_debug_text(bot: Any, interaction: discord.Interaction, user: Any) -> str:
+    now = time.time()
+    timezone = bot.config.timezone
+    user_id = int(user.id)
+    name = _safe_name(_person_name(user, user_id))
+    result = await bot.store.person_debug(user_id, now, include_live=_collection_reliable(bot))
+    lines = [f"**Debug: {name}** ({user_id})"]
+    if not result["known"]:
+        lines.append(f"{name} has never been tracked, so nothing is stored about them.")
+        return "\n".join(lines)
+    guild = getattr(interaction, "guild", None) or (
+        bot.get_guild(bot.config.guild_id) if hasattr(bot, "get_guild") else None
+    )
+    first = _local_time(result["tracking_since"], timezone)
+    if result["active"]:
+        line = f"Tracked: **yes**, first tracked {first}"
+        if result["added_by"] is not None:
+            line += f"; last added by {await _admin_label(bot, guild, result['added_by'])}"
+        lines.append(line + ".")
+    else:
+        stopped = result["updated_at"]
+        lines.append(
+            f"Tracked: **no longer**, first tracked {first}"
+            + (f", removed {_local_time(stopped, timezone)}." if stopped is not None else ".")
+        )
+    intervals = result["intervals"]
+    if len(intervals) > 1:
+        shown = intervals[-5:]
+        spans = "; ".join(
+            f"{_local_time(start, timezone)} – {'now' if stop is None else _local_time(stop, timezone)}"
+            for start, stop in shown
+        )
+        more = f" (latest {len(shown)})" if len(intervals) > len(shown) else ""
+        lines.append(f"Tracked-list stretches: **{len(intervals)}**{more}: {spans}.")
+    elapsed = float(result["elapsed_seconds"])
+    watched = float(result["watched_seconds"])
+    lines.append(
+        f"Watched: **{_duration(watched)}** of {_duration(elapsed)} since first tracked "
+        f"(**{_percent(watched, elapsed)}**)."
+    )
+    missing = [
+        (result["outage_seconds"], "outages"),
+        (result["idle_seconds"], "paused or not collecting"),
+        (result["untracked_seconds"], "off the tracked list"),
+    ]
+    parts = [f"{_duration(seconds)} {label}" for seconds, label in missing if seconds > 0]
+    if parts:
+        lines.append("Missing coverage: " + ", ".join(parts) + ".")
+    outages = result["outages"]
+    if outages:
+        longest = max(outages, key=lambda gap: gap["seconds"])
+        lines.append(
+            f"Outages while tracked: **{len(outages)}**, longest {_duration(longest['seconds'])} "
+            f"({_gap_reason(longest['reason'])}, {_local_time(longest['started_at'], timezone)})."
+        )
+    lines.append(
+        f"Stored: {_plural(result['messages'], 'message record')}, "
+        f"{_plural(result['voice_visits'], 'voice visit')} "
+        f"({result['visits_complete']:,} watched start to end, "
+        f"{result['voice_visits'] - result['visits_seen_start']:,} already in progress when seen), "
+        f"{_plural(result['voice_segments'], 'voice segment')}, "
+        f"{_plural(result['daily_rows'], 'daily total')} ({result['active_days']:,} active), "
+        f"{_plural(result['records'], 'personal record')}."
+    )
+    if result["first_message_at"] is not None:
+        lines.append(f"Oldest kept message record: {_local_time(result['first_message_at'], timezone)}.")
+    if result["detail_since"] > result["tracking_since"]:
+        lines.append(
+            f"Detail before {_local_time(result['detail_since'], timezone, date_only=True)} was pruned "
+            f"({result['retention_days']}-day retention); daily totals are kept."
+        )
+    visit = result["open_visit"]
+    if visit is not None:
+        seen = "start seen" if visit["complete_start"] else "already in voice when the bot started watching"
+        lines.append(f"In voice now: **yes**, since {_local_time(visit['started_at'], timezone)} ({seen}).")
+    elif result["last_voice_at"] is not None:
+        lines.append(f"In voice now: no; last seen in voice {_local_time(result['last_voice_at'], timezone)}.")
+    else:
+        lines.append("In voice now: no; never seen in voice.")
+    if result["paused"]:
+        lines.append("Collection is paused for everyone right now.")
+    return "\n".join(lines)
+
+
+async def _alerts_text(bot: Any, minutes: int | None) -> str:
+    if minutes is not None:
+        await bot.store.set_outage_alert_minutes(minutes)
+        if minutes == 0:
+            return "Outage alerts are now **off**."
+        return (
+            f"The owner now gets a DM after any outage of **{_duration(minutes * 60)}** or longer, "
+            "once the bot is back. Earlier outages are not announced."
+        )
+    current = await bot.store.outage_alert_minutes()
+    if current == 0:
+        return "Outage alerts are **off**. Set `minutes` to turn them on."
+    return (
+        f"The owner gets a DM after any outage of **{_duration(current * 60)}** or longer, "
+        "once the bot is back. Set `minutes` to change it, or 0 to turn alerts off."
+    )
 
 
 async def _request_update_text(bot: Any) -> str:
@@ -1882,6 +2220,9 @@ def register_commands(bot: Any) -> None:
     flock = app_commands.Group(name="flock", description="Activity reports for tracked people and bot controls")
     admin = app_commands.Group(name="admin", description="Manage tracker admins", parent=flock)
     track = app_commands.Group(name="track", description="Manage who is tracked", parent=flock)
+    debug = app_commands.Group(
+        name="debug", description="Admin-only bot health, uptime, and troubleshooting", parent=flock
+    )
 
     @flock.command(name="stats", description="Show activity statistics for a period")
     @app_commands.describe(period="The period to summarize", user=_USER_OPTION)
@@ -2421,6 +2762,65 @@ def register_commands(bot: Any) -> None:
             # The view still expires even if a test or interaction wrapper does
             # not expose the original response message.
             pass
+
+    async def _admin_report(
+        interaction: discord.Interaction,
+        label: str,
+        action: Callable[[], Awaitable[str | tuple[str, bytes | None]]],
+        *,
+        filename: str = "chart.png",
+    ) -> None:
+        """Run an admin-only debug report and reply privately, with an optional chart."""
+        if not await _scope_ok(interaction, bot):
+            return
+        if not await _control_permission_ok(interaction, bot):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        file = None
+        try:
+            result = await action()
+            content, png = result if isinstance(result, tuple) else (result, None)
+            if png:
+                file = discord.File(BytesIO(png), filename=filename)
+        except Exception:
+            logger.exception("Slash command %s failed", label)
+            content, file = _FAILURE_TEXT, None
+        await _send(interaction, content, ephemeral=True, file=file)
+
+    @debug.command(name="health", description="Show uptime, checkpoints, errors, storage, and backups")
+    async def debug_health_command(interaction: discord.Interaction) -> None:
+        await _admin_report(interaction, "flock debug health", lambda: _health_text(bot))
+
+    @debug.command(name="uptime", description="Chart when the bot was watching and list its outages")
+    @app_commands.describe(period="The period to check (last 7 days by default)")
+    @app_commands.choices(period=TREND_PERIOD_CHOICES)
+    async def debug_uptime_command(interaction: discord.Interaction, period: str = "last7") -> None:
+        await _admin_report(
+            interaction, "flock debug uptime", lambda: _uptime_report(bot, period),
+            filename="flock-uptime.png",
+        )
+
+    @debug.command(name="errors", description="List recent warnings and errors the bot logged")
+    async def debug_errors_command(interaction: discord.Interaction) -> None:
+        await _admin_report(interaction, "flock debug errors", lambda: _errors_text(bot))
+
+    @debug.command(name="person", description="Show one person's tracking history, coverage, and stored data")
+    @app_commands.describe(user="The person to inspect")
+    async def debug_person_command(interaction: discord.Interaction, user: discord.User) -> None:
+        if getattr(user, "bot", False):
+            await _send(interaction, "Bots aren't tracked.", ephemeral=True)
+            return
+        await _admin_report(
+            interaction, "flock debug person", lambda: _person_debug_text(bot, interaction, user)
+        )
+
+    @debug.command(name="alerts", description="Show or set when the owner is DMed about an outage")
+    @app_commands.describe(minutes="Alert after outages at least this long; 0 turns alerts off")
+    async def debug_alerts_command(
+        interaction: discord.Interaction,
+        minutes: app_commands.Range[int, 0, 1440] | None = None,
+    ) -> None:
+        await _admin_report(interaction, "flock debug alerts", lambda: _alerts_text(bot, minutes))
 
     bot.tree.add_command(flock, guild=guild)
 

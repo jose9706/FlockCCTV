@@ -74,16 +74,50 @@ Lifecycle and global state:
   supports the private list command. `set_admin_override(user_id: int, enabled: bool)`
   persists an owner-issued grant or revocation.
 - `connect(now: float)` opens coverage unless paused; idempotent.
-- `disconnect(now: float)` closes every open segment at its own last checkpoint as
-  incomplete, closes connected coverage conservatively, and marks unavailable; the
-  gap starts at the earliest of the coverage and segment checkpoints.
+- `disconnect(now: float, reason: str = "disconnect")` closes every open segment
+  at its own last checkpoint as incomplete, closes connected coverage
+  conservatively, and marks unavailable; the gap starts at the earliest of the
+  coverage and segment checkpoints. `reason` is `disconnect` or
+  `process_restart` (the tracker's own shutdown); either may bridge a visit.
 - `checkpoint(now: float)` advances every open segment and the coverage checkpoint
   to one common time, `max(now, coverage checkpoint, every open segment checkpoint)`.
 - `coverage_gap_seconds(now: float) -> float` is the collector's global outage
   total since the database clock began, shown by `/flock about`.
 - `maintenance(now: float, retention_days: int)` rolls up/prunes details for all
-  people without changing totals, uses SQLite backup API, retains seven managed
-  daily backups.
+  people without changing totals, prunes error log rows older than the retention
+  window, uses SQLite backup API, retains seven managed daily backups.
+
+Admin debugging (all read-only except the error log and alert setting):
+
+- `uptime(period: str, now: float, *, include_live: bool = True) -> dict`:
+  `start`, `end` (clipped to the database clock), `days` (`day`, `observed`,
+  `outage`, `idle` seconds per local day), the same three totals, `outages`
+  (recorded gaps overlapping the period: `gap_id`, `started_at`, `ended_at`
+  (`None` while open), `reason`, `seconds`), and `paused`. Idle is time neither
+  observed nor in a recorded gap, such as a pause.
+- `record_errors(entries: list[tuple[float, str, str, str]])` appends
+  `(at, level, source, summary)` rows and keeps the newest `ERROR_LOG_LIMIT`
+  (500). `error_log(now: float, limit: int = 15) -> dict` returns `recent`
+  (newest first), and `day`, `week`, `total` counts.
+- `outage_alert_minutes() -> int` (`DEFAULT_OUTAGE_ALERT_MINUTES`, 15, until
+  changed); `set_outage_alert_minutes(minutes: int)` (0 turns alerts off) also
+  marks every finished gap as announced. `due_outage_alerts() -> list[dict]`
+  returns finished gaps newer than the last announced one that meet the
+  threshold, and marks every finished gap announced in the same transaction.
+  The alert row is created at initialization with every existing gap announced.
+- `files_summary() -> dict`: `database_bytes`, `wal_bytes`, `backups` (`name`,
+  `modified`, `bytes`, `daily`), `disk_free`, `disk_total`, `retention_days`,
+  `pruned_before`, `tracking_since`.
+- `person_debug(user_id: int, now: float, *, include_live: bool = True) -> dict`:
+  `known`, `active`, `tracking_since`, `added_by`, `updated_at`, `intervals`
+  (`(start, end or None)`), `elapsed_seconds`, `tracked_seconds`,
+  `watched_seconds`, `outage_seconds`, `idle_seconds`, `untracked_seconds`,
+  `outages` (gaps clipped to their tracked time), stored row counts (`messages`,
+  `daily_rows`, `active_days`, `voice_visits`, `visits_seen_start`,
+  `visits_seen_end`, `visits_complete`, `voice_segments`, `company_rows`,
+  `records`), `first_message_at`, `open_visit` (`started_at`, `complete_start`
+  or `None`), `last_voice_at`, `detail_since`, `pruned_before`,
+  `retention_days`, `paused`. It names no channels.
 
 The tracked list:
 
@@ -238,7 +272,9 @@ and after every track, untrack, or deletion), and async methods:
 `untrack_user(user_id: int, actor_id: int) -> bool`,
 `delete_user_data(user_id: int, actor_id: int) -> bool`, `shutdown()`.
 `report_error(operation, exc)` and `report_recovered(operation)` let the adapter
-publish and clear its own failures.
+publish and clear its own failures. `collection_since: float | None` is when
+guild collection last started (None while stopped). `shutdown()` records its gap
+as `process_restart`.
 
 `VoiceSnapshot` is either a mapping or a zero-argument function returning one; a
 function is called only once the tracker holds its lock. A *voice snapshot*
@@ -287,6 +323,14 @@ the username to `BOT_USERNAME`, the avatar to the bundled `assets/avatar.jpg`,
 and the application description to `BOT_DESCRIPTION`, editing only what
 differs. `avatar-source.json` beside the database records the applied image
 hash and Discord avatar key, so a manually changed avatar is restored.
+`started_at` is the process start time. `error_log` (`error_log.ErrorLogBuffer`)
+is a logging handler on the `flock_cctv` logger for WARNING and higher that
+buffers `(created, level, module, summary)`, where the summary is the formatted
+log line plus the exception type name, never exception text. After every
+checkpoint the loop calls `Store.due_outage_alerts()` and DMs the owner
+`commands.outage_alert_text(...)` (closed DMs are logged and not retried), then
+`flush_error_log()` writes the buffer with `Store.record_errors`, putting entries
+back if the write fails. Close flushes once more.
 On every Gateway ready it writes `bot-ready.json` (`ready_at`, `pid`) beside the
 database for the updater's health check. Every five minutes it reads the
 updater's `update-status.json` there (`update_status.py`) and DMs the owner once
@@ -335,10 +379,11 @@ staging) or, in a development checkout, from `git rev-parse`.
 ## Commands (commands.py)
 
 `register_commands(bot)` installs the single `/flock` group on `bot.tree`
-for the configured guild, with `admin` and `track` subgroups. Implement stats,
+for the configured guild, with `admin`, `track`, and `debug` subgroups. Implement stats,
 records, where, company, leaderboard, trends, online, roast, top, introduce, help, about,
 version, update, pause, resume, delete-data, evil-mode, reaction-mode, `admin`
-add/remove/list (owner only), and `track` add/remove/list.
+add/remove/list (owner only), `track` add/remove/list, and `debug`
+health/uptime/errors/person/alerts (owner and effective admins, always private).
 Runtime checks enforce the guild and optional output channel; only the configured
 owner and effective extra admins can use controls. `LELAND_USER_ID` is never a
 controller, and `admin add` rejects bots, the owner, and that user. Admin decisions
@@ -370,13 +415,16 @@ mentions, never a mention. Options and defaults:
 | `track remove` | `user_id` (ID or mention, string) |
 | `admin add` | `user` (a server member); `admin remove`: `user_id` (string) |
 | `evil-mode`, `reaction-mode` | `mode`: `on` or `off` |
+| `debug uptime` | `period` (last7; same choices as trends) |
+| `debug person` | `user` (required; a bot replies "Bots aren't tracked.") |
+| `debug alerts` | `minutes` (optional, 0–1440; omitted shows the current setting) |
 | `delete-data` | `user` or `user_id` (ID or mention string; works for departed members). Both optional, not together; everyone's data if both omitted |
 
 Period choices are `today`, `week`, `month`, `all` (plus `last7` for trends).
 General reports (`stats`, `records`, `where`, `company`, `leaderboard`, `trends`,
 `roast`, `top`, `help`) are public in report channels and private elsewhere;
-`online`, `about`, `version`, `update`, `admin`, `track`, and controls are always
-private. `introduce` always posts publicly in the invoking channel (after the
+`online`, `about`, `version`, `update`, `admin`, `track`, `debug`, and controls
+are always private. `introduce` always posts publicly in the invoking channel (after the
 guild and output-channel checks) and shares a 300-second process-wide cooldown;
 its Leland sentence appears only with `leland_user_id`. Deletion confirmation is private, restricted to its requester, rechecks
 access when confirmed, expires, and says exactly whether it erases everyone's data

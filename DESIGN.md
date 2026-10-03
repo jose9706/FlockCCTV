@@ -138,6 +138,11 @@ activity to show (defaults to you)”; omitted, it is the requester.
 | `/flock update` | Ask the Pi updater to check GitHub now instead of at the next 15-minute poll; configured tracker admins only |
 | `/flock pause` | Stop collection for everyone; configured tracker admins only |
 | `/flock resume` | Resume after a pause; configured tracker admins only |
+| `/flock debug health` | Admin-only: process uptime, how long collection has run, checkpoint age, current error, logged problem counts, database and disk size, newest backup, retention, outage alert setting, last update result |
+| `/flock debug uptime period:last7` | Admin-only: share of time the bot was watching, each outage with its start, length and cause, and a stacked chart of watching, outage, and paused time per day |
+| `/flock debug errors` | Admin-only: recent warnings and errors the bot logged, with counts for the last day and week |
+| `/flock debug person user:` | Admin-only: one person's tracking history, watched share, missing coverage by cause, outages that hit them, and counts of what is stored about them |
+| `/flock debug alerts minutes:` | Admin-only: show or set how long an outage must last before the owner gets a DM once the bot is back (15 minutes by default, 0 turns it off) |
 | `/flock delete-data user:` | Configured tracker admins only; ephemeral confirmation, then erase everyone's data and pause collection, or with `user` only that person's data |
 | `/flock track add user:@member` | Admin-only: start tracking a human server member |
 | `/flock track remove user_id:ID` | Admin-only: stop tracking someone, keeping their history; accepts an ID or mention and departed members |
@@ -267,7 +272,9 @@ by `user_id`.
 | --- | --- | --- |
 | `settings` | Global | Guild ID, fixed timezone, database clock, pause state, checkpoints, retention, and the Leland evil/reaction settings |
 | `admin_overrides` | Global | Owner-issued grant or revocation for a Discord user ID; overrides the environment list |
-| `coverage_intervals`, `coverage_gaps` | Global | Connection coverage and uncertain time |
+| `coverage_intervals`, `coverage_gaps` | Global | Connection coverage and uncertain time; each gap records its cause (`disconnect` for a lost Discord connection or server, `process_restart` when the bot stopped) |
+| `error_log` | Global | Recent warnings and errors from the bot's own log lines: time, level, module, and the line with the exception type only; never message text or exception details |
+| `outage_alerts` | Global | Outage DM threshold in minutes and the newest gap already announced |
 | `tracked_users` | Person | One row per person ever tracked: active flag, first tracked time (reset by deletion), who added them, last change |
 | `tracking_intervals` | Person | When each person was on the tracked list; at most one open interval per person |
 | `messages` | Person | Unique message ID, author, channel, creation time and local day; no body |
@@ -323,6 +330,13 @@ historical daily totals are already grouped by that timezone.
 - `/flock pause` closes every active segment, disables collection for everyone
   and persists across restarts.
 - Empty data, disabled collection and a disconnected bot are distinct response states.
+- A clean shutdown or restart records its gap as `process_restart`, a lost
+  Discord connection or server as `disconnect`; a pause records no gap. Admin
+  uptime reports call everything else that was not observed "paused or not
+  collecting". Every one of these is missing coverage in reports, never quiet time.
+- Once collection is back, the owner gets one DM for each finished outage at
+  least as long as the alert threshold. Outages recorded before alerts existed,
+  or before the threshold last changed, are not announced.
 
 ## Discord configuration
 
@@ -344,8 +358,8 @@ intents in the portal.
 General reports, including voice whereabouts, are public when called from a
 configured public report channel; other channels receive ephemeral replies. The
 legacy `OUTPUT_CHANNEL_ID` option restricts all commands to one channel. Online
-status, `/flock about`, `/flock version`, tracked-list and admin management, and
-controls always receive ephemeral replies. Runtime checks enforce the configured
+status, `/flock about`, `/flock version`, `/flock debug`, tracked-list and admin
+management, and controls always receive ephemeral replies. Runtime checks enforce the configured
 guild and admin IDs.
 
 ## Running on the Pi
@@ -361,6 +375,10 @@ guild and admin IDs.
   deleted statistics.
 - Graceful shutdown flushes writes and closes segments. Check free disk space and
   synchronized system time; surface collection/storage errors in health status.
+  `/flock debug health` shows free disk space and backup age to tracker admins.
+- The bot keeps its own recent warnings and errors (the log line and exception
+  type, no message text) for `/flock debug errors`. They follow detail retention
+  and only the newest 500 are kept; the journal keeps full tracebacks.
 - Deploy by installing pinned dependencies, restarting the service, and checking a
   command plus logs. Take a database backup before schema changes.
 - Moving from Leland Tracker is a one-time import into a new database, run with
