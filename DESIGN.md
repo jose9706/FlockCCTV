@@ -81,8 +81,7 @@ recorded only while a person is tracked; earlier company cannot be
 reconstructed. Bots are excluded. Each observed minute is split evenly among
 the people present, so slices plus time alone sum to the observed, attributable
 voice time. Each person's whole shared time is also stored, without the split,
-for the leaderboard and for company reports run with `count:full`. Rows
-recorded before that change count their split share.
+for the leaderboard and for company reports run with `count:full`.
 When someone joins or leaves a channel, every tracked person in it gets the
 change applied to their own roster at that moment. An outage ends attribution at
 the last reliable checkpoint.
@@ -112,7 +111,6 @@ jokes are about cannot also control them.
   of his newly counted ordinary messages, then selects a new interval. The
   setting and remaining count are saved. A failed Discord reaction is not
   retried.
-- **Avatar mirror**: an inverted copy of his server avatar, checked hourly.
 - Global deletion, and deleting Leland's own data, turn both modes off and clear
   the countdown. No other person's messages are ever reposted or reacted to.
 
@@ -133,6 +131,7 @@ activity to show (defaults to you)”; omitted, it is the requester.
 | `/flock online user:` | Current Discord status of a currently tracked person; idle and Do Not Disturb count as online |
 | `/flock roast period:week user:` | A short template joke using a real statistic about the person |
 | `/flock top period:week metric:messages` | Ranks the tracked people by messages, voice time, or active days; top 10 plus a count of the rest |
+| `/flock introduce` | Public one-paragraph introduction in the current channel (a security camera that tracks the list; hates Leland only with `LELAND_USER_ID`); five-minute shared cooldown |
 | `/flock help` | Commands and what the bot measures |
 | `/flock about` | Bot version, connection health, enabled collectors, tracked people count, last checkpoint and gaps, last automatic update result |
 | `/flock version` | Release number and deployed commit of the running bot |
@@ -233,8 +232,9 @@ flowchart LR
 Use one bot process with collectors, storage, queries, and commands in separate
 modules. SQLite work is serialized on a worker thread. WAL mode and short
 transactions are used, and the database stores a schema version. Flock 1.0.0
-starts at schema version 1; a database from the single-person Leland Tracker is
-converted once by `flock_cctv.legacy_import` rather than by in-place migration.
+starts at schema version 1 with fresh data. A database from the single-person
+Leland Tracker is archived rather than converted, because its older voice company
+rows recorded only an even split of shared time; Flock refuses to open one.
 
 The bot uses an outbound Gateway connection and receives command interactions
 through it. This design needs no public website, inbound port, or port forwarding.
@@ -250,9 +250,9 @@ src/flock_cctv/
   stats.py           # Period boundaries, totals and records
   commands.py        # Slash commands and access checks
   jokes.py           # Templates
-  avatar.py          # Avatar colour inversion (Leland legacy)
+  avatar.py          # Bot name, description and bundled avatar
+  assets/avatar.jpg  # Flock camera profile picture
   evil.py            # Upside-down text and message splitting (Leland legacy)
-  legacy_import.py   # One-time Leland Tracker database import
   update_status.py   # Updater status, ready marker and update request files
 tests/
 deploy/flock-cctv.service

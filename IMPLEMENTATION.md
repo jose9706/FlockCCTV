@@ -317,7 +317,12 @@ and checkpoints remain disabled until reconciliation succeeds.
 (`Store.initialize(time.time(), config.guild_id)`), registers guild command groups,
 synchronizes only the configured guild, and wires
 ready/resumed/disconnect/message/voice events to `Tracker`. Checkpoint, daily
-maintenance, avatar-refresh, and update-watch tasks are cancelled/awaited on close.
+maintenance, profile-refresh, and update-watch tasks are cancelled/awaited on close.
+The first Gateway ready starts the hourly profile task (`avatar.py`): it sets
+the username to `BOT_USERNAME`, the avatar to the bundled `assets/avatar.jpg`,
+and the application description to `BOT_DESCRIPTION`, editing only what
+differs. `avatar-source.json` beside the database records the applied image
+hash and Discord avatar key, so a manually changed avatar is restored.
 `started_at` is the process start time. `error_log` (`error_log.ErrorLogBuffer`)
 is a logging handler on the `flock_cctv` logger for WARNING and higher that
 buffers `(created, level, module, summary)`, where the summary is the formatted
@@ -336,7 +341,7 @@ private reply) calls `update_status.request_update`, which writes
 `deploy/flock-cctv-update.path` starts `flock-cctv-update.service` while
 that file exists, and every polling run of `deploy/update.py` removes it before
 taking its lock. Collection
-and storage failures surface in status and logs; avatar-refresh failures are
+and storage failures surface in status and logs; profile-refresh failures are
 logged. Message payloads and the token are not logged. Gateway
 intents: guilds, guild_messages, voice_states, presences, plus message_content
 only when `leland_user_id` is set. Use
@@ -358,10 +363,7 @@ transforms it to upside-down Unicode, and posts the result in the same channel,
 skipping empty text and not reposting attachment files (text accompanying an
 attachment is still reposted). A direct mention of the bot gets a fixed reply
 based on mention metadata, even when collection is paused or that channel is
-outside the text allowlist, and only when `leland_user_id` is set. The hourly
-avatar task, which mirrors his current server avatar with inverted colours using
-the first frame for animated images and refreshing if the source changes or the
-bot avatar is manually changed, is not started otherwise. Reaction mode advances
+outside the text allowlist, and only when `leland_user_id` is set. Reaction mode advances
 its saved interval only for newly counted ordinary messages. Reaction and repost
 failures are logged without message bodies; they do not change collected message
 totals.
@@ -378,7 +380,7 @@ staging) or, in a development checkout, from `git rev-parse`.
 
 `register_commands(bot)` installs the single `/flock` group on `bot.tree`
 for the configured guild, with `admin`, `track`, and `debug` subgroups. Implement stats,
-records, where, company, leaderboard, trends, online, roast, top, help, about,
+records, where, company, leaderboard, trends, online, roast, top, introduce, help, about,
 version, update, pause, resume, delete-data, evil-mode, reaction-mode, `admin`
 add/remove/list (owner only), `track` add/remove/list, and `debug`
 health/uptime/errors/person/alerts (owner and effective admins, always private).
@@ -422,7 +424,9 @@ Period choices are `today`, `week`, `month`, `all` (plus `last7` for trends).
 General reports (`stats`, `records`, `where`, `company`, `leaderboard`, `trends`,
 `roast`, `top`, `help`) are public in report channels and private elsewhere;
 `online`, `about`, `version`, `update`, `admin`, `track`, `debug`, and controls
-are always private. Deletion confirmation is private, restricted to its requester, rechecks
+are always private. `introduce` always posts publicly in the invoking channel (after the
+guild and output-channel checks) and shares a 300-second process-wide cooldown;
+its Leland sentence appears only with `leland_user_id`. Deletion confirmation is private, restricted to its requester, rechecks
 access when confirmed, expires, and says exactly whether it erases everyone's data
 or one named person's. Without `user` it calls `tracker.delete_data` and the tracked
 list is kept; with `user` it calls `tracker.delete_user_data` and that person is
@@ -483,23 +487,9 @@ still exceeds the canvas width.
 `evil-mode` and `reaction-mode` check admin access, then reply privately that Leland
 mode isn't configured when `leland_user_id` is unset.
 
-`flock_cctv.legacy_import` is the one-time Leland Tracker import, run as
-`python -m flock_cctv.legacy_import --source OLD [--database NEW] [--backups DIR]
-[--guild-id G] [--leland-user-id L] [--timezone TZ] [--dry-run]`; every option
-except `--source` falls back to `DATABASE_PATH`, `BACKUP_DIR`, `GUILD_ID`,
-`LELAND_USER_ID`, and `TIMEZONE`. `import_legacy(source, database, backups, guild_id,
-leland_user_id, timezone, *, dry_run=False) -> dict[str, int]` snapshots the source
-into memory with the SQLite backup API (read-only, never modifying it), validates
-`PRAGMA user_version == 9` and the source's guild, tracked user, and timezone,
-refuses a destination that already has a `settings` row, creates the schema through
-`Store.initialize(source tracking start, guild_id)`, then copies in one transaction:
-the settings fields (including pause, retention, and Leland modes), a `tracked_users`
-row and an open tracking interval for Leland from the source tracking start, his
-rows in the per-person tables (visit and segment IDs kept), and coverage and admin
-overrides verbatim. After commit it reopens through `Store.initialize` so normal
-recovery closes anything left open, verifies row counts, and prints counts only.
-`main()` returns 0 on success and 1 on a `LegacyImportError`, with a usage error
-exiting 2; a new destination is removed when the import fails.
+There is no Leland Tracker import. `Store.initialize` raises `StoreError` for a
+database whose `settings` table has `target_user_id` (the single-target Leland
+schema), so an old database is archived and Flock starts from a new file.
 
 Run the standard-library tests with `PYTHONPATH=src .venv/bin/python -m unittest
 discover -s tests -v`.

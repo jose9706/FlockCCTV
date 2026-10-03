@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-import hashlib
 import json
 import logging
 import os
@@ -18,13 +17,13 @@ from discord import app_commands
 from .collectors import Tracker
 from .config import Config
 from .storage import Store
-from .avatar import invert_avatar
+from .avatar import BOT_DESCRIPTION, BOT_USERNAME, avatar_digest, profile_avatar
 from .error_log import ErrorLogBuffer
 from .evil import evil_messages
 from . import update_status
 
 logger = logging.getLogger(__name__)
-AVATAR_REFRESH_SECONDS = 60 * 60
+PROFILE_REFRESH_SECONDS = 60 * 60
 UPDATE_WATCH_SECONDS = 5 * 60
 MENTION_REPLY = "I am evil Leland, more gay than the original"
 
@@ -69,7 +68,7 @@ class TrackerClient(discord.Client):
         self._instance_lock: _InstanceLock | None = None
         self._checkpoint_task: asyncio.Task[None] | None = None
         self._maintenance_task: asyncio.Task[None] | None = None
-        self._avatar_task: asyncio.Task[None] | None = None
+        self._profile_task: asyncio.Task[None] | None = None
         self._update_watch_task: asyncio.Task[None] | None = None
         self._setup_complete = False
         self._closing = False
@@ -211,15 +210,15 @@ class TrackerClient(discord.Client):
                     logger.exception("Daily maintenance failed")
             await asyncio.sleep(24 * 60 * 60)
 
-    async def _avatar_loop(self) -> None:
+    async def _profile_loop(self) -> None:
         while True:
             try:
-                await self._sync_avatar()
+                await self._sync_profile()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Could not refresh the bot avatar")
-            await asyncio.sleep(AVATAR_REFRESH_SECONDS)
+                logger.exception("Could not refresh the bot profile")
+            await asyncio.sleep(PROFILE_REFRESH_SECONDS)
 
     async def _update_watch_loop(self) -> None:
         while True:
@@ -249,18 +248,15 @@ class TrackerClient(discord.Client):
         await asyncio.to_thread(update_status.mark_alerted, status, database_path)
         logger.warning("Automatic updates are failing; the owner was notified")
 
-    async def _sync_avatar(self) -> None:
-        """Mirror Leland's current server avatar with inverted colours (legacy)."""
-        leland_user_id = self.config.leland_user_id
-        guild = self.get_guild(self.config.guild_id)
-        if (
-            leland_user_id is None or guild is None
-            or getattr(guild, "unavailable", False) or self.user is None
-        ):
+    async def _sync_profile(self) -> None:
+        """Keep the bot's name, avatar, and application description as bundled."""
+        if self.user is None:
             return
-        member = await guild.fetch_member(leland_user_id)
-        asset = member.display_avatar.with_size(256)
-        source_hash = hashlib.sha256(str(asset).encode("utf-8")).hexdigest()
+        edits: dict[str, object] = {}
+        if self.user.name != BOT_USERNAME:
+            edits["username"] = BOT_USERNAME
+        avatar = await asyncio.to_thread(profile_avatar)
+        source_hash = avatar_digest(avatar)
         marker_path = self.config.database_path.with_name("avatar-source.json")
         try:
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -268,19 +264,23 @@ class TrackerClient(discord.Client):
             marker = {}
         current_avatar = self.user.avatar
         current_key = current_avatar.key if current_avatar is not None else None
-        if marker.get("source") == source_hash and marker.get("bot_avatar") == current_key:
-            return
-        image = await asset.read()
-        inverted = await asyncio.to_thread(invert_avatar, image)
-        updated = await self.user.edit(avatar=inverted)
-        avatar_key = updated.avatar.key if updated.avatar is not None else None
-        temporary = marker_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps({"source": source_hash, "bot_avatar": avatar_key}),
-            encoding="utf-8",
-        )
-        os.replace(temporary, marker_path)
-        logger.info("Updated the bot avatar from the Leland user's current server avatar")
+        if marker.get("source") != source_hash or marker.get("bot_avatar") != current_key:
+            edits["avatar"] = avatar
+        if edits:
+            updated = await self.user.edit(**edits)
+            if "avatar" in edits:
+                avatar_key = updated.avatar.key if updated.avatar is not None else None
+                temporary = marker_path.with_suffix(".tmp")
+                temporary.write_text(
+                    json.dumps({"source": source_hash, "bot_avatar": avatar_key}),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, marker_path)
+            logger.info("Updated the bot profile (%s)", ", ".join(sorted(edits)))
+        application = await self.application_info()
+        if application.description != BOT_DESCRIPTION:
+            await application.edit(description=BOT_DESCRIPTION)
+            logger.info("Updated the bot application description")
 
     def voice_snapshot(self) -> dict[int, int]:
         """Map each non-bot member in an eligible cached voice channel to that channel.
@@ -331,13 +331,9 @@ class TrackerClient(discord.Client):
     async def on_ready(self) -> None:
         try:
             await self._reconcile_gateway_ready()
-            if (
-                self.config.leland_user_id is not None
-                and self._avatar_task is None
-                and not self._closing
-            ):
-                self._avatar_task = asyncio.create_task(
-                    self._avatar_loop(), name="flock-cctv-avatar"
+            if self._profile_task is None and not self._closing:
+                self._profile_task = asyncio.create_task(
+                    self._profile_loop(), name="flock-cctv-profile"
                 )
         except Exception:
             logger.exception("Could not start collection after Gateway ready")
@@ -500,7 +496,7 @@ class TrackerClient(discord.Client):
             tasks = [
                 task for task in (
                     self._checkpoint_task, self._maintenance_task,
-                    self._avatar_task, self._update_watch_task,
+                    self._profile_task, self._update_watch_task,
                 )
                 if task
             ]
