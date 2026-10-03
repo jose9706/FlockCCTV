@@ -211,7 +211,9 @@ targets are preserved. Cleanup failure leaves the live statistics intact.
   voice, records, tracking intervals, and the tracked row. Daily company rows in
   which the person is someone else's companion are re-keyed to
   `DELETED_COMPANION_ID` (`"-2"`), summing on conflict, so other people keep
-  their shared time without the erased ID; live rosters are left alone. A person
+  their shared time without the erased ID. While collection is live, every open
+  segment is first credited through `now`, so time since the last checkpoint is
+  re-keyed too; live rosters are left alone. A person
   who appears only as a companion still counts as existing. It does not pause
   collection. `reset_legacy_modes=True` also turns evil and reaction modes off and
   clears the countdown. It returns False when nothing existed for the person.

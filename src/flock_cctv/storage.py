@@ -2002,11 +2002,13 @@ class Store:
         Managed backups are removed first because they hold this person's data.
         Time they shared with someone else stays in that person's company
         history, credited to ``DELETED_COMPANION_ID`` instead of their ID, so
-        other people's slices still add up. A live roster is current state, not
-        history, and is left alone. Global collection is not paused. ``reset_legacy_modes`` also switches the Leland-only evil and
+        other people's slices still add up; open segments are credited through
+        ``now`` first so that includes time since the last checkpoint. A live
+        roster is current state, not history, and is left alone. Global
+        collection is not paused. ``reset_legacy_modes`` also switches the Leland-only evil and
         reaction modes off. Returns False when nothing existed for the person.
         """
-        self._timestamp(now)
+        now = self._timestamp(now)
         int(actor_id)  # Validated for symmetry; deletion is not attributed in storage.
         user_text = str(int(user_id))
 
@@ -2030,6 +2032,12 @@ class Store:
                 self._remove_managed_backups()
 
             def action() -> None:
+                # Credit open segments through ``now`` first, so shared time from
+                # before the deletion is re-keyed below instead of being written
+                # under the erased ID at the next checkpoint.
+                settings = self._settings(conn)
+                if bool(settings["connected"]) and not bool(settings["paused"]):
+                    self._advance_checkpoint(conn, now)
                 conn.execute("DELETE FROM voice_segments WHERE user_id = ?", (user_text,))
                 conn.execute("DELETE FROM voice_visits WHERE user_id = ?", (user_text,))
                 conn.execute("DELETE FROM messages WHERE user_id = ?", (user_text,))

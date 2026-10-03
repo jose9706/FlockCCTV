@@ -176,8 +176,9 @@ voice observation, records, and tracking history, and removes them from the
 tracked list, without pausing collection for anyone else. Time the erased person
 shared with someone else stays in that person's company history, so its slices
 still sum to their voice time, but it is credited to a "Deleted person" member
-(`-2`) instead of the erased ID; leaderboards and top-companion records never rank
-it. A live roster is current state and keeps counting anyone still present.
+(`-2`) instead of the erased ID, up to the moment of deletion; leaderboards and
+top-companion records never rank it. A live roster is current state and keeps
+counting anyone still present from then on.
 `user_id:` accepts an ID or mention for someone who has left the server. Managed
 backups are removed in both cases
 because they contain the person's data. Both ask for a private confirmation that
