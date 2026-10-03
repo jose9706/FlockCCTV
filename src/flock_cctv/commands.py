@@ -1481,7 +1481,9 @@ async def _records_text(bot: Any, interaction: discord.Interaction, person: _Per
         has_record = True
     peers = [
         (member_id, seconds)
-        for member_id, seconds in (await _company_seconds(bot, interaction, person, "all")).items()
+        for member_id, seconds in (
+            await _company_seconds(bot, interaction, person, "all", "full_seconds")
+        ).items()
         if member_id > 0
     ]
     if peers:
@@ -1489,8 +1491,8 @@ async def _records_text(bot: Any, interaction: discord.Interaction, person: _Per
         guild = bot.get_guild(bot.config.guild_id)
         name = _safe_name(await _company_name(bot, guild, member_id))
         lines.append(
-            f"Top voice companion: **{name}** — {_duration(seconds)} of shared voice time "
-            "since companion tracking began (split evenly when more people were present)."
+            f"Top voice companion: **{name}** — {_duration(seconds)} together in voice "
+            "since companion tracking began."
         )
         has_record = True
     if not has_record:
