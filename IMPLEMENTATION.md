@@ -57,8 +57,8 @@ Lifecycle and global state:
   identity (`StoreError("database belongs to a different guild")`,
   `StoreError("database timezone differs from configured timezone")`), closes
   **every** stale open voice segment at its own checkpoint as incomplete, clears
-  all current company rosters, marks coverage lost since the earliest recovery
-  point as a `process_restart` gap, and reapplies the visit bridge rule per person.
+  all current company rosters, and marks coverage lost since the earliest
+  recovery point as a `process_restart` gap.
 - `close()` releases resources.
 - `state() -> dict`: `paused: bool`, `paused_by: str | None`,
   `tracking_since: float` (the database clock), `last_checkpoint: float | None`,
@@ -216,8 +216,7 @@ moment after their start that falls outside all their tracking intervals.
   records. When reconciliation finds the person in the same channel within
   `VISIT_BRIDGE_SECONDS` (120) of a visit cut short by a disconnect or restart
   gap, the visit continues; the gap stays uncounted. The previous visit must be
-  that person's, so an untrack and re-track never bridges. Startup reapplies this
-  rule to retained visits and only raises the record.
+  that person's, so an untrack and re-track never bridges.
 - `last_voice(user_id: int, now: float, *, include_live: bool = True) -> dict | None`
   returns the latest channel/time and whether the person is currently observed
   there. The latest observation survives detail retention and is cleared by
@@ -249,6 +248,9 @@ targets are preserved. Cleanup failure leaves the live statistics intact.
   who appears only as a companion still counts as existing. It does not pause
   collection. `reset_legacy_modes=True` also turns evil and reaction modes off and
   clears the countdown. It returns False when nothing existed for the person.
+  As with global deletion, compaction is best effort. Both deletions take the
+  per-person table list from one module constant, `_PERSON_TABLES`; a new
+  per-person table must be added there.
 
 Storage owns daily aggregates/retention; stats.py may contain pure date helpers.
 Keep deletion/backup operations serialized. Never prune before preserving records

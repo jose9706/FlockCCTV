@@ -318,8 +318,7 @@ historical daily totals are already grouped by that timezone.
   reconciliation finds the person in the same channel. The visit continues and keeps
   its original start; the gap remains a coverage gap and adds no voice time. A
   pause, a longer outage, a different channel, or an untrack and re-track still
-  splits the visit. Startup applies the same rule to retained visits recorded
-  before this rule existed.
+  splits the visit.
 - Keep each person's latest voice channel and observation time after detailed
   segments expire. A public `/flock where` reply reveals its name only when the
   `@everyone` role can view that channel. A private reply reveals it only to a
