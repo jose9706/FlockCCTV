@@ -47,6 +47,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     async def test_messages_deduplicate_update_days_and_enforce_pause_boundary(self) -> None:
+        await self.store.connect(100.0)
         stamp = epoch("2025-02-03T12:00:00")
         self.assertTrue(await self.store.add_message(USER, 1, 30, stamp))
         self.assertFalse(await self.store.add_message(USER, 1, 30, stamp))
@@ -64,6 +65,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         await self.store.set_paused(True, 99, stamp + 3)
         self.assertFalse(await self.store.add_message(USER, 3, 30, stamp + 4))
         await self.store.set_paused(False, 99, stamp + 10)
+        await self.store.connect(stamp + 10)
         self.assertFalse(await self.store.add_message(USER, 4, 30, stamp + 9))
         self.assertTrue(await self.store.add_message(USER, 5, 30, stamp + 10))
         self.assertEqual((await self.store.stats(USER, "all", stamp + 11))["messages"], 3)
@@ -77,6 +79,51 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         await self.store.connect(220.0)
         self.assertEqual(await self.store.coverage_gap_seconds(500.0), 60.0)
 
+    async def test_messages_and_reactions_require_connected_collection(self) -> None:
+        with patch("flock_cctv.storage.random.randint", return_value=15):
+            await self.store.set_reaction_mode(True)
+        self.assertFalse(await self.store.add_message(USER, 1, 30, 110))
+        self.assertEqual(
+            await self.store.add_message_with_reaction(USER, 2, 30, 110, ordinary=True),
+            (False, False),
+        )
+        await self.store.connect(120)
+        self.assertTrue(await self.store.add_message(USER, 1, 30, 120))
+        await self.store.disconnect(130)
+        self.assertFalse(await self.store.add_message(USER, 3, 30, 140))
+        self.assertEqual(
+            await self.store.add_message_with_reaction(USER, 4, 30, 140, ordinary=True),
+            (False, False),
+        )
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT reaction_countdown FROM settings").fetchone()[0], 15)
+        self.assertEqual((await self.store.stats(USER, "all", 150))["messages"], 1)
+        await self.store.connect(160)
+        self.assertEqual(
+            await self.store.add_message_with_reaction(USER, 4, 30, 160, ordinary=True),
+            (True, False),
+        )
+
+    async def test_short_untracked_or_disconnected_time_is_not_a_watched_day(self) -> None:
+        for reason in ("untracked", "disconnected"):
+            with self.subTest(reason=reason):
+                start = epoch("2025-03-01T00:00:00")
+                store = await self.new_store(reason, start)
+                try:
+                    await store.connect(start)
+                    await store.checkpoint(start + 100)
+                    if reason == "untracked":
+                        await store.untrack_user(USER, 99, start + 100)
+                        await store.track_user(USER, 99, start + 100.5)
+                    else:
+                        await store.disconnect(start + 100)
+                        await store.connect(start + 100.5)
+                    await store.checkpoint(start + 86400)
+                    trend = await store.daily_trend(USER, "all", start + 86400)
+                    self.assertFalse(trend[0]["watched"])
+                finally:
+                    await store.close()
+
     async def test_evil_mode_persists_and_deletion_disables_it(self) -> None:
         self.assertFalse((await self.store.state())["evil_mode"])
         await self.store.set_evil_mode(True)
@@ -89,6 +136,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await self.store.state())["evil_mode"])
 
     async def test_reaction_mode_counts_only_when_enabled_and_survives_restart(self) -> None:
+        await self.store.connect(100.0)
         self.assertFalse((await self.store.state())["reaction_mode"])
         self.assertEqual(
             await self.store.add_message_with_reaction(USER, 1, 30, 101.0, ordinary=True),
@@ -108,6 +156,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
             await self.store.close()
             self.store = Store(self.db, self.backups, "UTC")
             await self.store.initialize(200.0, 11)
+            await self.store.connect(200.0)
             self.assertTrue((await self.store.state())["reaction_mode"])
             self.assertEqual(
                 await self.store.add_message_with_reaction(USER, 9, 30, 109.0, ordinary=True),
@@ -127,6 +176,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
             await self.store.close()
             self.store = Store(self.db, self.backups, "UTC")
             await self.store.initialize(220.0, 11)
+            await self.store.connect(220.0)
             self.assertEqual(
                 await self.store.add_message_with_reaction(USER, 17, 30, 117.0, ordinary=True),
                 (False, False),
@@ -162,6 +212,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.store.admin_overrides(), {31: True, 32: False})
 
     async def test_concurrent_duplicate_delivery_commits_only_once(self) -> None:
+        await self.store.connect(100.0)
         stamp = epoch("2025-02-03T12:00:00")
         results = await asyncio.gather(
             *(self.store.add_message(USER, 17, 30, stamp) for _ in range(20))
@@ -202,9 +253,9 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_daily_trend_fills_every_day_and_splits_live_voice(self) -> None:
+        await self.store.connect(epoch("2025-03-02T23:00:00"))
         await self.store.add_message(USER, 1, 30, epoch("2025-03-01T23:30:00"))
         await self.store.add_message(USER, 2, 30, epoch("2025-03-03T00:01:00"))
-        await self.store.connect(epoch("2025-03-02T23:00:00"))
         await self.store.voice_transition(USER, 101, epoch("2025-03-02T23:50:00"))
         await self.store.checkpoint(epoch("2025-03-03T00:05:00"))
         now = epoch("2025-03-03T00:10:00")
@@ -285,6 +336,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_retained_detail_start_ignores_deletion_reset(self) -> None:
         await self.store.delete_data(99, epoch("2025-03-05T12:00:00"))
         await self.store.set_paused(False, 99, epoch("2025-03-05T12:00:00"))
+        await self.store.connect(epoch("2025-03-05T12:00:00"))
         await self.store.add_message(USER, 1, 30, epoch("2025-03-05T13:00:00"))
         result = await self.store.message_times(USER, "week", epoch("2025-03-05T14:00:00"))
         self.assertEqual(result["since"], result["period_start"])
@@ -570,6 +622,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.store.stats(USER, "all", 140))["gap_seconds"], 0)
 
     async def test_maintenance_prunes_detail_but_retains_totals_and_seven_backups(self) -> None:
+        await self.store.connect(100.0)
         old = epoch("2024-01-01T12:00:00")
         recent = epoch("2025-01-01T12:00:00")
         await self.store.add_message(USER, 101, 30, old)
@@ -622,6 +675,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
             await other_timezone.close()
 
     async def test_deletion_removes_documented_manual_backups_and_orphan_sidecars(self) -> None:
+        await self.store.connect(100.0)
         await self.store.add_message(USER, 201, 30, 150)
         await self.store.maintenance(200, 90)
         daily = next(self.backups.glob("flock-cctv-*.sqlite3"))
@@ -642,6 +696,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.store.stats(USER, "all", 220))["messages"], 0)
 
     async def test_committed_deletion_succeeds_when_optional_compaction_fails(self) -> None:
+        await self.store.connect(100.0)
         await self.store.add_message(USER, 201, 30, 150)
         await self.store.maintenance(200, 90)
         with patch.object(
@@ -652,6 +707,42 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.store.state())["paused"])
         self.assertEqual((await self.store.stats(USER, "all", 220))["messages"], 0)
         self.assertFalse(list(self.backups.iterdir()))
+
+    async def test_deletion_removes_interrupted_restore_snapshots_without_backup_directory(self) -> None:
+        for per_person in (False, True):
+            with self.subTest(per_person=per_person):
+                store = await self.new_store(f"restore-{per_person}", 100)
+                try:
+                    self.assertFalse(store.backup_dir.exists())
+                    legacy = store.path.with_name(f"{store.path.name}.update-restore")
+                    temporary = store.path.with_name(f".{store.path.name}.update-restore-abc.tmp")
+                    linked = store.path.with_name(f".{store.path.name}.update-restore-link.tmp")
+                    target = store.path.with_name(f"{store.path.name}.unrelated")
+                    wrong_suffix = store.path.with_name(f".{store.path.name}.update-restore-abc.txt")
+                    wrong_database = store.path.with_name(f".other-{per_person}.update-restore-abc.tmp")
+                    directory = store.path.with_name(f".{store.path.name}.update-restore-directory.tmp")
+                    legacy.write_bytes(b"synthetic old restore snapshot")
+                    temporary.write_bytes(b"synthetic restore snapshot")
+                    target.write_bytes(b"keep unrelated target")
+                    wrong_suffix.write_bytes(b"keep unrelated extension")
+                    wrong_database.write_bytes(b"keep another database's snapshot")
+                    linked.symlink_to(target)
+                    directory.mkdir()
+
+                    if per_person:
+                        self.assertTrue(await store.delete_user_data(USER, 99, 200))
+                    else:
+                        await store.delete_data(99, 200)
+
+                    self.assertFalse(legacy.exists())
+                    self.assertFalse(temporary.exists())
+                    self.assertFalse(linked.is_symlink())
+                    self.assertEqual(target.read_bytes(), b"keep unrelated target")
+                    self.assertTrue(wrong_suffix.exists())
+                    self.assertTrue(wrong_database.exists())
+                    self.assertTrue(directory.is_dir())
+                finally:
+                    await store.close()
 
     async def test_backup_restores_totals_and_records_with_interrupted_voice(self) -> None:
         await self.store.connect(100)
@@ -828,6 +919,7 @@ class MultiPersonStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.store.state())["tracking_since"], 100.0)
 
     async def test_messages_rejected_for_inactive_people_and_before_tracking_start(self) -> None:
+        await self.store.connect(100.0)
         self.assertFalse(await self.store.add_message(999, 1, 30, 150.0))  # Never tracked.
         self.assertTrue(await self.store.track_user(50, 99, 500.0))
         self.assertFalse(await self.store.add_message(50, 2, 30, 499.0))  # Before their interval.

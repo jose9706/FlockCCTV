@@ -159,6 +159,8 @@ moment after their start that falls outside all their tracking intervals.
   `messages`, `voice_seconds`, `voice_visits`, `watched`), zero-filled, with live
   voice split by day under the same rule as `stats`. `watched` is true only for a
   finished day fully inside coverage and the person's tracking intervals.
+  Subsecond coverage or tracking gaps make the day unwatched; only numerical
+  rounding tolerance is allowed.
 - `period_comparison(user_id: int, period: str, now: float, *, include_live: bool = True) -> dict`
   returns `current` and `previous` window totals (`start`, `end`, `messages`,
   `voice_seconds`, `voice_visits` with a complete start, `watched_seconds`) from
@@ -188,6 +190,12 @@ moment after their start that falls outside all their tracking intervals.
   deletion.
 
 Deletion:
+
+Managed deletion includes daily/named/temporary backups in `BACKUP_DIR` and
+abandoned updater restore snapshots beside the live database, named
+`<database-name>.update-restore` or `.<database-name>.update-restore-*.tmp`.
+Only matching files and symlinks are removed; unrelated paths and symlink
+targets are preserved. Cleanup failure leaves the live statistics intact.
 
 - `delete_data(actor_id: int, now: float)` is global. It removes managed backups
   first, then everyone's statistics, coverage, and tracking intervals, resets the
@@ -261,6 +269,11 @@ observation start or pause/resume boundary. While disconnected ignore voice even
 (including uncertain replay). On resumed, reconcile the cached snapshot and
 conservatively start incomplete segments. Track pause in storage; configured admins
 can resume any prior pause.
+Control boundaries and default-time ready/guild-available recovery boundaries
+are sampled inside that lock. A failed voice or companion transition disables
+collection and attempts conservative `Store.disconnect`; the normal snapshot
+recovery retries closure and only then reopens collection. Live extrapolation
+and checkpoints remain disabled until reconciliation succeeds.
 
 ## Discord adapter (bot.py)
 
@@ -312,7 +325,7 @@ totals.
 `__main__.py` loads Config and starts the bot with normal logging. It logs the
 version at startup and answers `--version` before reading any configuration; the
 console script is `flock-cctv`.
-`__init__.py` owns `__version__` (semantic release number, `1.0.0`, read by
+`__init__.py` owns `__version__` (semantic release number, `1.0.1`, read by
 `pyproject.toml`) and `version_string()`, which appends the short commit from
 `_build.py` (generated and git-ignored; written by `deploy/update.py` during
 staging) or, in a development checkout, from `git rev-parse`.
@@ -368,6 +381,11 @@ list is kept; with `user` it calls `tracker.delete_user_data` and that person is
 untracked while collection for others continues. Roast uses a shared 30-second
 cooldown. Defer slow interactions and use followups; errors get a safe response and
 logged traceback.
+Controls and deletion confirmation permission reads have the same two-second
+pre-acknowledgement timeout as report lookups, returning private busy/error
+replies without applying the control. Confirmation and cancellation serialize
+their state checks: cancellation prevents a pending confirmation from starting,
+and cannot succeed after deletion begins processing.
 
 `track add` rejects bots and calls `tracker.track_user(id, actor, bot.voice_snapshot)`.
 Per-person reports read the tracked list before acknowledging the interaction,
@@ -411,6 +429,8 @@ and `Store.voice_hours`, `bursts` from `Store.message_times` (two-minute gap),
 and `company` from `Store.company_daily` filtered and named like the company
 report, reading `seconds` or, with `count:full`, `full_seconds`. All of them take the resolved person's ID. No activity yields a text-only
 reply.
+Trend chart titles shrink to fit and use an ellipsis if the minimum font size
+still exceeds the canvas width.
 
 `evil-mode` and `reaction-mode` check admin access, then reply privately that Leland
 mode isn't configured when `leland_user_id` is unset.

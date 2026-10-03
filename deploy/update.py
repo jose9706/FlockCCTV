@@ -214,15 +214,22 @@ class Updater:
     def restore_database(self, backup: Path, owner: dict[str, int]) -> None:
         # The new code may have migrated the database before failing to start.
         # Restore the matching pre-update state only after the new bot is stopped.
-        for suffix in ("-wal", "-shm", "-journal"):
-            self.database.with_name(self.database.name + suffix).unlink(missing_ok=True)
-        temp = self.database.with_name(self.database.name + ".update-restore")
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{self.database.name}.update-restore-", suffix=".tmp",
+            dir=self.database.parent,
+        )
+        temp = Path(temp_name)
         try:
-            shutil.copyfile(backup, temp)
-            os.chown(temp, owner["uid"], owner["gid"])
-            os.chmod(temp, owner["mode"])
-            with temp.open("rb") as stream:
-                os.fsync(stream.fileno())
+            # Write through the exclusive descriptor instead of following a
+            # predictable path in the bot's writable state directory.
+            with os.fdopen(descriptor, "wb") as destination, backup.open("rb") as source:
+                shutil.copyfileobj(source, destination)
+                destination.flush()
+                os.fchown(destination.fileno(), owner["uid"], owner["gid"])
+                os.fchmod(destination.fileno(), owner["mode"])
+                os.fsync(destination.fileno())
+            for suffix in ("-wal", "-shm", "-journal"):
+                self.database.with_name(self.database.name + suffix).unlink(missing_ok=True)
             os.replace(temp, self.database)
             self.sync_directory(self.database.parent)
         finally:

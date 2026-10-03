@@ -150,6 +150,7 @@ class Tracker:
         self._recovered("guild unavailable")
         self._recovered("guild recovery")
         self._recovered("ready")
+        self._recovered("voice collection")
 
     async def gateway_ready(self) -> None:
         """Record Gateway health before the configured guild becomes available."""
@@ -159,8 +160,8 @@ class Tracker:
 
     async def ready(self, snapshot: VoiceSnapshot, now: float | None = None) -> None:
         """Handle the initial ready event or a fresh session for the configured guild."""
-        current = self._now(now)
         async with self._lock:
+            current = self._now(now)
             try:
                 self.connected = True
                 self._shutdown = False
@@ -177,8 +178,8 @@ class Tracker:
         self, snapshot: VoiceSnapshot, now: float | None = None
     ) -> None:
         """Reconcile cached voice state when the configured guild returns."""
-        current = self._now(now)
         async with self._lock:
+            current = self._now(now)
             try:
                 was_available = self.guild_is_available
                 self.guild_is_available = True
@@ -365,6 +366,17 @@ class Tracker:
                     await self.store.companion_transition(current_channel, member_id, True, now)
                 self._recovered("voice collection")
             except Exception as exc:
+                # A missed channel or roster change makes the persisted voice
+                # state unreliable. Stop crediting it until a current snapshot
+                # can be reconciled by the adapter's recovery loop.
+                self.collection_ready = False
+                self._collection_since = None
+                try:
+                    await self.store.disconnect(time.time())
+                except Exception:
+                    # Reconciliation retries disconnect before reopening any
+                    # segments; preserve the original collection failure.
+                    pass
                 self._record_error("voice collection", exc)
                 raise
 
@@ -386,8 +398,8 @@ class Tracker:
                 raise
 
     async def pause(self, actor_id: int) -> None:
-        current = time.time()
         async with self._lock:
+            current = time.time()
             try:
                 if not self.collection_ready:
                     await self.store.disconnect(current)
@@ -400,8 +412,8 @@ class Tracker:
                 raise
 
     async def resume(self, actor_id: int, snapshot: VoiceSnapshot) -> None:
-        current = time.time()
         async with self._lock:
+            current = time.time()
             try:
                 state = await self.store.state()
                 if not state["paused"]:
@@ -419,8 +431,8 @@ class Tracker:
                 raise
 
     async def delete_data(self, actor_id: int) -> None:
-        current = time.time()
         async with self._lock:
+            current = time.time()
             try:
                 await self.store.delete_data(actor_id, current)
                 self._collection_since = current
@@ -459,8 +471,8 @@ class Tracker:
 
     async def untrack_user(self, user_id: int, actor_id: int) -> bool:
         """Stop tracking a person now; an open visit ends incomplete, history stays."""
-        current = time.time()
         async with self._lock:
+            current = time.time()
             try:
                 removed = await self.store.untrack_user(user_id, actor_id, current)
                 await self._refresh_tracked()
@@ -476,8 +488,8 @@ class Tracker:
         Deleting the configured Leland also switches the Leland-only evil and
         reaction modes off, as global deletion does.
         """
-        current = time.time()
         async with self._lock:
+            current = time.time()
             try:
                 existed = await self.store.delete_user_data(
                     user_id, actor_id, current,
@@ -503,8 +515,8 @@ class Tracker:
 
     async def shutdown(self) -> None:
         """Close a cleanly observed visit and release the Store."""
-        current = time.time()
         async with self._lock:
+            current = time.time()
             if self._shutdown:
                 return
             try:

@@ -166,7 +166,18 @@ async def _control_permission_ok(
     interaction: discord.Interaction,
     bot: Any,
 ) -> bool:
-    if await _can_control(interaction, bot):
+    try:
+        can_control = await asyncio.wait_for(
+            _can_control(interaction, bot), timeout=_LOOKUP_TIMEOUT
+        )
+    except TimeoutError:
+        await _send(interaction, "The tracker is busy right now. Try again in a moment.", ephemeral=True)
+        return False
+    except Exception:
+        logger.exception("Tracker admin permission lookup failed")
+        await _send(interaction, _FAILURE_TEXT, ephemeral=True)
+        return False
+    if can_control:
         return True
     await _send(
         interaction,
@@ -716,6 +727,8 @@ def _draw_title(draw: ImageDraw.ImageDraw, title: str) -> None:
     while size > 24 and font.getlength(title) > _CHART_WIDTH - 2 * _CHART_MARGIN:
         size -= 2
         font = _font(size)
+    while len(title) > 1 and font.getlength(title) > _CHART_WIDTH - 2 * _CHART_MARGIN:
+        title = title[:-2] + "…"
     draw.text((_CHART_MARGIN, 24), title, font=font, fill=_TEXT_PRIMARY)
 
 
@@ -1753,7 +1766,7 @@ class DeleteDataConfirmation(discord.ui.View):
         if not await _control_permission_ok(interaction, self.bot):
             return
         async with self._confirmation_lock:
-            if self._processing or self._completed or self._expired:
+            if self._processing or self._completed or self._expired or self.is_finished():
                 await _send(interaction, "This deletion request is already being handled or has finished.", ephemeral=True)
                 return
             self._processing = True
@@ -1812,7 +1825,15 @@ class DeleteDataConfirmation(discord.ui.View):
             return
         if not await _scope_ok(interaction, self.bot):
             return
-        self.stop()
+        async with self._confirmation_lock:
+            if self._processing:
+                await _send(interaction, "This deletion request is already being handled and cannot be cancelled.", ephemeral=True)
+                return
+            if self._completed or self._expired or self.is_finished():
+                await _send(interaction, "This deletion confirmation has expired or finished.", ephemeral=True)
+                return
+            self._completed = True
+            self.stop()
         await interaction.response.edit_message(
             content="Data deletion cancelled.",
             view=None,

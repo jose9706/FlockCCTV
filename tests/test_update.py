@@ -163,6 +163,55 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT value FROM tracker").fetchone(), ("kept",))
         self.assertFalse(self.updater.pending.exists())
 
+    def test_restore_does_not_follow_a_preexisting_temporary_symlink(self) -> None:
+        backup = self.updater.backup_database()
+        original_stat = self.database.stat()
+        owner = {
+            "uid": original_stat.st_uid,
+            "gid": original_stat.st_gid,
+            "mode": stat.S_IMODE(original_stat.st_mode),
+        }
+        unrelated = self.database.parent / "unrelated-file"
+        unrelated.write_text("leave this intact", encoding="ascii")
+        temporary = self.database.with_name(self.database.name + ".update-restore")
+        temporary.symlink_to(unrelated)
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("DROP TABLE tracker")
+            connection.commit()
+
+        self.updater.restore_database(backup, owner)
+
+        self.assertFalse(self.database.is_symlink())
+        self.assertEqual(unrelated.read_text(encoding="ascii"), "leave this intact")
+        self.assertEqual(stat.S_IMODE(self.database.stat().st_mode), owner["mode"])
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute("SELECT value FROM tracker").fetchone(), ("kept",))
+
+    def test_restore_cleans_up_unique_temporary_file_after_copy_failure(self) -> None:
+        backup = self.updater.backup_database()
+        original_stat = self.database.stat()
+        owner = {
+            "uid": original_stat.st_uid,
+            "gid": original_stat.st_gid,
+            "mode": stat.S_IMODE(original_stat.st_mode),
+        }
+        sidecars = [
+            self.database.with_name(self.database.name + suffix)
+            for suffix in ("-wal", "-shm", "-journal")
+        ]
+        for sidecar in sidecars:
+            sidecar.write_bytes(b"existing state")
+        with mock.patch("deploy.update.shutil.copyfileobj", side_effect=OSError("copy failed")):
+            with self.assertRaisesRegex(OSError, "copy failed"):
+                self.updater.restore_database(backup, owner)
+
+        self.assertEqual(list(self.database.parent.glob(".*.update-restore-*.tmp")), [])
+        for sidecar in sidecars:
+            self.assertEqual(sidecar.read_bytes(), b"existing state")
+            sidecar.unlink()
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute("SELECT value FROM tracker").fetchone(), ("kept",))
+
     def test_verified_candidate_is_kept_after_interrupted_cleanup(self) -> None:
         self.interrupted_swap(candidate_installed=True)
         owner, _, digest = self.updater.read_pending()
