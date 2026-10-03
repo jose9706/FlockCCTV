@@ -365,10 +365,10 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.bot.get_channel = lambda channel_id: {101: visible, 102: hidden}.get(channel_id)
         self.config.public_report_channel_ids = frozenset({20})
         self.bot.store.company_rows = [
-            {"channel_id": 101, "member_id": 0, "seconds": 9000.0},
-            {"channel_id": 101, "member_id": 41, "seconds": 3000.0},
-            {"channel_id": 101, "member_id": 42, "seconds": 600.0},
-            {"channel_id": 102, "member_id": 42, "seconds": 9000.0},
+            {"channel_id": 101, "member_id": 0, "seconds": 9000.0, "full_seconds": 9000.0},
+            {"channel_id": 101, "member_id": 41, "seconds": 1500.0, "full_seconds": 3000.0},
+            {"channel_id": 101, "member_id": 42, "seconds": 1800.0, "full_seconds": 2400.0},
+            {"channel_id": 102, "member_id": 42, "seconds": 9000.0, "full_seconds": 9000.0},
         ]
         interaction = FakeInteraction(channel_id=20)
         interaction.guild = guild
@@ -381,9 +381,10 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             "so it cannot set the record).",
             content,
         )
-        # Alone time is not a companion, and Bob's hidden-channel time is excluded.
+        # Alone time is not a companion, Bob's hidden-channel time is excluded,
+        # and whole shared time ranks Alice first although her split share is smaller.
         self.assertIn(
-            "Top voice companion: **Alice** — 50m of shared voice time since companion tracking began",
+            "Top voice companion: **Alice** — 50m together in voice since companion tracking began.",
             content,
         )
 
