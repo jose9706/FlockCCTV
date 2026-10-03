@@ -1469,25 +1469,30 @@ class MultiPersonStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 self.rows(f"SELECT COUNT(*) FROM {table} WHERE user_id = '22'"), [(0,)], table
             )
-        # OTHER keeps the shared time, but their history no longer names USER.
+        # OTHER keeps the shared time through the deletion, including the time
+        # since the last checkpoint, but their history no longer names USER.
         self.assertEqual(self.rows(
             "SELECT member_id, seconds, full_seconds FROM voice_company_daily WHERE user_id = '23'"
-        ), [(DELETED_COMPANION_ID, 90.0, 90.0)])
+        ), [(DELETED_COMPANION_ID, 190.0, 190.0)])
         other = await self.store.stats(OTHER, "all", 300)
         self.assertEqual((other["messages"], other["voice_seconds"]), (1, 190))
-        # USER is still in the call, so OTHER's live roster still counts them from 200.
         self.assertEqual(
             await self.store.company_totals(OTHER, "all", 300),
-            [
-                {"channel_id": 101, "member_id": -2, "seconds": 90.0, "full_seconds": 90.0},
-                {"channel_id": 101, "member_id": 22, "seconds": 100.0, "full_seconds": 100.0},
-            ],
+            [{"channel_id": 101, "member_id": -2, "seconds": 190.0, "full_seconds": 190.0}],
         )
         # The other people are still collected; the deleted person is not tracked any more.
         self.assertTrue(await self.store.add_message(OTHER, 5, 30, 310))
         self.assertFalse(await self.store.add_message(USER, 6, 30, 310))
         await self.store.checkpoint(320)
         self.assertEqual((await self.store.stats(OTHER, "all", 320))["voice_seconds"], 210)
+        # USER is still in the call, so OTHER's live roster counts them from the deletion on.
+        self.assertEqual(
+            await self.store.company_totals(OTHER, "all", 320),
+            [
+                {"channel_id": 101, "member_id": -2, "seconds": 190.0, "full_seconds": 190.0},
+                {"channel_id": 101, "member_id": 22, "seconds": 20.0, "full_seconds": 20.0},
+            ],
+        )
 
         # Nothing to delete: False, other people's backups survive, modes stay.
         await self.store.maintenance(330, 90)
