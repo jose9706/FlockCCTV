@@ -11,10 +11,10 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
+
+from .text import local_time
 
 STATUS_NAME = "update-status.json"
 READY_NAME = "bot-ready.json"
@@ -27,24 +27,30 @@ def status_path(database_path: Path) -> Path:
     return database_path.with_name(STATUS_NAME)
 
 
-def read_status(database_path: Path) -> dict[str, Any] | None:
-    """Return the updater's last status, or ``None`` when absent or unreadable."""
+def read_json(path: Path) -> dict[str, Any] | None:
+    """Return a JSON object file, or ``None`` when absent, unreadable, or not an object."""
     try:
-        value = json.loads(status_path(database_path).read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return value if isinstance(value, dict) else None
 
 
-def _write_json(path: Path, value: dict[str, Any]) -> None:
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    """Replace ``path`` with ``value`` atomically through a temporary file."""
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(value), encoding="utf-8")
     os.replace(temporary, path)
 
 
+def read_status(database_path: Path) -> dict[str, Any] | None:
+    """Return the updater's last status, or ``None`` when absent or unreadable."""
+    return read_json(status_path(database_path))
+
+
 def write_ready(database_path: Path, now: float | None = None) -> None:
     """Record that this process connected to Discord, for the updater's health check."""
-    _write_json(
+    write_json(
         database_path.with_name(READY_NAME),
         {"ready_at": time.time() if now is None else now, "pid": os.getpid()},
     )
@@ -52,7 +58,7 @@ def write_ready(database_path: Path, now: float | None = None) -> None:
 
 def request_update(database_path: Path, now: float | None = None) -> None:
     """Ask the updater to check for a new commit now instead of at the next poll."""
-    _write_json(
+    write_json(
         database_path.with_name(REQUEST_NAME),
         {"requested_at": time.time() if now is None else now},
     )
@@ -60,10 +66,9 @@ def request_update(database_path: Path, now: float | None = None) -> None:
 
 def _when(timestamp: Any, timezone: str) -> str:
     try:
-        local = datetime.fromtimestamp(float(timestamp), tz=ZoneInfo(timezone))
+        return local_time(float(timestamp), timezone)
     except (TypeError, ValueError, OverflowError):
         return "an unknown time"
-    return local.strftime("%b %-d, %Y %H:%M %Z")
 
 
 def _short(revision: Any) -> str:
@@ -103,7 +108,7 @@ def alert_due(status: dict[str, Any] | None, database_path: Path) -> bool:
 
 
 def mark_alerted(status: dict[str, Any], database_path: Path) -> None:
-    _write_json(database_path.with_name(NOTIFIED_NAME), {"failing_since": status["failing_since"]})
+    write_json(database_path.with_name(NOTIFIED_NAME), {"failing_since": status["failing_since"]})
 
 
 def alert_text(status: dict[str, Any], timezone: str) -> str:
@@ -119,8 +124,10 @@ __all__ = [
     "alert_due",
     "alert_text",
     "mark_alerted",
+    "read_json",
     "read_status",
     "request_update",
     "status_line",
+    "write_json",
     "write_ready",
 ]

@@ -57,8 +57,8 @@ Lifecycle and global state:
   identity (`StoreError("database belongs to a different guild")`,
   `StoreError("database timezone differs from configured timezone")`), closes
   **every** stale open voice segment at its own checkpoint as incomplete, clears
-  all current company rosters, marks coverage lost since the earliest recovery
-  point as a `process_restart` gap, and reapplies the visit bridge rule per person.
+  all current company rosters, and marks coverage lost since the earliest
+  recovery point as a `process_restart` gap.
 - `close()` releases resources.
 - `state() -> dict`: `paused: bool`, `paused_by: str | None`,
   `tracking_since: float` (the database clock), `last_checkpoint: float | None`,
@@ -216,8 +216,7 @@ moment after their start that falls outside all their tracking intervals.
   records. When reconciliation finds the person in the same channel within
   `VISIT_BRIDGE_SECONDS` (120) of a visit cut short by a disconnect or restart
   gap, the visit continues; the gap stays uncounted. The previous visit must be
-  that person's, so an untrack and re-track never bridges. Startup reapplies this
-  rule to retained visits and only raises the record.
+  that person's, so an untrack and re-track never bridges.
 - `last_voice(user_id: int, now: float, *, include_live: bool = True) -> dict | None`
   returns the latest channel/time and whether the person is currently observed
   there. The latest observation survives detail retention and is cleared by
@@ -249,6 +248,9 @@ targets are preserved. Cleanup failure leaves the live statistics intact.
   who appears only as a companion still counts as existing. It does not pause
   collection. `reset_legacy_modes=True` also turns evil and reaction modes off and
   clears the countdown. It returns False when nothing existed for the person.
+  As with global deletion, compaction is best effort. Both deletions take the
+  per-person table list from one module constant, `_PERSON_TABLES`; a new
+  per-person table must be added there.
 
 Storage owns daily aggregates/retention; stats.py may contain pure date helpers.
 Keep deletion/backup operations serialized. Never prune before preserving records
@@ -272,24 +274,32 @@ and after every track, untrack, or deletion), and async methods:
 `untrack_user(user_id: int, actor_id: int) -> bool`,
 `delete_user_data(user_id: int, actor_id: int) -> bool`, `shutdown()`.
 `report_error(operation, exc)` and `report_recovered(operation)` let the adapter
-publish and clear its own failures. `collection_since: float | None` is when
-guild collection last started (None while stopped). `shutdown()` records its gap
+publish and clear its own failures; `last_error` reads `"<operation> failed
+(<exception type>)"` and a later success of that same operation (or, for a
+connection or voice failure, a successful collection start) clears it.
+`collection_since: float | None` is when guild collection last started (None
+while stopped). `shutdown()` records its gap
 as `process_restart`.
 
 `VoiceSnapshot` is either a mapping or a zero-argument function returning one; a
 function is called only once the tracker holds its lock. A *voice snapshot*
 is `Mapping[int, int]`: member ID to the eligible channel ID of
 every non-bot member currently in an eligible voice channel (allowlist applied,
-AFK excluded). The adapter builds it; the tracker derives each tracked person's
-companions as the other members the snapshot places in the same channel. Starting
-guild collection refreshes `tracked_ids`, retries `Store.disconnect`, calls
+AFK excluded). The adapter builds it with `eligible_voice_channel_id(config,
+guild, channel)`, the same channel check live voice events use; the tracker
+derives each tracked person's companions as the other members the snapshot
+places in the same channel. Starting guild collection refreshes `tracked_ids`, retries `Store.disconnect`, calls
 `Store.connect`, then starts an incomplete-start visit for each tracked person in
 the snapshot. `track_user` starts one for a newly added person the same way when
 collection is live and not paused.
 
 `message` and `message_with_reaction` accept a message only when its author is in
 `tracked_ids`, in addition to the guild, channel allowlist, bot, pause, and
-observation-boundary checks, and forward the author ID as `user_id`. `message_with_reaction`
+observation-boundary checks, and forward the author ID as `user_id`. The tracker
+applies the boundary only it knows (when the current collection run started);
+`Store` applies the pause and tracking-start filtering for messages, voice and
+companion transitions inside its own transaction, so the tracker does not read
+`Store.state()` per event. `message_with_reaction`
 is used only for `Config.leland_user_id`; the reaction countdown is global.
 `voice` ignores bots entirely and returns when the eligible previous and current
 channels are equal. If the member is tracked it calls `Store.voice_transition`
@@ -416,7 +426,7 @@ mentions, never a mention. Options and defaults:
 | `admin add` | `user` (a server member); `admin remove`: `user_id` (string) |
 | `evil-mode`, `reaction-mode` | `mode`: `on` or `off` |
 | `debug uptime` | `period` (last7; same choices as trends) |
-| `debug person` | `user` (required; a bot replies "Bots aren't tracked.") |
+| `debug person` | `user` (required; after the admin check, a bot replies "Bots aren't tracked.") |
 | `debug alerts` | `minutes` (optional, 0–1440; omitted shows the current setting) |
 | `delete-data` | `user` or `user_id` (ID or mention string; works for departed members). Both optional, not together; everyone's data if both omitted |
 
@@ -432,7 +442,9 @@ or one named person's. Without `user` it calls `tracker.delete_data` and the tra
 list is kept; with `user` it calls `tracker.delete_user_data` and that person is
 untracked while collection for others continues. Roast uses a shared 30-second
 cooldown. Defer slow interactions and use followups; errors get a safe response and
-logged traceback.
+logged traceback. Every command checks the guild and output channel first, then
+admin or owner access, then its arguments. Charts are drawn on a worker thread,
+one at a time, after the store reads finish.
 Controls and deletion confirmation permission reads have the same two-second
 pre-acknowledgement timeout as report lookups, returning private busy/error
 replies without applying the control. Confirmation and cancellation serialize

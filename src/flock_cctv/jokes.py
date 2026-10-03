@@ -7,18 +7,7 @@ import random
 import time
 from typing import Any
 
-import discord
-
-
-def _duration(seconds: float) -> str:
-    total_seconds = max(0, int(seconds))
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes = remainder // 60
-    if hours:
-        return f"{hours}h {minutes}m"
-    if minutes:
-        return f"{minutes}m"
-    return f"{total_seconds}s"
+from .text import clean_name, duration, safe_name
 
 
 def _addressee(name: str | None) -> str | None:
@@ -27,10 +16,8 @@ def _addressee(name: str | None) -> str | None:
     Whitespace (including newlines) is collapsed and the name is shortened, then
     Markdown and mentions are escaped so it can neither format nor ping.
     """
-    cleaned = " ".join(str(name).split())[:48] if name else ""
-    if not cleaned:
-        return None
-    return discord.utils.escape_mentions(discord.utils.escape_markdown(cleaned))
+    cleaned = clean_name(name)
+    return safe_name(cleaned) if cleaned else None
 
 
 def make_roast(
@@ -57,7 +44,7 @@ def make_roast(
         )
     if voice_seconds > 0:
         options.append(
-            f"{_duration(voice_seconds)} in observed voice {period_label}; the headset is earning its keep."
+            f"{duration(voice_seconds)} in observed voice {period_label}; the headset is earning its keep."
         )
     if active_days > 0:
         options.append(

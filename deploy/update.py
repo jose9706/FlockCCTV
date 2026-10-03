@@ -20,9 +20,11 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import closing
+from collections.abc import Callable, Iterator
+from contextlib import closing, contextmanager
 from datetime import date
 from pathlib import Path
+from typing import BinaryIO
 
 
 REVISION_FILE = ".deployed-revision"
@@ -58,6 +60,11 @@ class RevisionFailed(UpdateError):
 
 class RetryDeferred(UpdateError):
     """The remote commit failed recently and is not retried yet."""
+
+
+def _is_real_dir(path: Path) -> bool:
+    """True for a directory itself, not a symlink to one."""
+    return path.is_dir() and not path.is_symlink()
 
 
 class Updater:
@@ -184,56 +191,34 @@ class Updater:
         if not self.database.is_file() or not self.backups.is_dir():
             raise UpdateError("Configured database or backup directory is missing")
         backup = self.backups / BACKUP_NAME
-        fd, temp_name = tempfile.mkstemp(
-            prefix=f".flock-cctv-{date.today().isoformat()}.",
-            suffix=".sqlite3.tmp", dir=self.backups,
-        )
-        os.close(fd)
-        temp = Path(temp_name)
-        try:
-            source = sqlite3.connect(self.database.resolve().as_uri() + "?mode=ro", uri=True)
-            try:
-                destination = sqlite3.connect(temp)
-                try:
-                    source.backup(destination)
-                    result = destination.execute("PRAGMA integrity_check").fetchone()
-                    if result != ("ok",):
-                        raise UpdateError("Database backup failed integrity check")
-                finally:
-                    destination.close()
-            finally:
-                source.close()
-            with temp.open("rb") as stream:
-                os.fsync(stream.fileno())
-            os.replace(temp, backup)
-            self.sync_directory(self.backups)
-            return backup
-        finally:
-            temp.unlink(missing_ok=True)
+        with self._atomic_replace(
+            backup, prefix=f".flock-cctv-{date.today().isoformat()}.", suffix=".sqlite3.tmp",
+        ) as (_, temp):
+            # SQLite writes the snapshot through its own connection to the temporary path.
+            with closing(sqlite3.connect(self.database.resolve().as_uri() + "?mode=ro", uri=True)) as source, \
+                 closing(sqlite3.connect(temp)) as destination:
+                source.backup(destination)
+                result = destination.execute("PRAGMA integrity_check").fetchone()
+                if result != ("ok",):
+                    raise UpdateError("Database backup failed integrity check")
+        return backup
 
     def restore_database(self, backup: Path, owner: dict[str, int]) -> None:
         # The new code may have migrated the database before failing to start.
         # Restore the matching pre-update state only after the new bot is stopped.
-        descriptor, temp_name = tempfile.mkstemp(
-            prefix=f".{self.database.name}.update-restore-", suffix=".tmp",
-            dir=self.database.parent,
-        )
-        temp = Path(temp_name)
-        try:
-            # Write through the exclusive descriptor instead of following a
-            # predictable path in the bot's writable state directory.
-            with os.fdopen(descriptor, "wb") as destination, backup.open("rb") as source:
-                shutil.copyfileobj(source, destination)
-                destination.flush()
-                os.fchown(destination.fileno(), owner["uid"], owner["gid"])
-                os.fchmod(destination.fileno(), owner["mode"])
-                os.fsync(destination.fileno())
+        def drop_journals() -> None:
+            # Only once the copy is durable, and before it takes the database's
+            # place, so SQLite cannot replay the candidate's journals onto it.
             for suffix in ("-wal", "-shm", "-journal"):
                 self.database.with_name(self.database.name + suffix).unlink(missing_ok=True)
-            os.replace(temp, self.database)
-            self.sync_directory(self.database.parent)
-        finally:
-            temp.unlink(missing_ok=True)
+
+        # Write through the exclusive descriptor instead of following a
+        # predictable path in the bot's writable state directory.
+        with self._atomic_replace(
+            self.database, prefix=f".{self.database.name}.update-restore-", suffix=".tmp",
+            uid=owner["uid"], gid=owner["gid"], mode=owner["mode"], before_replace=drop_journals,
+        ) as (destination, _), backup.open("rb") as source:
+            shutil.copyfileobj(source, destination)
 
     def data_was_deleted(self, backup: Path) -> bool:
         """Never revive statistics erased while the candidate was starting."""
@@ -259,6 +244,49 @@ class Updater:
             os.close(descriptor)
 
     @classmethod
+    @contextmanager
+    def _atomic_replace(
+        cls,
+        path: Path,
+        *,
+        prefix: str,
+        suffix: str = "",
+        mode: int | None = None,
+        uid: int | None = None,
+        gid: int | None = None,
+        before_replace: Callable[[], None] | None = None,
+    ) -> Iterator[tuple[BinaryIO, Path]]:
+        """Yield a private temporary file beside ``path`` that durably replaces it.
+
+        The caller writes through the yielded stream or to the temporary path.
+        On success the file gets the requested owner and mode and is fsynced,
+        ``before_replace`` runs, the file is moved over ``path``, and the
+        directory is synced. On any failure the temporary file is removed.
+        """
+        descriptor, temp_name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=path.parent)
+        temp = Path(temp_name)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                yield stream, temp
+                stream.flush()
+                if uid is not None and gid is not None:
+                    os.fchown(stream.fileno(), uid, gid)
+                if mode is not None:
+                    os.fchmod(stream.fileno(), mode)
+                os.fsync(stream.fileno())
+            if before_replace is not None:
+                before_replace()
+            os.replace(temp, path)
+            cls.sync_directory(path.parent)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    @classmethod
+    def _atomic_write(cls, path: Path, data: bytes, *, prefix: str, mode: int | None = None) -> None:
+        with cls._atomic_replace(path, prefix=prefix, mode=mode) as (stream, _):
+            stream.write(data)
+
+    @classmethod
     def sync_tree(cls, root: Path) -> None:
         for directory, _, files in os.walk(root, topdown=False, followlinks=False):
             path = Path(directory)
@@ -272,25 +300,13 @@ class Updater:
 
     @staticmethod
     def backup_digest(path: Path) -> str:
-        digest = hashlib.sha256()
         with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
+            return hashlib.file_digest(stream, "sha256").hexdigest()
 
     def write_pending(self, owner: dict[str, int], *, verified: bool, backup_sha256: str) -> None:
         """Persist recovery state before moving either code directory."""
-        descriptor, temp_name = tempfile.mkstemp(prefix=".flock-cctv-pending-", dir=self.install.parent)
-        temp = Path(temp_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="ascii") as stream:
-                json.dump({**owner, "verified": verified, "backup_sha256": backup_sha256}, stream)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temp, self.pending)
-            self.sync_directory(self.install.parent)
-        finally:
-            temp.unlink(missing_ok=True)
+        pending = {**owner, "verified": verified, "backup_sha256": backup_sha256}
+        self._atomic_write(self.pending, json.dumps(pending).encode("ascii"), prefix=".flock-cctv-pending-")
 
     def read_pending(self) -> tuple[dict[str, int], bool, str]:
         try:
@@ -318,14 +334,14 @@ class Updater:
         if not self.pending.exists():
             return None
         owner, verified, expected_digest = self.read_pending()
-        if verified and self.install.is_dir() and not self.install.is_symlink():
+        if verified and _is_real_dir(self.install):
             if not self.database.is_file():
                 raise UpdateError("Database missing after verified update; manual recovery required")
             self.clear_pending()
             return None
         warning = None
         if self.previous.exists() or self.previous.is_symlink():
-            if self.previous.is_symlink() or not self.previous.is_dir():
+            if not _is_real_dir(self.previous):
                 raise UpdateError("Unexpected previous install during recovery")
             if stop_service:
                 self.command("systemctl", "stop", self.service)
@@ -340,11 +356,11 @@ class Updater:
             if warning is None:
                 self.restore_database(backup, owner)
             if self.install.exists() or self.install.is_symlink():
-                if not self.install.is_dir() or self.install.is_symlink():
+                if not _is_real_dir(self.install):
                     raise UpdateError("Unexpected installed path during recovery")
                 shutil.rmtree(self.install)
             os.replace(self.previous, self.install)
-        elif not self.install.is_dir() or self.install.is_symlink():
+        elif not _is_real_dir(self.install):
             raise UpdateError("Installed code and previous code are both missing")
         if not self.database.is_file():
             raise UpdateError("Database missing after rollback; manual recovery required")
@@ -364,7 +380,7 @@ class Updater:
     def remove_stale_work(self) -> None:
         """Remove staging trees left by an updater killed mid-stage."""
         for path in self.install.parent.glob(WORK_PREFIX + "*"):
-            if path.is_dir() and not path.is_symlink():
+            if _is_real_dir(path):
                 shutil.rmtree(path)
 
     def ready_since(self, started: float) -> bool:
@@ -423,9 +439,11 @@ class Updater:
     def set_hold(self, revision: str | None) -> None:
         if revision is None:
             self.hold.unlink(missing_ok=True)
+            self.sync_directory(self.hold.parent)
         else:
-            self.hold.write_text(revision + "\n", encoding="ascii")
-        self.sync_directory(self.hold.parent)
+            self._atomic_write(
+                self.hold, (revision + "\n").encode("ascii"), prefix=".flock-cctv-hold-", mode=0o644,
+            )
 
     def record(
         self,
@@ -466,21 +484,16 @@ class Updater:
                     status[key] = previous.get(key)
         else:
             status["last_success_at"] = now
-        descriptor, temp_name = tempfile.mkstemp(prefix=".update-status-", dir=self.status_path.parent)
-        temp = Path(temp_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(status, stream)
-            os.chmod(temp, 0o644)  # The unprivileged bot reads it; it holds no secrets.
-            os.replace(temp, self.status_path)
-        finally:
-            temp.unlink(missing_ok=True)
+        # The unprivileged bot reads it; it holds no secrets.
+        self._atomic_write(
+            self.status_path, json.dumps(status).encode("utf-8"), prefix=".update-status-", mode=0o644,
+        )
 
     def update(self, target: str | None = None) -> bool:
         """Deploy the remote default branch, or ``target`` commit when given."""
         if self.pending.exists():
             raise UpdateError("Interrupted update must be recovered before polling")
-        if not self.install.is_dir() or self.install.is_symlink():
+        if not _is_real_dir(self.install):
             raise UpdateError(f"Expected an installed directory at {self.install}")
         self.remove_stale_work()
         if target is not None:
@@ -490,8 +503,7 @@ class Updater:
         else:
             branch, remote_revision = self.remote_head()
         self.branch = branch
-        deployed = self.install / REVISION_FILE
-        if deployed.is_file() and deployed.read_text(encoding="ascii").strip() == remote_revision:
+        if self.deployed_revision() == remote_revision:
             print(f"Already at {remote_revision} ({branch})")
             return False
         status = self.read_status()
@@ -512,12 +524,11 @@ class Updater:
             raise RevisionFailed(remote_revision, str(exc) or type(exc).__name__) from exc
 
     def install_revision(self, remote_revision: str, branch: str, *, ref: str) -> bool:
-        deployed = self.install / REVISION_FILE
         with tempfile.TemporaryDirectory(prefix=WORK_PREFIX, dir=self.install.parent) as work_name:
             work = Path(work_name)
             candidate, revision = self.stage(work, ref)
             # A concurrent push during clone is fine: install the actual checkout.
-            if deployed.is_file() and deployed.read_text(encoding="ascii").strip() == revision:
+            if self.deployed_revision() == revision:
                 print(f"Already at {revision} ({branch})")
                 return False
 
@@ -534,7 +545,7 @@ class Updater:
                 backup = self.backup_database()
                 backup_sha256 = self.backup_digest(backup)
                 if self.previous.exists():
-                    if self.previous.is_symlink() or not self.previous.is_dir():
+                    if not _is_real_dir(self.previous):
                         raise UpdateError(f"Unexpected previous install at {self.previous}")
                     shutil.rmtree(self.previous)
                 self.write_pending(owner, verified=False, backup_sha256=backup_sha256)
@@ -591,6 +602,11 @@ def main() -> int:
         except OSError as exc:
             print(f"Could not write update status: {exc}", file=sys.stderr)
 
+    def recovered(warning: str | None) -> None:
+        if warning:
+            print(f"Recovery warning: {warning}", file=sys.stderr)
+        record("failed", message=f"Recovered an interrupted update. {warning or ''}")
+
     if not args.recover_only:
         # Clear before taking the lock, so a busy lock cannot make the path unit
         # restart a failing run in a loop.
@@ -604,19 +620,13 @@ def main() -> int:
                     return 0  # The running updater owns recovery and activation.
                 raise UpdateError("Another update or recovery is already running")
             if args.recover_only:
-                interrupted = updater.pending.exists()
-                warning = updater.recover_pending(stop_service=False)
-                if warning:
-                    print(f"Recovery warning: {warning}", file=sys.stderr)
-                if interrupted:
-                    record("failed", message=f"Recovered an interrupted update. {warning or ''}")
+                if updater.pending.exists():
+                    recovered(updater.recover_pending(stop_service=False))
             elif updater.pending.exists():
                 warning = updater.recover_pending(stop_service=True)
                 updater.start_and_check(require_ready=False)
-                if warning:
-                    print(f"Recovery warning: {warning}", file=sys.stderr)
+                recovered(warning)
                 print("Recovered interrupted update; next timer run will poll")
-                record("failed", message=f"Recovered an interrupted update. {warning or ''}")
             else:
                 if args.release:
                     updater.set_hold(None)

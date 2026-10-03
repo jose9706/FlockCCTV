@@ -27,6 +27,14 @@ class MakeRoastTests(unittest.TestCase):
         )
         self.assertEqual(joke, "1h 1m in observed voice this month; the headset is earning its keep.")
 
+    def test_voice_joke_uses_the_report_duration_format(self):
+        joke = make_roast(
+            {"messages": 0, "voice_seconds": 2 * 86_400 + 3_660, "active_days": 0},
+            "all time",
+            chooser=lambda options: options[0],
+        )
+        self.assertTrue(joke.startswith("2d 1h 1m in observed voice all time;"))
+
 
     def test_joke_can_address_the_person_by_escaped_name(self):
         joke = make_roast(

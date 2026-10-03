@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -50,6 +51,52 @@ def _take_snapshot(snapshot: VoiceSnapshot) -> Mapping[int, int]:
     return snapshot() if callable(snapshot) else snapshot
 
 
+def _allowed_voice_channel(config: Config, channel_id: int | None) -> int | None:
+    if channel_id is None:
+        return None
+    allowlist = config.voice_channel_ids
+    return channel_id if allowlist is None or channel_id in allowlist else None
+
+
+def eligible_voice_channel_id(config: Config, guild: Any, channel: Any) -> int | None:
+    """Return ``channel``'s ID when it is an eligible voice channel, else None.
+
+    ``guild`` is the guild the channel was seen through. Eligible means both
+    belong to the configured guild, the channel is not that guild's AFK
+    channel, and it is inside ``VOICE_CHANNEL_IDS`` when an allowlist is set.
+    """
+    channel_id = _id(channel)
+    if channel_id is None or _id(guild) != config.guild_id:
+        return None
+    channel_guild_id = _id(getattr(channel, "guild", None))
+    if channel_guild_id is not None and channel_guild_id != config.guild_id:
+        return None
+    if _id(getattr(guild, "afk_channel", None)) == channel_id:
+        return None
+    return _allowed_voice_channel(config, channel_id)
+
+
+# Operation names published in ``Tracker.last_error`` as "<operation> failed (...)".
+OP_READY = "ready"
+OP_GUILD_RECOVERY = "guild recovery"
+OP_GUILD_UNAVAILABLE = "guild unavailable"
+OP_DISCONNECT = "disconnect"
+OP_MESSAGE = "message collection"
+OP_VOICE = "voice collection"
+OP_CHECKPOINT = "checkpoint"
+OP_PAUSE = "pause"
+OP_RESUME = "resume"
+OP_DATA_DELETION = "data deletion"
+OP_TRACK_USER = "track user"
+OP_UNTRACK_USER = "untrack user"
+OP_USER_DATA_DELETION = "user data deletion"
+OP_SHUTDOWN = "shutdown"
+# Failures that left collection stopped; a successful collection start clears them.
+_COLLECTION_START_RECOVERS = (
+    OP_DISCONNECT, OP_GUILD_UNAVAILABLE, OP_GUILD_RECOVERY, OP_READY, OP_VOICE,
+)
+
+
 class Tracker:
     """Serializes collector state and forwards eligible metadata to ``Store``.
 
@@ -79,15 +126,12 @@ class Tracker:
         """When guild collection last (re)started, or None while it is stopped."""
         return self._collection_since
 
-    def _record_error(self, operation: str, exc: BaseException) -> None:
+    def report_error(self, operation: str, exc: BaseException) -> None:
+        """Publish a failure, including adapter-owned ones such as maintenance."""
         # Error text from a dependency can include implementation details. Keep
         # status concise and safe; the adapter logs the traceback separately.
         self.last_error = f"{operation} failed ({type(exc).__name__})"
         self._error_operation = operation
-
-    def report_error(self, operation: str, exc: BaseException) -> None:
-        """Publish an adapter-owned failure, such as a maintenance error."""
-        self._record_error(operation, exc)
 
     def report_recovered(self, operation: str) -> None:
         """Clear status only when the operation that failed has recovered."""
@@ -95,18 +139,36 @@ class Tracker:
             self.last_error = None
             self._error_operation = None
 
-    def _recovered(self, operation: str) -> None:
-        self.report_recovered(operation)
+    @contextmanager
+    def _operation(self, operation: str, *, recover: bool = True) -> Iterator[None]:
+        """Report a failure of ``operation`` and re-raise it.
+
+        Leaving the block normally (including by ``return``) clears an earlier
+        failure of the same operation unless ``recover`` is False.
+        """
+        try:
+            yield
+        except Exception as exc:
+            self.report_error(operation, exc)
+            raise
+        if recover:
+            self.report_recovered(operation)
+
+    def _collecting(self) -> bool:
+        return (
+            not self._shutdown
+            and self.connected
+            and self.guild_is_available
+            and self.collection_ready
+        )
+
+    def _stop_collection(self) -> None:
+        self.collection_ready = False
+        self._collection_since = None
 
     @staticmethod
     def _now(now: float | None) -> float:
         return time.time() if now is None else float(now)
-
-    def _eligible_voice_channel(self, channel_id: int | None) -> int | None:
-        if channel_id is None:
-            return None
-        allowlist = self.config.voice_channel_ids
-        return channel_id if allowlist is None or channel_id in allowlist else None
 
     async def _refresh_tracked(self) -> None:
         self.tracked_ids = frozenset(await self.store.active_user_ids())
@@ -125,7 +187,7 @@ class Tracker:
         self, user_id: int, snapshot: Mapping[int, int], now: float
     ) -> None:
         """Begin an incomplete-start visit when the snapshot places a person in voice."""
-        channel_id = self._eligible_voice_channel(snapshot.get(user_id))
+        channel_id = _allowed_voice_channel(self.config, snapshot.get(user_id))
         if channel_id is None:
             return
         await self.store.voice_transition(
@@ -151,11 +213,8 @@ class Tracker:
         for user_id in sorted(self.tracked_ids):
             await self._start_visit_from_snapshot(user_id, members, now)
         self.collection_ready = True
-        self._recovered("disconnect")
-        self._recovered("guild unavailable")
-        self._recovered("guild recovery")
-        self._recovered("ready")
-        self._recovered("voice collection")
+        for operation in _COLLECTION_START_RECOVERS:
+            self.report_recovered(operation)
 
     async def gateway_ready(self) -> None:
         """Record Gateway health before the configured guild becomes available."""
@@ -167,17 +226,13 @@ class Tracker:
         """Handle the initial ready event or a fresh session for the configured guild."""
         async with self._lock:
             current = self._now(now)
-            try:
+            with self._operation(OP_READY):
                 self.connected = True
                 self._shutdown = False
                 self.guild_is_available = True
                 self.collection_ready = False
                 await self._start_guild_collection(snapshot, current)
-                self._recovered("ready")
-                self._recovered("guild recovery")
-            except Exception as exc:
-                self._record_error("ready", exc)
-                raise
+                self.report_recovered(OP_GUILD_RECOVERY)
 
     async def guild_available(
         self, snapshot: VoiceSnapshot, now: float | None = None
@@ -185,15 +240,11 @@ class Tracker:
         """Reconcile cached voice state when the configured guild returns."""
         async with self._lock:
             current = self._now(now)
-            try:
+            with self._operation(OP_GUILD_RECOVERY):
                 was_available = self.guild_is_available
                 self.guild_is_available = True
                 if self.connected and (not was_available or not self.collection_ready):
                     await self._start_guild_collection(snapshot, current)
-                self._recovered("guild recovery")
-            except Exception as exc:
-                self._record_error("guild recovery", exc)
-                raise
 
     async def guild_unavailable(self, now: float | None = None) -> None:
         """Stop collection while the configured guild is unavailable or removed."""
@@ -201,18 +252,13 @@ class Tracker:
         async with self._lock:
             was_available = self.guild_is_available
             self.guild_is_available = False
-            self.collection_ready = False
-            self._collection_since = None
+            self._stop_collection()
             if not was_available:
                 return
-            try:
+            with self._operation(OP_GUILD_UNAVAILABLE):
                 # Store.disconnect closes voice at the last reliable checkpoint
                 # and records the uncertain interval as a coverage gap.
                 await self.store.disconnect(current)
-                self._recovered("guild unavailable")
-            except Exception as exc:
-                self._record_error("guild unavailable", exc)
-                raise
 
     async def disconnected(self, now: float | None = None) -> None:
         """Handle Gateway loss. Voice and messages stay disabled until ready."""
@@ -221,16 +267,11 @@ class Tracker:
             was_collecting = self.connected and self.guild_is_available
             self.connected = False
             self.guild_is_available = False
-            self.collection_ready = False
-            self._collection_since = None
+            self._stop_collection()
             if not was_collecting:
                 return
-            try:
+            with self._operation(OP_DISCONNECT):
                 await self.store.disconnect(current)
-                self._recovered("disconnect")
-            except Exception as exc:
-                self._record_error("disconnect", exc)
-                raise
 
     async def message(self, message: Any) -> bool:
         """Count one eligible message from a tracked person; return whether it was new."""
@@ -251,22 +292,18 @@ class Tracker:
         self, message: Any, *, reaction_eligible: bool, ordinary: bool
     ) -> tuple[bool, bool]:
         async with self._lock:
-            if (
-                self._shutdown
-                or not self.connected
-                or not self.guild_is_available
-                or not self.collection_ready
-            ):
+            if not self._collecting():
                 return False, False
             guild_id = _id(getattr(message, "guild", None))
             author = getattr(message, "author", None)
+            author_id = _id(author)
             channel = getattr(message, "channel", None)
             message_id = _id(message)
             channel_id = _id(channel)
             created_at = _timestamp(getattr(message, "created_at", None))
             if (
                 guild_id != self.config.guild_id
-                or _id(author) not in self.tracked_ids
+                or author_id not in self.tracked_ids
                 or message_id is None
                 or channel_id is None
                 or created_at is None
@@ -276,48 +313,24 @@ class Tracker:
             allowed = self.config.text_channel_ids
             if allowed is not None and channel_id not in allowed:
                 return False, False
-            try:
-                state = await self.store.state()
-                boundary = max(
-                    float(state["tracking_since"]),
-                    self._collection_since if self._collection_since is not None else float("inf"),
-                )
-                if state["paused"] or created_at < boundary:
-                    return False, False
-                author_id = _id(author)
+            # The Store rejects messages while paused or from before tracking
+            # started; only the tracker knows when this collection run began.
+            if self._collection_since is None or created_at < self._collection_since:
+                return False, False
+            with self._operation(OP_MESSAGE):
                 if reaction_eligible:
-                    result = await self.store.add_message_with_reaction(
+                    return await self.store.add_message_with_reaction(
                         author_id, message_id, channel_id, created_at, ordinary=ordinary
                     )
-                else:
-                    result = (
-                        await self.store.add_message(
-                            author_id, message_id, channel_id, created_at
-                        ),
-                        False,
-                    )
-                self._recovered("message collection")
-                return result
-            except Exception as exc:
-                self._record_error("message collection", exc)
-                raise
+                inserted = await self.store.add_message(
+                    author_id, message_id, channel_id, created_at
+                )
+                return inserted, False
 
     def _channel_id_for_state(self, member: Any, state: Any) -> int | None:
-        channel = getattr(state, "channel", None)
-        channel_id = _id(channel)
-        if channel_id is None:
-            return None
-        guild = getattr(member, "guild", None)
-        guild_id = _id(guild)
-        channel_guild_id = _id(getattr(channel, "guild", None))
-        if guild_id != self.config.guild_id:
-            return None
-        if channel_guild_id is not None and channel_guild_id != self.config.guild_id:
-            return None
-        afk_id = _id(getattr(guild, "afk_channel", None))
-        if afk_id == channel_id:
-            return None
-        return self._eligible_voice_channel(channel_id)
+        return eligible_voice_channel_id(
+            self.config, getattr(member, "guild", None), getattr(state, "channel", None)
+        )
 
     @staticmethod
     def _companions(channel: Any, member_id: int) -> frozenset[int]:
@@ -332,12 +345,7 @@ class Tracker:
     async def voice(self, member: Any, before: Any, after: Any) -> None:
         """Process a member's channel change for them (if tracked) and for every roster."""
         async with self._lock:
-            if (
-                self._shutdown
-                or not self.connected
-                or not self.guild_is_available
-                or not self.collection_ready
-            ):
+            if not self._collecting():
                 return
             guild_id = _id(getattr(member, "guild", None))
             member_id = _id(member)
@@ -350,76 +358,61 @@ class Tracker:
             current_channel = self._channel_id_for_state(member, after)
             if previous == current_channel:
                 return
-            try:
-                state = await self.store.state()
-                if state["paused"]:
-                    return
-                now = time.time()
-                if member_id in self.tracked_ids:
-                    companions = (
-                        self._companions(getattr(after, "channel", None), member_id)
-                        if current_channel is not None else frozenset()
-                    )
-                    await self.store.voice_transition(
-                        member_id, current_channel, now, companions=companions
-                    )
-                # Everyone else already in either channel gains or loses this
-                # member as company; the Store skips rosters that already match.
-                if previous is not None:
-                    await self.store.companion_transition(previous, member_id, False, now)
-                if current_channel is not None:
-                    await self.store.companion_transition(current_channel, member_id, True, now)
-                self._recovered("voice collection")
-            except Exception as exc:
-                # A missed channel or roster change makes the persisted voice
-                # state unreliable. Stop crediting it until a current snapshot
-                # can be reconciled by the adapter's recovery loop.
-                self.collection_ready = False
-                self._collection_since = None
+            with self._operation(OP_VOICE):
                 try:
-                    await self.store.disconnect(time.time())
+                    # The Store ignores voice and companion transitions while paused.
+                    now = time.time()
+                    if member_id in self.tracked_ids:
+                        companions = (
+                            self._companions(getattr(after, "channel", None), member_id)
+                            if current_channel is not None else frozenset()
+                        )
+                        await self.store.voice_transition(
+                            member_id, current_channel, now, companions=companions
+                        )
+                    # Everyone else already in either channel gains or loses this
+                    # member as company; the Store skips rosters that already match.
+                    if previous is not None:
+                        await self.store.companion_transition(previous, member_id, False, now)
+                    if current_channel is not None:
+                        await self.store.companion_transition(current_channel, member_id, True, now)
                 except Exception:
-                    # Reconciliation retries disconnect before reopening any
-                    # segments; preserve the original collection failure.
-                    pass
-                self._record_error("voice collection", exc)
-                raise
+                    # A missed channel or roster change makes the persisted voice
+                    # state unreliable. Stop crediting it until a current snapshot
+                    # can be reconciled by the adapter's recovery loop.
+                    self._stop_collection()
+                    try:
+                        await self.store.disconnect(time.time())
+                    except Exception:
+                        # Reconciliation retries disconnect before reopening any
+                        # segments; preserve the original collection failure.
+                        pass
+                    raise
 
     async def checkpoint(self) -> None:
         """Persist the current reliable boundary when the guild is collectible."""
         async with self._lock:
-            if (
-                self._shutdown
-                or not self.connected
-                or not self.guild_is_available
-                or not self.collection_ready
-            ):
+            if not self._collecting():
                 return
-            try:
+            with self._operation(OP_CHECKPOINT):
                 await self.store.checkpoint(time.time())
-                self._recovered("checkpoint")
-            except Exception as exc:
-                self._record_error("checkpoint", exc)
-                raise
 
     async def pause(self, actor_id: int) -> None:
         async with self._lock:
             current = time.time()
-            try:
+            with self._operation(OP_PAUSE):
                 if not self.collection_ready:
                     await self.store.disconnect(current)
                 await self.store.set_paused(True, actor_id, current)
                 self._collection_since = current
                 self.collection_ready = True
-                self._recovered("pause")
-            except Exception as exc:
-                self._record_error("pause", exc)
-                raise
 
     async def resume(self, actor_id: int, snapshot: VoiceSnapshot) -> None:
         async with self._lock:
             current = time.time()
-            try:
+            # Finding collection already running is not a recovery, so an
+            # earlier resume failure stays visible in that case.
+            with self._operation(OP_RESUME, recover=False):
                 state = await self.store.state()
                 if not state["paused"]:
                     return
@@ -428,25 +421,16 @@ class Tracker:
                 self.collection_ready = False
                 if self.connected and self.guild_is_available:
                     await self._start_guild_collection(snapshot, current)
-                self._recovered("resume")
-            except PermissionError:
-                raise
-            except Exception as exc:
-                self._record_error("resume", exc)
-                raise
+                self.report_recovered(OP_RESUME)
 
     async def delete_data(self, actor_id: int) -> None:
         async with self._lock:
             current = time.time()
-            try:
+            with self._operation(OP_DATA_DELETION):
                 await self.store.delete_data(actor_id, current)
                 self._collection_since = current
                 self.collection_ready = True
                 await self._refresh_tracked()
-                self._recovered("data deletion")
-            except Exception as exc:
-                self._record_error("data deletion", exc)
-                raise
 
     async def track_user(
         self, user_id: int, actor_id: int, snapshot: VoiceSnapshot
@@ -455,37 +439,27 @@ class Tracker:
 
         If collection is live and the snapshot places the person in an eligible
         channel, an incomplete-start visit begins at this moment: the bot did
-        not observe them joining.
+        not observe them joining. The Store records no visit while paused.
         """
         async with self._lock:
             current = time.time()
-            try:
+            with self._operation(OP_TRACK_USER):
                 added = await self.store.track_user(user_id, actor_id, current)
                 await self._refresh_tracked()
                 if added and self._collecting():
-                    state = await self.store.state()
-                    if not state["paused"]:
-                        await self._start_visit_from_snapshot(
-                            user_id, _take_snapshot(snapshot), current
-                        )
-                self._recovered("track user")
+                    await self._start_visit_from_snapshot(
+                        user_id, _take_snapshot(snapshot), current
+                    )
                 return added
-            except Exception as exc:
-                self._record_error("track user", exc)
-                raise
 
     async def untrack_user(self, user_id: int, actor_id: int) -> bool:
         """Stop tracking a person now; an open visit ends incomplete, history stays."""
         async with self._lock:
             current = time.time()
-            try:
+            with self._operation(OP_UNTRACK_USER):
                 removed = await self.store.untrack_user(user_id, actor_id, current)
                 await self._refresh_tracked()
-                self._recovered("untrack user")
                 return removed
-            except Exception as exc:
-                self._record_error("untrack user", exc)
-                raise
 
     async def delete_user_data(self, user_id: int, actor_id: int) -> bool:
         """Erase one person's data and untrack them; collection for others continues.
@@ -495,7 +469,7 @@ class Tracker:
         """
         async with self._lock:
             current = time.time()
-            try:
+            with self._operation(OP_USER_DATA_DELETION):
                 existed = await self.store.delete_user_data(
                     user_id, actor_id, current,
                     reset_legacy_modes=(
@@ -504,19 +478,7 @@ class Tracker:
                     ),
                 )
                 await self._refresh_tracked()
-                self._recovered("user data deletion")
                 return existed
-            except Exception as exc:
-                self._record_error("user data deletion", exc)
-                raise
-
-    def _collecting(self) -> bool:
-        return (
-            not self._shutdown
-            and self.connected
-            and self.guild_is_available
-            and self.collection_ready
-        )
 
     async def shutdown(self) -> None:
         """Close a cleanly observed visit and release the Store."""
@@ -525,21 +487,19 @@ class Tracker:
             if self._shutdown:
                 return
             try:
-                if self.connected and self.guild_is_available and self.collection_ready:
-                    await self.store.checkpoint(current)
-                # Also retry closure after a prior disconnect failure. A process
-                # boundary ends coverage; keep any active visit incomplete so it
-                # cannot claim a longest-visit record when a tracked person may
-                # still be connected. The gap is the bot's own downtime, so it
-                # is labelled a restart rather than a lost Discord connection.
-                await self.store.disconnect(current, reason="process_restart")
-            except Exception as exc:
-                self._record_error("shutdown", exc)
-                raise
+                with self._operation(OP_SHUTDOWN, recover=False):
+                    if self._collecting():
+                        await self.store.checkpoint(current)
+                    # Also retry closure after a prior disconnect failure. A
+                    # process boundary ends coverage; keep any active visit
+                    # incomplete so it cannot claim a longest-visit record when
+                    # a tracked person may still be connected. The gap is the
+                    # bot's own downtime, so it is labelled a restart rather
+                    # than a lost Discord connection.
+                    await self.store.disconnect(current, reason="process_restart")
             finally:
                 self.connected = False
                 self.guild_is_available = False
-                self.collection_ready = False
-                self._collection_since = None
+                self._stop_collection()
                 self._shutdown = True
                 await self.store.close()

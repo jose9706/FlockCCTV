@@ -63,17 +63,23 @@ class FakeStore:
         self.disconnections.append(now)
         self.disconnect_reasons.append(reason)
 
+    # Like Store, record no voice, company, or message events while paused or
+    # from before tracking started.
     async def voice_transition(
         self, user_id, channel_id, now, complete_start=True, companions=frozenset()
     ):
+        if self.paused:
+            return
         self.transitions.append((user_id, channel_id, now, complete_start))
         self.companions[user_id] = companions
 
     async def companion_transition(self, channel_id, member_id, joined, now):
+        if self.paused:
+            return
         self.company_transitions.append((channel_id, member_id, joined, now))
 
     async def add_message(self, user_id, message_id, channel_id, created_at):
-        if self.paused or message_id in self.messages:
+        if self.paused or created_at < self.tracking_since or message_id in self.messages:
             return False
         self.messages[message_id] = user_id
         return True
@@ -285,6 +291,36 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertAlmostEqual(record["longest_visit_seconds"], 160)
                 self.assertEqual(record["longest_visit_at"], 110.0)
                 self.assertEqual((await store.stats(20, "all", 300.0))["voice_visits"], 1)
+            finally:
+                await store.close()
+
+    async def test_paused_real_store_records_no_messages_or_voice(self):
+        # The tracker relies on Store to drop events while paused.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config()
+            store = Store(root / "tracker.sqlite3", root / "backups", "UTC")
+            await store.initialize(100.0, config.guild_id)
+            await store.track_user(20, 99, 100.0)
+            await store.track_user(21, 99, 100.0)
+            tracker = Tracker(config, store)
+            try:
+                await tracker.ready({21: 40}, now=150.0)
+                with patch("flock_cctv.collectors.time.time", return_value=160.0):
+                    await tracker.pause(99)
+                self.assertTrue(tracker.collection_ready)
+                self.assertFalse(await tracker.message(message(created=170.0)))
+                with patch("flock_cctv.collectors.time.time", return_value=180.0):
+                    await tracker.voice(
+                        member(20), NO_CHANNEL, in_channel(voice_channel(40, 20, 21)),
+                    )
+                self.assertIsNone(tracker.last_error)
+                stats = await store.stats(20, "all", 200.0)
+                self.assertEqual(stats["messages"], 0)
+                self.assertEqual(stats["voice_visits"], 0)
+                self.assertEqual(stats["voice_seconds"], 0)
+                self.assertIsNone(roster(root / "tracker.sqlite3", 20))
+                self.assertIsNone(roster(root / "tracker.sqlite3", 21))
             finally:
                 await store.close()
 

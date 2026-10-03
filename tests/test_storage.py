@@ -580,35 +580,6 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         await self.store.voice_transition(USER, None, start + 120)
         self.assertIsNone((await self.store.records(USER, start + 120))["longest_visit_at"])
 
-    async def test_startup_recomputes_record_from_visits_split_by_outages(self) -> None:
-        await self.store.connect(100)
-        await self.store.voice_transition(USER, 101, 110)
-        await self.store.voice_transition(USER, None, 140)  # 30s fully observed visit.
-        await self.store.voice_transition(USER, 101, 200)
-        await self.store.checkpoint(260)
-        await self.store.disconnect(265)
-        await self.store.connect(280)
-        await self.store.voice_transition(USER, 101, 280, complete_start=False)
-        await self.store.voice_transition(USER, None, 400)
-        # Simulate visits split before bridging existed.
-        with closing(sqlite3.connect(self.db)) as conn:
-            conn.execute("UPDATE voice_visits SET ended_at = 260, complete_end = 0 WHERE visit_id = 2")
-            conn.execute(
-                "INSERT INTO voice_visits(user_id, started_at, ended_at, complete_start, complete_end, observed_seconds) "
-                "VALUES ('22', 280, 400, 0, 1, 120)"
-            )
-            conn.execute("UPDATE voice_visits SET observed_seconds = 60 WHERE visit_id = 2")
-            conn.execute("UPDATE voice_segments SET visit_id = 3 WHERE started_at = 280")
-            conn.execute("UPDATE records SET value = 30, at = '110.0' "
-                "WHERE user_id = '22' AND record_type = 'longest_visit'")
-            conn.commit()
-        await self.store.close()
-        self.store = Store(self.db, self.backups, "UTC")
-        await self.store.initialize(500, 11)
-        record = await self.store.records(USER, 500)
-        self.assertAlmostEqual(record["longest_visit_seconds"], 180)
-        self.assertEqual(record["longest_visit_at"], 200)
-
     async def test_legacy_target_pause_can_be_cleared_by_admin_and_visit_is_incomplete(self) -> None:
         await self.store.connect(100)
         await self.store.voice_transition(USER, 101, 110)
@@ -700,12 +671,28 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         await self.store.add_message(USER, 201, 30, 150)
         await self.store.maintenance(200, 90)
         with patch.object(
-            self.store, "_compact_after_deletion",
+            self.store, "_compact",
             side_effect=sqlite3.OperationalError("database or disk is full"),
         ), self.assertLogs("flock_cctv.storage", level="ERROR"):
             await self.store.delete_data(22, 210)
         self.assertTrue((await self.store.state())["paused"])
         self.assertEqual((await self.store.stats(USER, "all", 220))["messages"], 0)
+        self.assertFalse(list(self.backups.iterdir()))
+
+    async def test_committed_per_person_deletion_succeeds_when_optional_compaction_fails(self) -> None:
+        self.assertTrue(await self.store.track_user(OTHER, 99, 100.0))
+        await self.store.connect(100.0)
+        await self.store.add_message(USER, 201, 30, 150)
+        await self.store.add_message(OTHER, 202, 30, 160)
+        await self.store.maintenance(200, 90)
+        with patch.object(
+            self.store, "_compact",
+            side_effect=sqlite3.OperationalError("database or disk is full"),
+        ), self.assertLogs("flock_cctv.storage", level="ERROR"):
+            self.assertTrue(await self.store.delete_user_data(USER, 99, 210))
+        self.assertFalse((await self.store.state())["paused"])
+        self.assertEqual((await self.store.stats(USER, "all", 220))["messages"], 0)
+        self.assertEqual((await self.store.stats(OTHER, "all", 220))["messages"], 1)
         self.assertFalse(list(self.backups.iterdir()))
 
     async def test_deletion_removes_interrupted_restore_snapshots_without_backup_directory(self) -> None:
@@ -1250,7 +1237,7 @@ class MultiPersonStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone((await self.store.records(THIRD, 260))["longest_visit_at"])
         self.assertIsNone((await self.store.records(OTHER, 260))["longest_visit_at"])
 
-    async def test_startup_recomputes_each_persons_record_separately(self) -> None:
+    async def test_bridge_rule_applies_to_each_persons_record_separately(self) -> None:
         await self.store.connect(100)
         for user in (USER, OTHER):
             await self.store.voice_transition(user, 101, 200)
@@ -1261,10 +1248,6 @@ class MultiPersonStoreTests(unittest.IsolatedAsyncioTestCase):
         await self.store.voice_transition(OTHER, 102, 280, complete_start=False)
         await self.store.voice_transition(USER, None, 400)
         await self.store.voice_transition(OTHER, None, 400)
-        # Drop the stored records and rebuild them at startup.
-        with closing(sqlite3.connect(self.db)) as conn:
-            conn.execute("DELETE FROM records WHERE record_type = 'longest_visit'")
-            conn.commit()
         await self.reopen(500)
         # USER's visit continued across the outage; OTHER changed channels and did not.
         self.assertAlmostEqual((await self.store.records(USER, 500))["longest_visit_seconds"], 180)

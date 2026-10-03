@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-import json
 import logging
-import os
 import random
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import discord
 from discord import app_commands
 
-from .collectors import Tracker
+from .collectors import Tracker, eligible_voice_channel_id
 from .config import Config
 from .storage import Store
 from .avatar import BOT_DESCRIPTION, BOT_USERNAME, avatar_digest, profile_avatar
@@ -25,7 +24,23 @@ from . import update_status
 logger = logging.getLogger(__name__)
 PROFILE_REFRESH_SECONDS = 60 * 60
 UPDATE_WATCH_SECONDS = 5 * 60
+MAINTENANCE_SECONDS = 24 * 60 * 60
 MENTION_REPLY = "I am evil Leland, more gay than the original"
+
+
+async def _log_failure(action: Callable[[], Awaitable[object]], failure: str) -> None:
+    """Run ``action``, logging (not raising) an ordinary failure as ``failure``."""
+    try:
+        await action()
+    except Exception:
+        logger.exception(failure)
+
+
+async def _every(seconds: float, action: Callable[[], Awaitable[object]], failure: str) -> None:
+    """Run ``action`` now and then every ``seconds``; failures are logged, not fatal."""
+    while True:
+        await _log_failure(action, failure)
+        await asyncio.sleep(seconds)
 
 
 class _InstanceLock:
@@ -125,23 +140,13 @@ class TrackerClient(discord.Client):
             raise
 
     async def _checkpoint_loop(self) -> None:
+        # Unlike the other loops, the first checkpoint waits one interval.
         while True:
             await asyncio.sleep(self.config.checkpoint_seconds)
-            tracker = self.tracker
-            if tracker is None:
+            if self.tracker is None:
                 continue
-            try:
-                await self._checkpoint_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Checkpoint failed")
-            try:
-                await self._alert_outages()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Could not check for outages to report")
+            await _log_failure(self._checkpoint_once, "Checkpoint failed")
+            await _log_failure(self._alert_outages, "Could not check for outages to report")
             await self.flush_error_log()
 
     async def flush_error_log(self) -> None:
@@ -187,48 +192,41 @@ class TrackerClient(discord.Client):
             return
         # Retry storage reconciliation after transient failures even when no
         # further Gateway ready event arrives. Do not revive a lost Gateway.
-        if tracker.connected and not tracker.collection_ready and self.is_ready():
-            guild = self.get_guild(self.config.guild_id)
-            if guild is not None and not getattr(guild, "unavailable", False):
-                await tracker.guild_available(self.voice_snapshot)
+        if (
+            tracker.connected
+            and not tracker.collection_ready
+            and self.is_ready()
+            and self._configured_guild() is not None
+        ):
+            await tracker.guild_available(self.voice_snapshot)
         await tracker.checkpoint()
 
     async def _maintenance_loop(self) -> None:
-        while True:
-            store = self.store
-            tracker = self.tracker
-            if store is not None:
-                try:
-                    await store.maintenance(time.time(), self.config.retention_days)
-                    if tracker is not None:
-                        tracker.report_recovered("maintenance")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    if tracker is not None:
-                        tracker.report_error("maintenance", exc)
-                    logger.exception("Daily maintenance failed")
-            await asyncio.sleep(24 * 60 * 60)
+        await _every(MAINTENANCE_SECONDS, self._maintain_once, "Daily maintenance failed")
+
+    async def _maintain_once(self) -> None:
+        store = self.store
+        tracker = self.tracker
+        if store is None:
+            return
+        try:
+            await store.maintenance(time.time(), self.config.retention_days)
+        except Exception as exc:
+            if tracker is not None:
+                tracker.report_error("maintenance", exc)
+            raise
+        if tracker is not None:
+            tracker.report_recovered("maintenance")
 
     async def _profile_loop(self) -> None:
-        while True:
-            try:
-                await self._sync_profile()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Could not refresh the bot profile")
-            await asyncio.sleep(PROFILE_REFRESH_SECONDS)
+        await _every(
+            PROFILE_REFRESH_SECONDS, self._sync_profile, "Could not refresh the bot profile"
+        )
 
     async def _update_watch_loop(self) -> None:
-        while True:
-            try:
-                await self._alert_update_failure()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Could not check the updater status")
-            await asyncio.sleep(UPDATE_WATCH_SECONDS)
+        await _every(
+            UPDATE_WATCH_SECONDS, self._alert_update_failure, "Could not check the updater status"
+        )
 
     async def _alert_update_failure(self) -> None:
         """DM the owner once when automatic updates start failing."""
@@ -258,10 +256,7 @@ class TrackerClient(discord.Client):
         avatar = await asyncio.to_thread(profile_avatar)
         source_hash = avatar_digest(avatar)
         marker_path = self.config.database_path.with_name("avatar-source.json")
-        try:
-            marker = json.loads(marker_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            marker = {}
+        marker = update_status.read_json(marker_path) or {}
         current_avatar = self.user.avatar
         current_key = current_avatar.key if current_avatar is not None else None
         if marker.get("source") != source_hash or marker.get("bot_avatar") != current_key:
@@ -270,45 +265,43 @@ class TrackerClient(discord.Client):
             updated = await self.user.edit(**edits)
             if "avatar" in edits:
                 avatar_key = updated.avatar.key if updated.avatar is not None else None
-                temporary = marker_path.with_suffix(".tmp")
-                temporary.write_text(
-                    json.dumps({"source": source_hash, "bot_avatar": avatar_key}),
-                    encoding="utf-8",
+                update_status.write_json(
+                    marker_path, {"source": source_hash, "bot_avatar": avatar_key}
                 )
-                os.replace(temporary, marker_path)
             logger.info("Updated the bot profile (%s)", ", ".join(sorted(edits)))
         application = await self.application_info()
         if application.description != BOT_DESCRIPTION:
             await application.edit(description=BOT_DESCRIPTION)
             logger.info("Updated the bot application description")
 
+    def _configured_guild(self) -> discord.Guild | None:
+        """The configured guild when it is cached and available, else None."""
+        guild = self.get_guild(self.config.guild_id)
+        if guild is None or getattr(guild, "unavailable", False):
+            return None
+        return guild
+
     def voice_snapshot(self) -> dict[int, int]:
         """Map each non-bot member in an eligible cached voice channel to that channel.
 
-        Built from the cached guild's voice and stage channels. The AFK channel,
-        channels outside the ``VOICE_CHANNEL_IDS`` allowlist, channels that do
-        not belong to the configured guild, and bots are all excluded. An
-        unknown or unavailable guild yields an empty snapshot.
+        Built from the cached guild's voice and stage channels with the same
+        eligibility rules as live voice events
+        (``collectors.eligible_voice_channel_id``): the AFK channel, channels
+        outside the ``VOICE_CHANNEL_IDS`` allowlist, channels that do not
+        belong to the configured guild, and bots are all excluded. An unknown
+        or unavailable guild yields an empty snapshot.
         """
-        guild = self.get_guild(self.config.guild_id)
-        if guild is None or getattr(guild, "unavailable", False):
+        guild = self._configured_guild()
+        if guild is None:
             return {}
-        afk_channel = getattr(guild, "afk_channel", None)
-        afk_id = int(afk_channel.id) if afk_channel is not None else None
-        allowlist = self.config.voice_channel_ids
         snapshot: dict[int, int] = {}
         channels = [
             *getattr(guild, "voice_channels", ()),
             *getattr(guild, "stage_channels", ()),
         ]
         for channel in channels:
-            channel_id = int(channel.id)
-            if channel_id == afk_id:
-                continue
-            if allowlist is not None and channel_id not in allowlist:
-                continue
-            channel_guild = getattr(channel, "guild", None)
-            if channel_guild is not None and int(channel_guild.id) != self.config.guild_id:
+            channel_id = eligible_voice_channel_id(self.config, guild, channel)
+            if channel_id is None:
                 continue
             for member in getattr(channel, "members", ()):
                 if getattr(member, "bot", False):
@@ -322,8 +315,7 @@ class TrackerClient(discord.Client):
             return
         was_connected = tracker.connected
         await tracker.gateway_ready()
-        guild = self.get_guild(self.config.guild_id)
-        if guild is None or getattr(guild, "unavailable", False):
+        if self._configured_guild() is None:
             return
         if not was_connected or not tracker.guild_is_available or not tracker.collection_ready:
             await tracker.ready(self.voice_snapshot)
@@ -364,51 +356,44 @@ class TrackerClient(discord.Client):
         except Exception:
             logger.exception("Could not close collection after Gateway disconnect")
 
+    async def _configured_guild_returned(self, guild: discord.Guild, failure: str) -> None:
+        tracker = self.tracker
+        if (
+            guild.id != self.config.guild_id
+            or self._closing
+            or getattr(guild, "unavailable", False)
+            or tracker is None
+        ):
+            return
+        await _log_failure(lambda: tracker.guild_available(self.voice_snapshot), failure)
+
+    async def _configured_guild_lost(self, guild: discord.Guild, failure: str) -> None:
+        tracker = self.tracker
+        if guild.id != self.config.guild_id or self._closing or tracker is None:
+            return
+        await _log_failure(tracker.guild_unavailable, failure)
+
     async def on_guild_available(self, guild: discord.Guild) -> None:
-        if guild.id != self.config.guild_id or self._closing or getattr(guild, "unavailable", False):
-            return
-        tracker = self.tracker
-        if tracker is None:
-            return
-        try:
-            await tracker.guild_available(self.voice_snapshot)
-        except Exception:
-            logger.exception("Could not reconcile collection after guild recovery")
-
-    async def on_guild_unavailable(self, guild: discord.Guild) -> None:
-        if guild.id != self.config.guild_id or self._closing:
-            return
-        tracker = self.tracker
-        if tracker is None:
-            return
-        try:
-            await tracker.guild_unavailable()
-        except Exception:
-            logger.exception("Could not stop collection after guild became unavailable")
-
-    async def on_guild_remove(self, guild: discord.Guild) -> None:
-        if guild.id != self.config.guild_id or self._closing:
-            return
-        tracker = self.tracker
-        if tracker is None:
-            return
-        try:
-            await tracker.guild_unavailable()
-        except Exception:
-            logger.exception("Could not stop collection after bot left configured guild")
+        await self._configured_guild_returned(
+            guild, "Could not reconcile collection after guild recovery"
+        )
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         # The bot may be invited back after it was removed. A new join is also
         # a fresh observation boundary, so reconcile only current cached state.
-        if guild.id != self.config.guild_id or self._closing or getattr(guild, "unavailable", False):
-            return
-        tracker = self.tracker
-        if tracker is None:
-            return
-        try:
-            await tracker.guild_available(self.voice_snapshot)
-        except Exception:
-            logger.exception("Could not reconcile collection after joining configured guild")
+        await self._configured_guild_returned(
+            guild, "Could not reconcile collection after joining configured guild"
+        )
+
+    async def on_guild_unavailable(self, guild: discord.Guild) -> None:
+        await self._configured_guild_lost(
+            guild, "Could not stop collection after guild became unavailable"
+        )
+
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        await self._configured_guild_lost(
+            guild, "Could not stop collection after bot left configured guild"
+        )
 
     async def on_message(self, message: discord.Message) -> None:
         tracker = self.tracker

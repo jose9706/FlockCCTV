@@ -62,6 +62,26 @@ def _is_managed_backup(name: str) -> bool:
 # people's history. 0 is the alone slice; real Discord IDs are positive.
 DELETED_COMPANION_ID = "-2"
 
+# Tables whose rows belong to one person through ``user_id``, apart from
+# ``tracked_users``, which deletion handles separately. Global deletion empties
+# them; per-person deletion checks and removes one person's rows.
+_PERSON_TABLES = (
+    "voice_segments",
+    "voice_visits",
+    "messages",
+    "daily_stats",
+    "voice_company_current",
+    "voice_company_daily",
+    "last_voice",
+    "records",
+    "tracking_intervals",
+)
+
+
+def _new_countdown() -> int:
+    """Return how many ordinary messages pass before the next reaction."""
+    return random.randint(15, 25)
+
 
 class StoreError(RuntimeError):
     """Base error for invalid or unavailable store operations."""
@@ -71,7 +91,6 @@ class Store:
     """Async storage service; construct once and close it during shutdown."""
 
     SCHEMA_VERSION = 1
-    DEFAULT_RETENTION_DAYS = 90
     # A tracker reconnect or restart closes each open visit at its last
     # checkpoint. If that person is found in the same channel this soon
     # afterwards, the visit continues instead of splitting into two incomplete
@@ -99,6 +118,28 @@ class Store:
                 raise StoreError("store is closed")
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(self._executor, operation)
+
+    async def _read(self, fn: Callable[[sqlite3.Connection, sqlite3.Row], _T]) -> _T:
+        """Run ``fn(conn, settings)`` on the worker after checking the store is initialized."""
+
+        def operation() -> _T:
+            conn = self._conn()
+            return fn(conn, self._settings(conn))
+
+        return await self._run(operation)
+
+    async def _write(self, fn: Callable[[sqlite3.Connection, sqlite3.Row], _T]) -> _T:
+        """Run ``fn(conn, settings)`` in one ``BEGIN IMMEDIATE`` transaction.
+
+        The settings row is read inside the transaction, so ``fn`` sees the
+        current state, and an uninitialized store raises before any change.
+        """
+
+        def operation() -> _T:
+            conn = self._conn()
+            return self._transaction(conn, lambda: fn(conn, self._settings(conn)))
+
+        return await self._run(operation)
 
     def _conn(self) -> sqlite3.Connection:
         # This method is called only from the store's single worker thread.
@@ -362,17 +403,19 @@ class Store:
             return
         members = json.loads(row["member_ids"])
         recipients = members if members else ["0"]  # 0 is the alone slice.
-        for day, seconds in split_interval_by_day(start, end, self.timezone):
-            for member_id in recipients:
-                conn.execute(
-                    """INSERT INTO voice_company_daily(
-                           user_id, day, channel_id, member_id, seconds, full_seconds
-                       ) VALUES (?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(user_id, day, channel_id, member_id) DO UPDATE SET
-                           seconds = seconds + excluded.seconds,
-                           full_seconds = full_seconds + excluded.full_seconds""",
-                    (user_text, day, row["channel_id"], member_id, seconds / len(recipients), seconds),
-                )
+        conn.executemany(
+            """INSERT INTO voice_company_daily(
+                   user_id, day, channel_id, member_id, seconds, full_seconds
+               ) VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, day, channel_id, member_id) DO UPDATE SET
+                   seconds = seconds + excluded.seconds,
+                   full_seconds = full_seconds + excluded.full_seconds""",
+            [
+                (user_text, day, row["channel_id"], member_id, seconds / len(recipients), seconds)
+                for day, seconds in split_interval_by_day(start, end, self.timezone)
+                for member_id in recipients
+            ],
+        )
         conn.execute(
             "UPDATE voice_company_current SET checkpoint = ? WHERE user_id = ?", (end, user_text)
         )
@@ -447,7 +490,7 @@ class Store:
     ) -> float:
         user_text = str(segment["user_id"])
         close_at = max(float(segment["checkpoint"]), at)
-        delta = self._add_voice_time(
+        self._add_voice_time(
             conn, user_text, int(segment["visit_id"]), float(segment["checkpoint"]), close_at
         )
         conn.execute(
@@ -485,11 +528,10 @@ class Store:
             )
 
     @staticmethod
-    def _visit_channel(conn: sqlite3.Connection, visit_id: int, *, last: bool) -> str | None:
-        order = "DESC" if last else "ASC"
+    def _last_visit_channel(conn: sqlite3.Connection, visit_id: int) -> str | None:
         row = conn.execute(
-            f"SELECT channel_id FROM voice_segments WHERE visit_id = ? "
-            f"ORDER BY started_at {order}, segment_id {order} LIMIT 1",
+            "SELECT channel_id FROM voice_segments WHERE visit_id = ? "
+            "ORDER BY started_at DESC, segment_id DESC LIMIT 1",
             (visit_id,),
         ).fetchone()
         return None if row is None else str(row["channel_id"])
@@ -508,7 +550,7 @@ class Store:
         ended_at = float(previous["ended_at"])
         if not 0 <= at - ended_at <= self.VISIT_BRIDGE_SECONDS:
             return False
-        if self._visit_channel(conn, int(previous["visit_id"]), last=True) != channel_id:
+        if self._last_visit_channel(conn, int(previous["visit_id"])) != channel_id:
             return False
         # The visit and its continuation must sit inside one tracking interval.
         if conn.execute(
@@ -526,51 +568,26 @@ class Store:
             (ended_at, at),
         ).fetchone() is not None
 
-    def _recompute_longest_visit(self, conn: sqlite3.Connection, user_text: str) -> None:
-        """Apply the bridge rule to one person's retained visits split before it existed."""
-        rows = conn.execute(
-            "SELECT * FROM voice_visits WHERE user_id = ? AND ended_at IS NOT NULL "
-            "ORDER BY started_at, visit_id",
-            (user_text,),
-        ).fetchall()
-        chain_start: sqlite3.Row | None = None
-        previous: sqlite3.Row | None = None
-        seconds = 0.0
-        for row in rows:
-            channel = self._visit_channel(conn, int(row["visit_id"]), last=False)
-            if (
-                previous is not None
-                and chain_start is not None
-                and not bool(row["complete_start"])
-                and channel is not None
-                and self._bridges(conn, previous, channel, float(row["started_at"]))
-            ):
-                seconds += float(row["observed_seconds"])
-            else:
-                chain_start = row
-                seconds = float(row["observed_seconds"])
-            previous = row
-            if bool(chain_start["complete_start"]) and bool(row["complete_end"]):
-                self._update_longest_visit(
-                    conn, user_text, seconds, float(chain_start["started_at"])
-                )
-
     @staticmethod
+    def _set_record(
+        conn: sqlite3.Connection, user_text: str, record_type: str, value: float, at: str
+    ) -> None:
+        conn.execute(
+            "INSERT INTO records(user_id, record_type, value, at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, record_type) DO UPDATE SET "
+            "value = excluded.value, at = excluded.at",
+            (user_text, record_type, value, at),
+        )
+
     def _update_longest_visit(
-        conn: sqlite3.Connection, user_text: str, duration: float, started_at: float
+        self, conn: sqlite3.Connection, user_text: str, duration: float, started_at: float
     ) -> None:
         current = conn.execute(
             "SELECT value FROM records WHERE user_id = ? AND record_type = 'longest_visit'",
             (user_text,),
         ).fetchone()
         if current is None or duration > float(current["value"]):
-            conn.execute(
-                "INSERT INTO records(user_id, record_type, value, at) "
-                "VALUES (?, 'longest_visit', ?, ?) "
-                "ON CONFLICT(user_id, record_type) DO UPDATE SET "
-                "value = excluded.value, at = excluded.at",
-                (user_text, duration, repr(started_at)),
-            )
+            self._set_record(conn, user_text, "longest_visit", duration, repr(started_at))
 
     def _update_busiest_day(self, conn: sqlite3.Connection, user_text: str, day: str) -> None:
         count_row = conn.execute(
@@ -584,13 +601,26 @@ class Store:
         if existing is None or count > int(existing["value"]) or (
             count == int(existing["value"]) and day < str(existing["at"])
         ):
+            self._set_record(conn, user_text, "busiest_day", count, day)
+
+    def _end_segments_at_checkpoint(
+        self, conn: sqlite3.Connection, segments: list[sqlite3.Row]
+    ) -> float | None:
+        """End each open segment, and its visit as incomplete, at its own last checkpoint.
+
+        Time after a checkpoint was not observed, so it is never credited.
+        Returns the earliest of those checkpoints, or None without segments.
+        """
+        earliest: float | None = None
+        for segment in segments:
+            checkpoint = float(segment["checkpoint"])
             conn.execute(
-                "INSERT INTO records(user_id, record_type, value, at) "
-                "VALUES (?, 'busiest_day', ?, ?) "
-                "ON CONFLICT(user_id, record_type) DO UPDATE SET "
-                "value = excluded.value, at = excluded.at",
-                (user_text, count, day),
+                "UPDATE voice_segments SET ended_at = ?, checkpoint = ? WHERE segment_id = ?",
+                (checkpoint, checkpoint, int(segment["segment_id"])),
             )
+            self._finish_visit(conn, int(segment["visit_id"]), checkpoint, complete_end=False)
+            earliest = checkpoint if earliest is None else min(earliest, checkpoint)
+        return earliest
 
     async def initialize(self, now: float, guild_id: int) -> None:
         """Create or validate the database and recover any previous open session."""
@@ -620,24 +650,10 @@ class Store:
 
                 was_connected = bool(row["connected"])
                 intentionally_paused = bool(row["paused"])
-                recovery_point: float | None = None
                 # Every person's open segment ends at its own last checkpoint.
-                for segment in self._open_segments(conn):
-                    checkpoint = float(segment["checkpoint"])
-                    recovery_point = checkpoint if recovery_point is None else min(
-                        recovery_point, checkpoint
-                    )
-                    conn.execute(
-                        "UPDATE voice_segments SET ended_at = ?, checkpoint = ? "
-                        "WHERE segment_id = ?",
-                        (checkpoint, checkpoint, int(segment["segment_id"])),
-                    )
-                    self._finish_visit(
-                        conn,
-                        int(segment["visit_id"]),
-                        checkpoint,
-                        complete_end=False,
-                    )
+                recovery_point = self._end_segments_at_checkpoint(
+                    conn, self._open_segments(conn)
+                )
                 conn.execute("DELETE FROM voice_company_current")
 
                 coverage = self._open_coverage(conn)
@@ -660,22 +676,10 @@ class Store:
                 conn.execute(
                     "UPDATE settings SET connected = 0 WHERE singleton = 1"
                 )
-                for visitor in conn.execute("SELECT DISTINCT user_id FROM voice_visits").fetchall():
-                    self._recompute_longest_visit(conn, str(visitor["user_id"]))
 
             self._transaction(conn, action)
 
         await self._run(operation)
-
-    @staticmethod
-    def _insert_gap(
-        conn: sqlite3.Connection, start: float, end: float, reason: str
-    ) -> None:
-        if end > start:
-            conn.execute(
-                "INSERT INTO coverage_gaps(started_at, ended_at, reason) VALUES (?, ?, ?)",
-                (start, end, reason),
-            )
 
     @staticmethod
     def _start_gap(conn: sqlite3.Connection, start: float, reason: str) -> None:
@@ -714,82 +718,67 @@ class Store:
             self._executor.shutdown(wait=True)
 
     async def state(self) -> dict[str, Any]:
-        def operation() -> dict[str, Any]:
-            row = self._settings(self._conn())
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[str, Any]:
             return {
-                "paused": bool(row["paused"]),
-                "evil_mode": bool(row["evil_mode"]),
-                "reaction_mode": bool(row["reaction_mode"]),
-                "paused_by": row["paused_by"],
-                "tracking_since": float(row["tracking_since"]),
+                "paused": bool(settings["paused"]),
+                "evil_mode": bool(settings["evil_mode"]),
+                "reaction_mode": bool(settings["reaction_mode"]),
+                "paused_by": settings["paused_by"],
+                "tracking_since": float(settings["tracking_since"]),
                 "last_checkpoint": (
-                    None if row["last_checkpoint"] is None else float(row["last_checkpoint"])
+                    None
+                    if settings["last_checkpoint"] is None
+                    else float(settings["last_checkpoint"])
                 ),
             }
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def set_evil_mode(self, enabled: bool) -> None:
         """Persist the admin-controlled message echo switch."""
 
-        def operation() -> None:
-            conn = self._conn()
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> None:
+            conn.execute(
+                "UPDATE settings SET evil_mode = ? WHERE singleton = 1",
+                (int(enabled),),
+            )
 
-            def action() -> None:
-                self._settings(conn)
-                conn.execute(
-                    "UPDATE settings SET evil_mode = ? WHERE singleton = 1",
-                    (int(enabled),),
-                )
-
-            self._transaction(conn, action)
-
-        await self._run(operation)
+        await self._write(action)
 
     async def set_reaction_mode(self, enabled: bool) -> None:
         """Persist the reaction switch and start a fresh interval when enabled."""
 
-        def operation() -> None:
-            conn = self._conn()
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> None:
+            conn.execute(
+                "UPDATE settings SET reaction_mode = ?, reaction_countdown = ? "
+                "WHERE singleton = 1",
+                (int(enabled), _new_countdown() if enabled else None),
+            )
 
-            def action() -> None:
-                self._settings(conn)
-                conn.execute(
-                    "UPDATE settings SET reaction_mode = ?, reaction_countdown = ? "
-                    "WHERE singleton = 1",
-                    (int(enabled), random.randint(15, 25) if enabled else None),
-                )
-
-            self._transaction(conn, action)
-
-        await self._run(operation)
+        await self._write(action)
 
     async def admin_override(self, user_id: int) -> bool | None:
         """Return a stored admin decision, or None to use the environment list."""
         user_text = str(int(user_id))
 
-        def operation() -> bool | None:
-            conn = self._conn()
-            self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> bool | None:
             row = conn.execute(
                 "SELECT enabled FROM admin_overrides WHERE user_id = ?", (user_text,)
             ).fetchone()
             return None if row is None else bool(row["enabled"])
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def admin_overrides(self) -> dict[int, bool]:
         """Return all stored decisions for the private admin list."""
 
-        def operation() -> dict[int, bool]:
-            conn = self._conn()
-            self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[int, bool]:
             return {
                 int(row["user_id"]): bool(row["enabled"])
                 for row in conn.execute("SELECT user_id, enabled FROM admin_overrides")
             }
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def set_admin_override(self, user_id: int, enabled: bool) -> None:
         """Persist an owner's grant or revocation across restarts."""
@@ -797,65 +786,52 @@ class Store:
             raise ValueError("user_id must be a positive Discord ID")
         user_text = str(int(user_id))
 
-        def operation() -> None:
-            conn = self._conn()
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> None:
+            conn.execute(
+                "INSERT INTO admin_overrides(user_id, enabled) VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET enabled = excluded.enabled",
+                (user_text, int(enabled)),
+            )
 
-            def action() -> None:
-                self._settings(conn)
-                conn.execute(
-                    "INSERT INTO admin_overrides(user_id, enabled) VALUES (?, ?) "
-                    "ON CONFLICT(user_id) DO UPDATE SET enabled = excluded.enabled",
-                    (user_text, int(enabled)),
-                )
-
-            self._transaction(conn, action)
-
-        await self._run(operation)
+        await self._write(action)
 
     async def set_paused(self, paused: bool, actor_id: int, now: float) -> None:
         """Persist collection pause; command authorization happens before this call."""
         now = self._timestamp(now)
         actor_text = str(int(actor_id))
 
-        def operation() -> None:
-            conn = self._conn()
-
-            def action() -> None:
-                self._settings(conn)
-
-                if paused:
-                    for segment in self._open_segments(conn):
-                        end = self._close_voice_segment(conn, segment, now)
-                        self._finish_visit(
-                            conn,
-                            int(segment["visit_id"]),
-                            end,
-                            complete_end=False,
-                        )
-                    coverage = self._open_coverage(conn)
-                    if coverage is not None:
-                        end = max(float(coverage["checkpoint"]), now)
-                        conn.execute(
-                            "UPDATE coverage_intervals SET ended_at = ?, checkpoint = ? "
-                            "WHERE interval_id = ?",
-                            (end, end, int(coverage["interval_id"])),
-                        )
-                    self._close_open_gap(conn, now)
-                    conn.execute(
-                        "UPDATE settings SET paused = 1, paused_by = ?, connected = 0, "
-                        "last_checkpoint = ?, resume_boundary = ? WHERE singleton = 1",
-                        (actor_text, now, now),
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> None:
+            if paused:
+                for segment in self._open_segments(conn):
+                    end = self._close_voice_segment(conn, segment, now)
+                    self._finish_visit(
+                        conn,
+                        int(segment["visit_id"]),
+                        end,
+                        complete_end=False,
                     )
-                else:
+                coverage = self._open_coverage(conn)
+                if coverage is not None:
+                    end = max(float(coverage["checkpoint"]), now)
                     conn.execute(
-                        "UPDATE settings SET paused = 0, paused_by = NULL, connected = 0, "
-                        "resume_boundary = ? WHERE singleton = 1",
-                        (now,),
+                        "UPDATE coverage_intervals SET ended_at = ?, checkpoint = ? "
+                        "WHERE interval_id = ?",
+                        (end, end, int(coverage["interval_id"])),
                     )
+                self._close_open_gap(conn, now)
+                conn.execute(
+                    "UPDATE settings SET paused = 1, paused_by = ?, connected = 0, "
+                    "last_checkpoint = ?, resume_boundary = ? WHERE singleton = 1",
+                    (actor_text, now, now),
+                )
+            else:
+                conn.execute(
+                    "UPDATE settings SET paused = 0, paused_by = NULL, connected = 0, "
+                    "resume_boundary = ? WHERE singleton = 1",
+                    (now,),
+                )
 
-            self._transaction(conn, action)
-
-        await self._run(operation)
+        await self._write(action)
 
     # -- Tracked list -------------------------------------------------------
 
@@ -882,41 +858,35 @@ class Store:
         user_text = str(int(user_id))
         actor_text = str(int(actor_id))
 
-        def operation() -> bool:
-            conn = self._conn()
-
-            def action() -> bool:
-                self._settings(conn)
-                row = self._tracked_row(conn, user_text)
-                if row is not None and bool(row["active"]):
-                    return False
-                # Intervals never overlap, even if the clock stepped backwards.
-                last_end = conn.execute(
-                    "SELECT MAX(ended_at) FROM tracking_intervals WHERE user_id = ?",
-                    (user_text,),
-                ).fetchone()[0]
-                started = now if last_end is None else max(now, float(last_end))
-                if row is None:
-                    conn.execute(
-                        "INSERT INTO tracked_users(user_id, tracking_since, active, added_by, updated_at) "
-                        "VALUES (?, ?, 1, ?, ?)",
-                        (user_text, started, actor_text, now),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tracked_users SET active = 1, added_by = ?, updated_at = ? "
-                        "WHERE user_id = ?",
-                        (actor_text, now, user_text),
-                    )
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> bool:
+            row = self._tracked_row(conn, user_text)
+            if row is not None and bool(row["active"]):
+                return False
+            # Intervals never overlap, even if the clock stepped backwards.
+            last_end = conn.execute(
+                "SELECT MAX(ended_at) FROM tracking_intervals WHERE user_id = ?",
+                (user_text,),
+            ).fetchone()[0]
+            started = now if last_end is None else max(now, float(last_end))
+            if row is None:
                 conn.execute(
-                    "INSERT INTO tracking_intervals(user_id, started_at) VALUES (?, ?)",
-                    (user_text, started),
+                    "INSERT INTO tracked_users(user_id, tracking_since, active, added_by, updated_at) "
+                    "VALUES (?, ?, 1, ?, ?)",
+                    (user_text, started, actor_text, now),
                 )
-                return True
+            else:
+                conn.execute(
+                    "UPDATE tracked_users SET active = 1, added_by = ?, updated_at = ? "
+                    "WHERE user_id = ?",
+                    (actor_text, now, user_text),
+                )
+            conn.execute(
+                "INSERT INTO tracking_intervals(user_id, started_at) VALUES (?, ?)",
+                (user_text, started),
+            )
+            return True
 
-            return self._transaction(conn, action)
-
-        return await self._run(operation)
+        return await self._write(action)
 
     async def untrack_user(self, user_id: int, actor_id: int, now: float) -> bool:
         """Stop tracking a person, keeping their history; False when not tracked.
@@ -927,47 +897,39 @@ class Store:
         user_text = str(int(user_id))
         int(actor_id)  # Validated for symmetry; removal does not store its actor.
 
-        def operation() -> bool:
-            conn = self._conn()
-
-            def action() -> bool:
-                settings = self._settings(conn)
-                row = self._tracked_row(conn, user_text)
-                if row is None or not bool(row["active"]):
-                    return False
-                ended = now
-                segment = self._open_segment(conn, user_text)
-                if segment is not None:
-                    ended = self._close_voice_segment(conn, segment, now)
-                    self._finish_visit(
-                        conn, int(segment["visit_id"]), ended, complete_end=False
-                    )
-                    if bool(settings["connected"]) and not bool(settings["paused"]):
-                        self._advance_checkpoint(conn, ended)
-                conn.execute(
-                    "DELETE FROM voice_company_current WHERE user_id = ?", (user_text,)
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> bool:
+            row = self._tracked_row(conn, user_text)
+            if row is None or not bool(row["active"]):
+                return False
+            ended = now
+            segment = self._open_segment(conn, user_text)
+            if segment is not None:
+                ended = self._close_voice_segment(conn, segment, now)
+                self._finish_visit(
+                    conn, int(segment["visit_id"]), ended, complete_end=False
                 )
-                conn.execute(
-                    "UPDATE tracking_intervals SET ended_at = MAX(started_at, ?) "
-                    "WHERE user_id = ? AND ended_at IS NULL",
-                    (ended, user_text),
-                )
-                conn.execute(
-                    "UPDATE tracked_users SET active = 0, updated_at = ? WHERE user_id = ?",
-                    (now, user_text),
-                )
-                return True
+                if bool(settings["connected"]) and not bool(settings["paused"]):
+                    self._advance_checkpoint(conn, ended)
+            conn.execute(
+                "DELETE FROM voice_company_current WHERE user_id = ?", (user_text,)
+            )
+            conn.execute(
+                "UPDATE tracking_intervals SET ended_at = MAX(started_at, ?) "
+                "WHERE user_id = ? AND ended_at IS NULL",
+                (ended, user_text),
+            )
+            conn.execute(
+                "UPDATE tracked_users SET active = 0, updated_at = ? WHERE user_id = ?",
+                (now, user_text),
+            )
+            return True
 
-            return self._transaction(conn, action)
-
-        return await self._run(operation)
+        return await self._write(action)
 
     async def tracked_users(self) -> list[dict[str, Any]]:
         """Return every tracked-list row, active or not, ordered by user ID."""
 
-        def operation() -> list[dict[str, Any]]:
-            conn = self._conn()
-            self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> list[dict[str, Any]]:
             rows = [
                 {
                     "user_id": int(row["user_id"]),
@@ -980,20 +942,18 @@ class Store:
             ]
             return sorted(rows, key=lambda item: item["user_id"])
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def active_user_ids(self) -> frozenset[int]:
         """Return the IDs of everyone currently tracked."""
 
-        def operation() -> frozenset[int]:
-            conn = self._conn()
-            self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> frozenset[int]:
             return frozenset(
                 int(row["user_id"])
                 for row in conn.execute("SELECT user_id FROM tracked_users WHERE active = 1")
             )
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     # -- Collection ---------------------------------------------------------
 
@@ -1023,123 +983,105 @@ class Store:
         channel_text = str(int(channel_id))
         day = local_day(created_at, self.timezone)
 
-        def operation() -> tuple[bool, bool]:
-            conn = self._conn()
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> tuple[bool, bool]:
+            if bool(settings["paused"]) or not bool(settings["connected"]):
+                return False, False
+            person_start = self._collection_start(conn, user_text)
+            if person_start is None:
+                return False, False
+            if created_at < max(
+                float(settings["tracking_since"]),
+                float(settings["resume_boundary"]),
+                person_start,
+            ):
+                return False, False
+            pruned_before = settings["pruned_before"]
+            if pruned_before is not None and created_at < float(pruned_before):
+                return False, False
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO messages(message_id, user_id, channel_id, created_at, day) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (message_text, user_text, channel_text, created_at, day),
+            )
+            if cursor.rowcount == 0:
+                return False, False
+            self._daily_delta(conn, user_text, day, messages=1)
+            self._update_busiest_day(conn, user_text, day)
+            if not ordinary or not settings["reaction_mode"]:
+                return True, False
+            remaining = settings["reaction_countdown"]
+            if remaining is None:
+                remaining = _new_countdown()
+            due = remaining <= 1
+            conn.execute(
+                "UPDATE settings SET reaction_countdown = ? WHERE singleton = 1",
+                (_new_countdown() if due else remaining - 1,),
+            )
+            return True, due
 
-            def action() -> tuple[bool, bool]:
-                settings = self._settings(conn)
-                if bool(settings["paused"]) or not bool(settings["connected"]):
-                    return False, False
-                person_start = self._collection_start(conn, user_text)
-                if person_start is None:
-                    return False, False
-                if created_at < max(
-                    float(settings["tracking_since"]),
-                    float(settings["resume_boundary"]),
-                    person_start,
-                ):
-                    return False, False
-                pruned_before = settings["pruned_before"]
-                if pruned_before is not None and created_at < float(pruned_before):
-                    return False, False
-                cursor = conn.execute(
-                    "INSERT OR IGNORE INTO messages(message_id, user_id, channel_id, created_at, day) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (message_text, user_text, channel_text, created_at, day),
-                )
-                if cursor.rowcount == 0:
-                    return False, False
-                self._daily_delta(conn, user_text, day, messages=1)
-                self._update_busiest_day(conn, user_text, day)
-                if not ordinary or not settings["reaction_mode"]:
-                    return True, False
-                remaining = settings["reaction_countdown"]
-                if remaining is None:
-                    remaining = random.randint(15, 25)
-                due = remaining <= 1
-                conn.execute(
-                    "UPDATE settings SET reaction_countdown = ? WHERE singleton = 1",
-                    (random.randint(15, 25) if due else remaining - 1,),
-                )
-                return True, due
-
-            return self._transaction(conn, action)
-
-        return await self._run(operation)
+        return await self._write(action)
 
     async def connect(self, now: float) -> None:
         """Start a fresh observed coverage interval unless collection is paused."""
         now = self._timestamp(now)
 
-        def operation() -> None:
-            conn = self._conn()
-
-            def action() -> None:
-                settings = self._settings(conn)
-                if bool(settings["paused"]):
-                    return
-                if self._open_coverage(conn) is not None:
-                    conn.execute(
-                        "UPDATE settings SET connected = 1 WHERE singleton = 1"
-                    )
-                    return
-                self._close_open_gap(conn, now)
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> None:
+            if bool(settings["paused"]):
+                return
+            if self._open_coverage(conn) is not None:
                 conn.execute(
-                    "INSERT INTO coverage_intervals(started_at, checkpoint) VALUES (?, ?)",
-                    (now, now),
+                    "UPDATE settings SET connected = 1 WHERE singleton = 1"
                 )
-                conn.execute(
-                    "UPDATE settings SET connected = 1, last_checkpoint = ? WHERE singleton = 1",
-                    (now,),
-                )
+                return
+            self._close_open_gap(conn, now)
+            conn.execute(
+                "INSERT INTO coverage_intervals(started_at, checkpoint) VALUES (?, ?)",
+                (now, now),
+            )
+            conn.execute(
+                "UPDATE settings SET connected = 1, last_checkpoint = ? WHERE singleton = 1",
+                (now,),
+            )
 
-            self._transaction(conn, action)
-
-        await self._run(operation)
+        await self._write(action)
 
     async def checkpoint(self, now: float) -> None:
         """Persist observed voice time and advance the reliable coverage checkpoint."""
         now = self._timestamp(now)
 
-        def operation() -> None:
-            conn = self._conn()
-
-            def action() -> None:
-                settings = self._settings(conn)
-                if bool(settings["paused"]) or not bool(settings["connected"]):
-                    return
-                coverage = self._open_coverage(conn)
-                if coverage is None:
-                    return
-                segments = self._open_segments(conn)
-                at = max(now, float(coverage["checkpoint"]))
-                for segment in segments:
-                    at = max(at, float(segment["checkpoint"]))
-                for segment in segments:
-                    user_text = str(segment["user_id"])
-                    self._add_voice_time(
-                        conn,
-                        user_text,
-                        int(segment["visit_id"]),
-                        float(segment["checkpoint"]),
-                        at,
-                    )
-                    conn.execute(
-                        "UPDATE voice_segments SET checkpoint = ? WHERE segment_id = ?",
-                        (at, int(segment["segment_id"])),
-                    )
-                    self._record_last_voice(conn, user_text, str(segment["channel_id"]), at)
-                conn.execute(
-                    "UPDATE coverage_intervals SET checkpoint = ? WHERE interval_id = ?",
-                    (at, int(coverage["interval_id"])),
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> None:
+            if bool(settings["paused"]) or not bool(settings["connected"]):
+                return
+            coverage = self._open_coverage(conn)
+            if coverage is None:
+                return
+            segments = self._open_segments(conn)
+            at = max(now, float(coverage["checkpoint"]))
+            for segment in segments:
+                at = max(at, float(segment["checkpoint"]))
+            for segment in segments:
+                user_text = str(segment["user_id"])
+                self._add_voice_time(
+                    conn,
+                    user_text,
+                    int(segment["visit_id"]),
+                    float(segment["checkpoint"]),
+                    at,
                 )
                 conn.execute(
-                    "UPDATE settings SET last_checkpoint = ? WHERE singleton = 1", (at,)
+                    "UPDATE voice_segments SET checkpoint = ? WHERE segment_id = ?",
+                    (at, int(segment["segment_id"])),
                 )
+                self._record_last_voice(conn, user_text, str(segment["channel_id"]), at)
+            conn.execute(
+                "UPDATE coverage_intervals SET checkpoint = ? WHERE interval_id = ?",
+                (at, int(coverage["interval_id"])),
+            )
+            conn.execute(
+                "UPDATE settings SET last_checkpoint = ? WHERE singleton = 1", (at,)
+            )
 
-            self._transaction(conn, action)
-
-        await self._run(operation)
+        await self._write(action)
 
     async def companion_transition(
         self, channel_id: int, member_id: int, joined: bool, now: float
@@ -1156,42 +1098,38 @@ class Store:
         channel_text = str(int(channel_id))
         member_text = str(int(member_id))
 
-        def operation() -> None:
-            conn = self._conn()
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> None:
+            if bool(settings["paused"]) or not bool(settings["connected"]):
+                return
+            self._advance_checkpoint(conn, now)
+            # Fetch after crediting so every checkpoint read below is current.
+            rows = conn.execute(
+                """SELECT s.user_id, s.checkpoint, c.member_ids
+                   FROM voice_segments s
+                   JOIN voice_company_current c ON c.user_id = s.user_id
+                   WHERE s.ended_at IS NULL AND s.user_id != ?
+                     AND s.channel_id = ? AND c.channel_id = ?
+                   ORDER BY s.segment_id""",
+                (member_text, channel_text, channel_text),
+            ).fetchall()
+            for row in rows:
+                user_text = str(row["user_id"])
+                members = set(json.loads(row["member_ids"]))
+                if (member_text in members) == joined:
+                    continue
+                # A checkpoint ahead of ``now`` (clock step) keeps its later time.
+                at = max(now, float(row["checkpoint"]))
+                if joined:
+                    members.add(member_text)
+                else:
+                    members.discard(member_text)
+                conn.execute(
+                    "UPDATE voice_company_current SET member_ids = ?, checkpoint = ? "
+                    "WHERE user_id = ?",
+                    (json.dumps(sorted(members)), at, user_text),
+                )
 
-            def action() -> None:
-                settings = self._settings(conn)
-                if bool(settings["paused"]) or not bool(settings["connected"]):
-                    return
-                self._advance_checkpoint(conn, now)
-                # Fetch after crediting so every checkpoint read below is current.
-                for segment in self._open_segments(conn):
-                    user_text = str(segment["user_id"])
-                    if user_text == member_text or str(segment["channel_id"]) != channel_text:
-                        continue
-                    company = conn.execute(
-                        "SELECT * FROM voice_company_current WHERE user_id = ?", (user_text,)
-                    ).fetchone()
-                    if company is None or str(company["channel_id"]) != channel_text:
-                        continue
-                    members = set(json.loads(company["member_ids"]))
-                    if (member_text in members) == joined:
-                        continue
-                    # A checkpoint ahead of ``now`` (clock step) keeps its later time.
-                    at = max(now, float(segment["checkpoint"]))
-                    if joined:
-                        members.add(member_text)
-                    else:
-                        members.discard(member_text)
-                    conn.execute(
-                        "UPDATE voice_company_current SET member_ids = ?, checkpoint = ? "
-                        "WHERE user_id = ?",
-                        (json.dumps(sorted(members)), at, user_text),
-                    )
-
-            self._transaction(conn, action)
-
-        await self._run(operation)
+        await self._write(action)
 
     async def voice_transition(
         self,
@@ -1206,86 +1144,80 @@ class Store:
         user_text = str(int(user_id))
         channel_text = None if channel_id is None else str(int(channel_id))
 
-        def operation() -> None:
-            conn = self._conn()
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> None:
+            if bool(settings["paused"]) or not bool(settings["connected"]):
+                return
+            person_start = self._collection_start(conn, user_text)
+            if person_start is None:
+                return
+            segment = self._open_segment(conn, user_text)
+            current_channel = None if segment is None else str(segment["channel_id"])
+            if current_channel == channel_text:
+                return
+            coverage = self._open_coverage(conn)
+            # Nothing is observed before the person was on the tracked list.
+            at = max(now, person_start)
+            if coverage is not None:
+                at = max(at, float(coverage["checkpoint"]))
+            if segment is not None:
+                at = max(at, float(segment["checkpoint"]))
+                close_at = self._close_voice_segment(conn, segment, at)
+                visit_id = int(segment["visit_id"])
+                if channel_text is None:
+                    self._finish_visit(conn, visit_id, close_at, complete_end=True)
+            else:
+                visit_id = -1
 
-            def action() -> None:
-                settings = self._settings(conn)
-                if bool(settings["paused"]) or not bool(settings["connected"]):
-                    return
-                person_start = self._collection_start(conn, user_text)
-                if person_start is None:
-                    return
-                segment = self._open_segment(conn, user_text)
-                current_channel = None if segment is None else str(segment["channel_id"])
-                if current_channel == channel_text:
-                    return
-                coverage = self._open_coverage(conn)
-                # Nothing is observed before the person was on the tracked list.
-                at = max(now, person_start)
-                if coverage is not None:
-                    at = max(at, float(coverage["checkpoint"]))
-                if segment is not None:
-                    at = max(at, float(segment["checkpoint"]))
-                    close_at = self._close_voice_segment(conn, segment, at)
-                    visit_id = int(segment["visit_id"])
-                    if channel_text is None:
-                        self._finish_visit(conn, visit_id, close_at, complete_end=True)
-                else:
-                    visit_id = -1
-
-                if channel_text is not None:
-                    previous = None
-                    if segment is None and not complete_start:
-                        previous = conn.execute(
-                            "SELECT * FROM voice_visits WHERE user_id = ? "
-                            "ORDER BY visit_id DESC LIMIT 1",
-                            (user_text,),
-                        ).fetchone()
-                    if previous is not None and self._bridges(conn, previous, channel_text, at):
-                        visit_id = int(previous["visit_id"])
-                        conn.execute(
-                            "UPDATE voice_visits SET ended_at = NULL, complete_end = 0 "
-                            "WHERE visit_id = ?",
-                            (visit_id,),
-                        )
-                    elif segment is None or current_channel is None:
-                        cursor = conn.execute(
-                            """INSERT INTO voice_visits(
-                                   user_id, started_at, complete_start, complete_end, observed_seconds
-                               ) VALUES (?, ?, ?, 0, 0)""",
-                            (user_text, at, int(complete_start)),
-                        )
-                        visit_id = int(cursor.lastrowid)
-                        if complete_start:
-                            self._daily_delta(
-                                conn,
-                                user_text,
-                                local_day(at, self.timezone),
-                                voice_visits=1,
-                            )
+            if channel_text is not None:
+                previous = None
+                if segment is None and not complete_start:
+                    previous = conn.execute(
+                        "SELECT * FROM voice_visits WHERE user_id = ? "
+                        "ORDER BY visit_id DESC LIMIT 1",
+                        (user_text,),
+                    ).fetchone()
+                if previous is not None and self._bridges(conn, previous, channel_text, at):
+                    visit_id = int(previous["visit_id"])
                     conn.execute(
-                        """INSERT INTO voice_segments(
-                               visit_id, user_id, channel_id, started_at, checkpoint
-                           ) VALUES (?, ?, ?, ?, ?)""",
-                        (visit_id, user_text, channel_text, at, at),
+                        "UPDATE voice_visits SET ended_at = NULL, complete_end = 0 "
+                        "WHERE visit_id = ?",
+                        (visit_id,),
                     )
-                    members = sorted({
-                        str(int(member)) for member in companions
-                        if int(member) > 0 and str(int(member)) != user_text
-                    })
-                    conn.execute(
-                        """INSERT INTO voice_company_current(user_id, channel_id, member_ids, checkpoint)
-                           VALUES (?, ?, ?, ?)""",
-                        (user_text, channel_text, json.dumps(members), at),
+                elif segment is None or current_channel is None:
+                    cursor = conn.execute(
+                        """INSERT INTO voice_visits(
+                               user_id, started_at, complete_start, complete_end, observed_seconds
+                           ) VALUES (?, ?, ?, 0, 0)""",
+                        (user_text, at, int(complete_start)),
                     )
-                    self._record_last_voice(conn, user_text, channel_text, at)
+                    visit_id = int(cursor.lastrowid)
+                    if complete_start:
+                        self._daily_delta(
+                            conn,
+                            user_text,
+                            local_day(at, self.timezone),
+                            voice_visits=1,
+                        )
+                conn.execute(
+                    """INSERT INTO voice_segments(
+                           visit_id, user_id, channel_id, started_at, checkpoint
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (visit_id, user_text, channel_text, at, at),
+                )
+                members = sorted({
+                    str(int(member)) for member in companions
+                    if int(member) > 0 and str(int(member)) != user_text
+                })
+                conn.execute(
+                    """INSERT INTO voice_company_current(user_id, channel_id, member_ids, checkpoint)
+                       VALUES (?, ?, ?, ?)""",
+                    (user_text, channel_text, json.dumps(members), at),
+                )
+                self._record_last_voice(conn, user_text, channel_text, at)
 
-                self._advance_checkpoint(conn, at)
+            self._advance_checkpoint(conn, at)
 
-            self._transaction(conn, action)
-
-        await self._run(operation)
+        await self._write(action)
 
     async def disconnect(self, now: float, reason: str = "disconnect") -> None:
         """Close observed state at last checkpoint and record uncertain time as a gap.
@@ -1297,55 +1229,37 @@ class Store:
         if reason not in ("disconnect", "process_restart"):
             raise ValueError(f"unsupported gap reason: {reason}")
 
-        def operation() -> None:
-            conn = self._conn()
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> None:
+            coverage = self._open_coverage(conn)
+            segments = self._open_segments(conn)
+            if coverage is None and not segments and not bool(settings["connected"]):
+                return
 
-            def action() -> None:
-                settings = self._settings(conn)
-                coverage = self._open_coverage(conn)
-                segments = self._open_segments(conn)
-                if coverage is None and not segments and not bool(settings["connected"]):
-                    return
-
-                checkpoint = (
-                    float(coverage["checkpoint"])
-                    if coverage is not None
-                    else float(settings["last_checkpoint"] or now)
-                )
-                for segment in segments:
-                    voice_checkpoint = float(segment["checkpoint"])
-                    conn.execute(
-                        "UPDATE voice_segments SET ended_at = ?, checkpoint = ? "
-                        "WHERE segment_id = ?",
-                        (voice_checkpoint, voice_checkpoint, int(segment["segment_id"])),
-                    )
-                    self._finish_visit(
-                        conn,
-                        int(segment["visit_id"]),
-                        voice_checkpoint,
-                        complete_end=False,
-                    )
-                    checkpoint = min(checkpoint, voice_checkpoint)
-                if segments:
-                    conn.execute("DELETE FROM voice_company_current")
-                if coverage is not None:
-                    coverage_checkpoint = float(coverage["checkpoint"])
-                    conn.execute(
-                        "UPDATE coverage_intervals SET ended_at = ? WHERE interval_id = ?",
-                        (coverage_checkpoint, int(coverage["interval_id"])),
-                    )
-                    checkpoint = min(checkpoint, coverage_checkpoint)
-
-                if not bool(settings["paused"]):
-                    self._start_gap(conn, checkpoint, reason)
+            checkpoint = (
+                float(coverage["checkpoint"])
+                if coverage is not None
+                else float(settings["last_checkpoint"] or now)
+            )
+            earliest_segment = self._end_segments_at_checkpoint(conn, segments)
+            if earliest_segment is not None:
+                checkpoint = min(checkpoint, earliest_segment)
+                conn.execute("DELETE FROM voice_company_current")
+            if coverage is not None:
+                coverage_checkpoint = float(coverage["checkpoint"])
                 conn.execute(
-                    "UPDATE settings SET connected = 0, last_checkpoint = ? WHERE singleton = 1",
-                    (checkpoint,),
+                    "UPDATE coverage_intervals SET ended_at = ? WHERE interval_id = ?",
+                    (coverage_checkpoint, int(coverage["interval_id"])),
                 )
+                checkpoint = min(checkpoint, coverage_checkpoint)
 
-            self._transaction(conn, action)
+            if not bool(settings["paused"]):
+                self._start_gap(conn, checkpoint, reason)
+            conn.execute(
+                "UPDATE settings SET connected = 0, last_checkpoint = ? WHERE singleton = 1",
+                (checkpoint,),
+            )
 
-        await self._run(operation)
+        await self._write(action)
 
     # -- Reports ------------------------------------------------------------
 
@@ -1411,6 +1325,23 @@ class Store:
         if not self._is_live(settings, include_live):
             return None
         return self._open_segment(conn, user_text)
+
+    def _live_voice(
+        self, segment: sqlite3.Row, start: float, end: float, now: float
+    ) -> tuple[float, set[str]] | None:
+        """Return an open segment's unsaved seconds through ``now`` inside ``[start, end)``
+        and the local days they touch, or None when none fall inside."""
+        live_start = float(segment["checkpoint"])
+        clipped_start = max(live_start, start)
+        clipped_end = min(max(now, live_start), end)
+        if clipped_end <= clipped_start:
+            return None
+        days = {
+            day
+            for day, seconds in split_interval_by_day(clipped_start, clipped_end, self.timezone)
+            if seconds > 0
+        }
+        return clipped_end - clipped_start, days
 
     @staticmethod
     def _detail_since(settings: sqlite3.Row, start: float, since: float) -> float:
@@ -1508,9 +1439,7 @@ class Store:
         now = self._timestamp(now)
         user_text = str(int(user_id))
 
-        def operation() -> dict[str, Any]:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[str, Any]:
             tracked = self._tracked_row(conn, user_text)
             since = self._person_since(settings, tracked)
             start, end = period_bounds(period, now, self.timezone, since)
@@ -1535,20 +1464,10 @@ class Store:
                 )
             }
             segment = self._live_segment(conn, settings, user_text, include_live)
-            if segment is not None:
-                live_start = float(segment["checkpoint"])
-                live_end = max(now, live_start)
-                clipped_start = max(live_start, start)
-                clipped_end = min(live_end, end)
-                if clipped_end > clipped_start:
-                    voice_seconds += clipped_end - clipped_start
-                    active_dates.update(
-                        day
-                        for day, seconds in split_interval_by_day(
-                            clipped_start, clipped_end, self.timezone
-                        )
-                        if seconds > 0
-                    )
+            live = None if segment is None else self._live_voice(segment, start, end, now)
+            if live is not None:
+                voice_seconds += live[0]
+                active_dates.update(live[1])
 
             return {
                 "messages": int(aggregate["messages"]),
@@ -1562,7 +1481,7 @@ class Store:
                 "known": tracked is not None,
             }
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def ranking(
         self, period: str, now: float, *, include_live: bool = True
@@ -1575,9 +1494,7 @@ class Store:
         """
         now = self._timestamp(now)
 
-        def operation() -> list[dict[str, Any]]:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> list[dict[str, Any]]:
             start, end = period_bounds(
                 period, now, self.timezone, float(settings["tracking_since"])
             )
@@ -1602,19 +1519,11 @@ class Store:
                     item["days"].add(str(row["day"]))
             if self._is_live(settings, include_live):
                 for segment in self._open_segments(conn):
-                    live_start = float(segment["checkpoint"])
-                    clipped_start = max(live_start, start)
-                    clipped_end = min(max(now, live_start), end)
-                    if clipped_end > clipped_start:
+                    live = self._live_voice(segment, start, end, now)
+                    if live is not None:
                         item = entry(str(segment["user_id"]))
-                        item["voice_seconds"] += clipped_end - clipped_start
-                        item["days"].update(
-                            day
-                            for day, seconds in split_interval_by_day(
-                                clipped_start, clipped_end, self.timezone
-                            )
-                            if seconds > 0
-                        )
+                        item["voice_seconds"] += live[0]
+                        item["days"].update(live[1])
             active = {
                 str(row["user_id"]): bool(row["active"])
                 for row in conn.execute("SELECT user_id, active FROM tracked_users")
@@ -1632,7 +1541,7 @@ class Store:
                 })
             return sorted(rows, key=lambda row: row["user_id"])
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def coverage_gap_seconds(self, now: float) -> float:
         """Return the collector's recorded coverage gaps since the database clock began.
@@ -1642,9 +1551,7 @@ class Store:
         """
         now = self._timestamp(now)
 
-        def operation() -> float:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> float:
             start = float(settings["tracking_since"])
             end = max(now, start)
             return sum(
@@ -1661,7 +1568,7 @@ class Store:
                 )
             )
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def period_comparison(
         self, user_id: int, period: str, now: float, *, include_live: bool = True
@@ -1675,9 +1582,7 @@ class Store:
         now = self._timestamp(now)
         user_text = str(int(user_id))
 
-        def operation() -> dict[str, Any]:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[str, Any]:
             since = self._person_since(settings, self._tracked_row(conn, user_text))
             start, end = period_bounds(period, now, self.timezone, since)
             current = self._window_totals(conn, settings, user_text, start, end, now, include_live)
@@ -1695,7 +1600,7 @@ class Store:
                 )
             return result
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def company_daily(
         self, user_id: int, period: str, now: float, *, include_live: bool = True
@@ -1708,9 +1613,7 @@ class Store:
         now = self._timestamp(now)
         user_text = str(int(user_id))
 
-        def operation() -> list[dict[str, Any]]:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> list[dict[str, Any]]:
             since = self._person_since(settings, self._tracked_row(conn, user_text))
             start, end = period_bounds(period, now, self.timezone, since)
             totals: dict[tuple[str, int, int], tuple[float, float]] = {}
@@ -1744,7 +1647,7 @@ class Store:
                 for (day, channel_id, member_id), (split, full) in sorted(totals.items())
             ]
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def company_totals(
         self, user_id: int, period: str, now: float, *, include_live: bool = True
@@ -1772,9 +1675,7 @@ class Store:
         now = self._timestamp(now)
         user_text = str(int(user_id))
 
-        def operation() -> list[dict[str, Any]]:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> list[dict[str, Any]]:
             since = self._person_since(settings, self._tracked_row(conn, user_text))
             start, end = period_bounds(period, now, self.timezone, since)
             # Days before tracking began are unknown, not quiet, so leave them out.
@@ -1817,7 +1718,7 @@ class Store:
                         series[piece_day]["voice_seconds"] += seconds
             return list(series.values())
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def message_times(self, user_id: int, period: str, now: float) -> dict[str, Any]:
         """Return a person's retained message send times in a period, oldest first.
@@ -1828,9 +1729,7 @@ class Store:
         now = self._timestamp(now)
         user_text = str(int(user_id))
 
-        def operation() -> dict[str, Any]:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[str, Any]:
             since = self._person_since(settings, self._tracked_row(conn, user_text))
             start, end = period_bounds(period, now, self.timezone, since)
             times = [
@@ -1847,7 +1746,7 @@ class Store:
                 "period_start": start,
             }
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def voice_hours(
         self, user_id: int, period: str, now: float, *, include_live: bool = True
@@ -1856,9 +1755,7 @@ class Store:
         now = self._timestamp(now)
         user_text = str(int(user_id))
 
-        def operation() -> dict[str, Any]:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[str, Any]:
             person_since = self._person_since(settings, self._tracked_row(conn, user_text))
             start, end = period_bounds(period, now, self.timezone, person_since)
             spans = [
@@ -1883,7 +1780,7 @@ class Store:
                     hours[hour] += seconds
             return {"hours": hours, "since": since, "period_start": start}
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def records(
         self, user_id: int, now: float, *, include_live: bool = True
@@ -1893,9 +1790,7 @@ class Store:
         now = self._timestamp(now)
         user_text = str(int(user_id))
 
-        def operation() -> dict[str, Any]:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[str, Any]:
             current_seconds: float | None = None
             current_complete_start = False
             segment = self._live_segment(conn, settings, user_text, include_live)
@@ -1928,7 +1823,7 @@ class Store:
                 "current_visit_complete_start": current_complete_start,
             }
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def last_voice(
         self, user_id: int, now: float, *, include_live: bool = True
@@ -1937,9 +1832,7 @@ class Store:
         now = self._timestamp(now)
         user_text = str(int(user_id))
 
-        def operation() -> dict[str, Any] | None:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[str, Any] | None:
             segment = self._live_segment(conn, settings, user_text, include_live)
             if segment is not None:
                 return {
@@ -1960,7 +1853,7 @@ class Store:
                 "observed_since": None,
             }
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     # -- Deletion -----------------------------------------------------------
 
@@ -2029,9 +1922,7 @@ class Store:
         """
         now = self._timestamp(now)
 
-        def operation() -> dict[str, Any]:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[str, Any]:
             since = float(settings["tracking_since"])
             start, end = period_bounds(period, now, self.timezone, since)
             start = max(start, since)
@@ -2072,7 +1963,7 @@ class Store:
                 "paused": bool(settings["paused"]),
             }
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def record_errors(self, entries: list[tuple[float, str, str, str]]) -> None:
         """Append ``(at, level, source, summary)`` rows and keep the newest ones."""
@@ -2083,31 +1974,23 @@ class Store:
         if not rows:
             return
 
-        def operation() -> None:
-            conn = self._conn()
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> None:
+            conn.executemany(
+                "INSERT INTO error_log(at, level, source, summary) VALUES (?, ?, ?, ?)", rows
+            )
+            conn.execute(
+                "DELETE FROM error_log WHERE error_id NOT IN "
+                "(SELECT error_id FROM error_log ORDER BY at DESC, error_id DESC LIMIT ?)",
+                (self.ERROR_LOG_LIMIT,),
+            )
 
-            def action() -> None:
-                self._settings(conn)
-                conn.executemany(
-                    "INSERT INTO error_log(at, level, source, summary) VALUES (?, ?, ?, ?)", rows
-                )
-                conn.execute(
-                    "DELETE FROM error_log WHERE error_id NOT IN "
-                    "(SELECT error_id FROM error_log ORDER BY at DESC, error_id DESC LIMIT ?)",
-                    (self.ERROR_LOG_LIMIT,),
-                )
-
-            self._transaction(conn, action)
-
-        await self._run(operation)
+        await self._write(action)
 
     async def error_log(self, now: float, limit: int = 15) -> dict[str, Any]:
         """Return the newest logged problems and how many fell in the last day and week."""
         now = self._timestamp(now)
 
-        def operation() -> dict[str, Any]:
-            conn = self._conn()
-            self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[str, Any]:
 
             def count(since: float | None) -> int:
                 if since is None:
@@ -2134,38 +2017,30 @@ class Store:
                 "total": count(None),
             }
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def outage_alert_minutes(self) -> int:
-        def operation() -> int:
-            conn = self._conn()
-            self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> int:
             row = conn.execute("SELECT minutes FROM outage_alerts WHERE singleton = 1").fetchone()
             return self.DEFAULT_OUTAGE_ALERT_MINUTES if row is None else int(row["minutes"])
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def set_outage_alert_minutes(self, minutes: int) -> None:
         """Change the alert threshold; outages that already ended are not announced."""
         if isinstance(minutes, bool) or int(minutes) < 0:
             raise ValueError("minutes must not be negative")
 
-        def operation() -> None:
-            conn = self._conn()
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> None:
+            self._ensure_outage_alerts(conn)
+            conn.execute(
+                "UPDATE outage_alerts SET minutes = ?, last_gap_id = MAX(last_gap_id, "
+                "(SELECT COALESCE(MAX(gap_id), 0) FROM coverage_gaps WHERE ended_at IS NOT NULL)) "
+                "WHERE singleton = 1",
+                (int(minutes),),
+            )
 
-            def action() -> None:
-                self._settings(conn)
-                self._ensure_outage_alerts(conn)
-                conn.execute(
-                    "UPDATE outage_alerts SET minutes = ?, last_gap_id = MAX(last_gap_id, "
-                    "(SELECT COALESCE(MAX(gap_id), 0) FROM coverage_gaps WHERE ended_at IS NOT NULL)) "
-                    "WHERE singleton = 1",
-                    (int(minutes),),
-                )
-
-            self._transaction(conn, action)
-
-        await self._run(operation)
+        await self._write(action)
 
     async def due_outage_alerts(self) -> list[dict[str, Any]]:
         """Return finished outages long enough to announce, marking them announced.
@@ -2174,52 +2049,44 @@ class Store:
         until collection is back and it has an end.
         """
 
-        def operation() -> list[dict[str, Any]]:
-            conn = self._conn()
+        def action(conn: sqlite3.Connection, settings: sqlite3.Row) -> list[dict[str, Any]]:
+            self._ensure_outage_alerts(conn)
+            alerts = conn.execute(
+                "SELECT minutes, last_gap_id FROM outage_alerts WHERE singleton = 1"
+            ).fetchone()
+            rows = conn.execute(
+                "SELECT * FROM coverage_gaps WHERE gap_id > ? AND ended_at IS NOT NULL "
+                "ORDER BY gap_id",
+                (int(alerts["last_gap_id"]),),
+            ).fetchall()
+            if not rows:
+                return []
+            # An open gap is never skipped: rows are only finished ones, and
+            # gap IDs grow, so an older open gap cannot sit behind a newer one.
+            conn.execute(
+                "UPDATE outage_alerts SET last_gap_id = ? WHERE singleton = 1",
+                (max(int(row["gap_id"]) for row in rows),),
+            )
+            minutes = int(alerts["minutes"])
+            if minutes <= 0:
+                return []
+            return [
+                {
+                    "started_at": float(row["started_at"]),
+                    "ended_at": float(row["ended_at"]),
+                    "reason": str(row["reason"]),
+                    "seconds": float(row["ended_at"]) - float(row["started_at"]),
+                }
+                for row in rows
+                if float(row["ended_at"]) - float(row["started_at"]) >= minutes * 60
+            ]
 
-            def action() -> list[dict[str, Any]]:
-                self._settings(conn)
-                self._ensure_outage_alerts(conn)
-                alerts = conn.execute(
-                    "SELECT minutes, last_gap_id FROM outage_alerts WHERE singleton = 1"
-                ).fetchone()
-                rows = conn.execute(
-                    "SELECT * FROM coverage_gaps WHERE gap_id > ? AND ended_at IS NOT NULL "
-                    "ORDER BY gap_id",
-                    (int(alerts["last_gap_id"]),),
-                ).fetchall()
-                if not rows:
-                    return []
-                # An open gap is never skipped: rows are only finished ones, and
-                # gap IDs grow, so an older open gap cannot sit behind a newer one.
-                conn.execute(
-                    "UPDATE outage_alerts SET last_gap_id = ? WHERE singleton = 1",
-                    (max(int(row["gap_id"]) for row in rows),),
-                )
-                minutes = int(alerts["minutes"])
-                if minutes <= 0:
-                    return []
-                return [
-                    {
-                        "started_at": float(row["started_at"]),
-                        "ended_at": float(row["ended_at"]),
-                        "reason": str(row["reason"]),
-                        "seconds": float(row["ended_at"]) - float(row["started_at"]),
-                    }
-                    for row in rows
-                    if float(row["ended_at"]) - float(row["started_at"]) >= minutes * 60
-                ]
-
-            return self._transaction(conn, action)
-
-        return await self._run(operation)
+        return await self._write(action)
 
     async def files_summary(self) -> dict[str, Any]:
         """Return database, backup, and disk sizes for the health report."""
 
-        def operation() -> dict[str, Any]:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[str, Any]:
 
             def size(path: Path) -> int:
                 try:
@@ -2260,7 +2127,7 @@ class Store:
                 "tracking_since": float(settings["tracking_since"]),
             }
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def person_debug(
         self, user_id: int, now: float, *, include_live: bool = True
@@ -2269,9 +2136,7 @@ class Store:
         now = self._timestamp(now)
         user_text = str(int(user_id))
 
-        def operation() -> dict[str, Any]:
-            conn = self._conn()
-            settings = self._settings(conn)
+        def operation(conn: sqlite3.Connection, settings: sqlite3.Row) -> dict[str, Any]:
             tracked = self._tracked_row(conn, user_text)
             since = self._person_since(settings, tracked)
             end = max(now, since)
@@ -2363,7 +2228,7 @@ class Store:
                 "paused": bool(settings["paused"]),
             }
 
-        return await self._run(operation)
+        return await self._read(operation)
 
     async def delete_data(self, actor_id: int, now: float) -> None:
         """Erase everyone's statistics and all managed backups, then pause collection.
@@ -2384,17 +2249,10 @@ class Store:
             self._remove_managed_backups()
 
             def action() -> None:
-                conn.execute("DELETE FROM voice_company_current")
-                conn.execute("DELETE FROM voice_company_daily")
-                conn.execute("DELETE FROM voice_visits")
-                conn.execute("DELETE FROM voice_segments")
-                conn.execute("DELETE FROM messages")
-                conn.execute("DELETE FROM daily_stats")
+                for table in _PERSON_TABLES:
+                    conn.execute(f"DELETE FROM {table}")
                 conn.execute("DELETE FROM coverage_intervals")
                 conn.execute("DELETE FROM coverage_gaps")
-                conn.execute("DELETE FROM records")
-                conn.execute("DELETE FROM last_voice")
-                conn.execute("DELETE FROM tracking_intervals")
                 conn.execute("DELETE FROM tracked_users WHERE active = 0")
                 conn.execute(
                     "UPDATE tracked_users SET tracking_since = ?, updated_at = ?", (now, now)
@@ -2413,13 +2271,7 @@ class Store:
                 )
 
             self._transaction(conn, action)
-            # Logical deletion is committed at this point. Compaction only
-            # reclaims space; failure must not tell the caller that their data
-            # still exists in the application or invite another destructive retry.
-            try:
-                self._compact_after_deletion(conn)
-            except sqlite3.Error:
-                logger.exception("Data deletion committed, but database compaction failed")
+            self._compact_after_deletion(conn)
 
         await self._run(operation)
 
@@ -2437,8 +2289,9 @@ class Store:
         Time they shared with someone else stays in that person's company
         history, credited to ``DELETED_COMPANION_ID`` instead of their ID, so
         other people's slices still add up. A live roster is current state, not
-        history, and is left alone. Global collection is not paused. ``reset_legacy_modes`` also switches the Leland-only evil and
-        reaction modes off. Returns False when nothing existed for the person.
+        history, and is left alone. Global collection is not paused.
+        ``reset_legacy_modes`` also switches the Leland-only evil and reaction
+        modes off. Returns False when nothing existed for the person.
         """
         self._timestamp(now)
         int(actor_id)  # Validated for symmetry; deletion is not attributed in storage.
@@ -2450,11 +2303,7 @@ class Store:
             existed = any(
                 conn.execute(f"SELECT 1 FROM {table} WHERE user_id = ? LIMIT 1", (user_text,)).fetchone()
                 is not None
-                for table in (
-                    "tracked_users", "tracking_intervals", "messages", "daily_stats",
-                    "voice_visits", "voice_company_current", "voice_company_daily",
-                    "last_voice", "records",
-                )
+                for table in ("tracked_users", *_PERSON_TABLES)
             ) or conn.execute(
                 "SELECT 1 FROM voice_company_daily WHERE member_id = ? LIMIT 1", (user_text,)
             ).fetchone() is not None
@@ -2464,16 +2313,8 @@ class Store:
                 self._remove_managed_backups()
 
             def action() -> None:
-                conn.execute("DELETE FROM voice_segments WHERE user_id = ?", (user_text,))
-                conn.execute("DELETE FROM voice_visits WHERE user_id = ?", (user_text,))
-                conn.execute("DELETE FROM messages WHERE user_id = ?", (user_text,))
-                conn.execute("DELETE FROM daily_stats WHERE user_id = ?", (user_text,))
-                conn.execute("DELETE FROM voice_company_current WHERE user_id = ?", (user_text,))
-                conn.execute("DELETE FROM voice_company_daily WHERE user_id = ?", (user_text,))
-                conn.execute("DELETE FROM last_voice WHERE user_id = ?", (user_text,))
-                conn.execute("DELETE FROM records WHERE user_id = ?", (user_text,))
-                conn.execute("DELETE FROM tracking_intervals WHERE user_id = ?", (user_text,))
-                conn.execute("DELETE FROM tracked_users WHERE user_id = ?", (user_text,))
+                for table in (*_PERSON_TABLES, "tracked_users"):
+                    conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_text,))
                 # Other people's company history keeps the shared time, so their
                 # slices still add up, but no longer names this person.
                 conn.execute(
@@ -2497,18 +2338,27 @@ class Store:
             if existed or reset_legacy_modes:
                 self._transaction(conn, action)
             if existed:
-                try:
-                    self._compact_after_deletion(conn)
-                except sqlite3.Error:
-                    logger.exception("Data deletion committed, but database compaction failed")
+                self._compact_after_deletion(conn)
             return existed
 
         return await self._run(operation)
 
     @staticmethod
-    def _compact_after_deletion(conn: sqlite3.Connection) -> None:
+    def _compact(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.execute("VACUUM")
+
+    def _compact_after_deletion(self, conn: sqlite3.Connection) -> None:
+        """Reclaim space after a committed deletion, logging rather than raising.
+
+        Logical deletion is already committed. Compaction only reclaims space;
+        its failure must not tell the caller that their data still exists in the
+        application or invite another destructive retry.
+        """
+        try:
+            self._compact(conn)
+        except sqlite3.Error:
+            logger.exception("Data deletion committed, but database compaction failed")
 
     def _remove_managed_backups(self) -> None:
         if self.backup_dir.exists():
