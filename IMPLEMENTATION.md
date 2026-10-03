@@ -281,7 +281,12 @@ and checkpoints remain disabled until reconciliation succeeds.
 (`Store.initialize(time.time(), config.guild_id)`), registers guild command groups,
 synchronizes only the configured guild, and wires
 ready/resumed/disconnect/message/voice events to `Tracker`. Checkpoint, daily
-maintenance, avatar-refresh, and update-watch tasks are cancelled/awaited on close.
+maintenance, profile-refresh, and update-watch tasks are cancelled/awaited on close.
+The first Gateway ready starts the hourly profile task (`avatar.py`): it sets
+the username to `BOT_USERNAME`, the avatar to the bundled `assets/avatar.jpg`,
+and the application description to `BOT_DESCRIPTION`, editing only what
+differs. `avatar-source.json` beside the database records the applied image
+hash and Discord avatar key, so a manually changed avatar is restored.
 On every Gateway ready it writes `bot-ready.json` (`ready_at`, `pid`) beside the
 database for the updater's health check. Every five minutes it reads the
 updater's `update-status.json` there (`update_status.py`) and DMs the owner once
@@ -292,7 +297,7 @@ private reply) calls `update_status.request_update`, which writes
 `deploy/flock-cctv-update.path` starts `flock-cctv-update.service` while
 that file exists, and every polling run of `deploy/update.py` removes it before
 taking its lock. Collection
-and storage failures surface in status and logs; avatar-refresh failures are
+and storage failures surface in status and logs; profile-refresh failures are
 logged. Message payloads and the token are not logged. Gateway
 intents: guilds, guild_messages, voice_states, presences, plus message_content
 only when `leland_user_id` is set. Use
@@ -314,10 +319,7 @@ transforms it to upside-down Unicode, and posts the result in the same channel,
 skipping empty text and not reposting attachment files (text accompanying an
 attachment is still reposted). A direct mention of the bot gets a fixed reply
 based on mention metadata, even when collection is paused or that channel is
-outside the text allowlist, and only when `leland_user_id` is set. The hourly
-avatar task, which mirrors his current server avatar with inverted colours using
-the first frame for animated images and refreshing if the source changes or the
-bot avatar is manually changed, is not started otherwise. Reaction mode advances
+outside the text allowlist, and only when `leland_user_id` is set. Reaction mode advances
 its saved interval only for newly counted ordinary messages. Reaction and repost
 failures are logged without message bodies; they do not change collected message
 totals.

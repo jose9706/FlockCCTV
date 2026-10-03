@@ -112,7 +112,6 @@ jokes are about cannot also control them.
   of his newly counted ordinary messages, then selects a new interval. The
   setting and remaining count are saved. A failed Discord reaction is not
   retried.
-- **Avatar mirror**: an inverted copy of his server avatar, checked hourly.
 - Global deletion, and deleting Leland's own data, turn both modes off and clear
   the countdown. No other person's messages are ever reposted or reacted to.
 
@@ -245,7 +244,8 @@ src/flock_cctv/
   stats.py           # Period boundaries, totals and records
   commands.py        # Slash commands and access checks
   jokes.py           # Templates
-  avatar.py          # Avatar colour inversion (Leland legacy)
+  avatar.py          # Bot name, description and bundled avatar
+  assets/avatar.jpg  # Flock camera profile picture
   evil.py            # Upside-down text and message splitting (Leland legacy)
   legacy_import.py   # One-time Leland Tracker database import
   update_status.py   # Updater status, ready marker and update request files

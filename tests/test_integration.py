@@ -206,7 +206,6 @@ class BotIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await bot.store.stats(ANA, "all", time.time()))["messages"], 1)
                 message.add_reaction.assert_not_awaited()
                 channel.send.assert_not_awaited()
-                self.assertIsNone(bot._avatar_task)
 
 
 if __name__ == "__main__":

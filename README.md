@@ -207,11 +207,6 @@ commands reply that Leland mode isn't configured, and `/flock help` and
   messages.
 - Reaction mode (`/flock reaction-mode`) occasionally reacts to his newly counted
   ordinary messages.
-- The bot mirrors his current server avatar with inverted colours. It checks when
-  it connects and then every hour. It also refreshes the avatar if the bot
-  profile was changed manually; animated source avatars use their first frame.
-  This task runs independently of collection pause and data deletion. A small
-  marker file beside the database prevents repeating an unchanged profile edit.
 - A direct mention of the bot gets the fixed reply described under
   [Commands](#commands).
 
@@ -637,9 +632,11 @@ though never as root.
   `LELAND_USER_ID` is set. It works independently of collection pause and
   channel allowlists, but the bot must receive the server message and have
   permission to send in that channel.
-- **Avatar does not refresh:** avatar mirroring needs `LELAND_USER_ID`. Check
-  that he is still in the configured server and inspect the service journal for
-  avatar update errors.
+- **Bot name or picture is wrong:** the bot sets its username to Flock CCTV,
+  its avatar to the bundled Flock camera photo, and its application description
+  when it connects and then every hour. Discord limits username changes to a
+  few per hour, so check the service journal for profile update errors. A server
+  nickname overrides the username; clear it in the member list.
 
 ## Commands
 
