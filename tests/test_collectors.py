@@ -718,6 +718,25 @@ class TrackedListTests(unittest.IsolatedAsyncioTestCase):
         await tracker.ready(take, now=200.0)
         self.assertEqual(seen, [True, True])
 
+    async def test_failed_visit_start_on_track_user_disables_collection_until_reconciled(self):
+        store, tracker = await self.live_tracker(active=frozenset({20}))
+        store.voice_transition = AsyncMock(side_effect=OSError("temporary storage failure"))
+        with patch("flock_cctv.collectors.time.time", return_value=180.0):
+            with self.assertRaises(OSError):
+                await tracker.track_user(22, 99, {22: 40})
+        # The person is tracked, but no visit was recorded: watched time must
+        # stop until a snapshot reconciles, so it cannot count as quiet time.
+        self.assertEqual(tracker.tracked_ids, frozenset({20, 22}))
+        self.assertFalse(tracker.collection_ready)
+        self.assertEqual(store.disconnections[-1], 180.0)
+        self.assertEqual(tracker.last_error, "track user failed (OSError)")
+        self.assertFalse(await tracker.message(message(message_id=7, user_id=22, created=181.0)))
+
+        del store.voice_transition  # Storage recovers.
+        await tracker.guild_available({22: 40}, now=200.0)
+        self.assertTrue(tracker.collection_ready)
+        self.assertEqual(store.transitions, [(22, 40, 200.0, False)])
+
     async def test_track_user_not_in_voice_only_updates_the_tracked_set(self):
         store, tracker = await self.live_tracker()
         with patch("flock_cctv.collectors.time.time", return_value=180.0):

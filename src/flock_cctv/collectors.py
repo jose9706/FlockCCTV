@@ -456,6 +456,10 @@ class Tracker:
             current = time.time()
             try:
                 added = await self.store.track_user(user_id, actor_id, current)
+            except Exception as exc:
+                self._record_error("track user", exc)
+                raise
+            try:
                 await self._refresh_tracked()
                 if added and self._collecting():
                     state = await self.store.state()
@@ -463,11 +467,23 @@ class Tracker:
                         await self._start_visit_from_snapshot(
                             user_id, _take_snapshot(snapshot), current
                         )
-                self._recovered("track user")
-                return added
             except Exception as exc:
+                # The person is now tracked, but their current voice presence
+                # may be missing, which would count observed time as quiet.
+                # Stop crediting until the adapter's recovery loop reconciles a
+                # snapshot, as a failed voice update does.
+                if self.collection_ready:
+                    self.collection_ready = False
+                    self._collection_since = None
+                    try:
+                        await self.store.disconnect(time.time())
+                    except Exception:
+                        # Reconciliation retries disconnect before reopening.
+                        pass
                 self._record_error("track user", exc)
                 raise
+            self._recovered("track user")
+            return added
 
     async def untrack_user(self, user_id: int, actor_id: int) -> bool:
         """Stop tracking a person now; an open visit ends incomplete, history stays."""

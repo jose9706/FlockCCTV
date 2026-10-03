@@ -270,8 +270,10 @@ observation start or pause/resume boundary. While disconnected ignore voice even
 conservatively start incomplete segments. Track pause in storage; configured admins
 can resume any prior pause.
 Control boundaries and default-time ready/guild-available recovery boundaries
-are sampled inside that lock. A failed voice or companion transition disables
-collection and attempts conservative `Store.disconnect`; the normal snapshot
+are sampled inside that lock. A failed voice or companion transition, or a
+failure in `track_user` after the person was added (refreshing `tracked_ids` or
+starting their visit), disables collection and attempts conservative
+`Store.disconnect`; the normal snapshot
 recovery retries closure and only then reopens collection. Live extrapolation
 and checkpoints remain disabled until reconciliation succeeds.
 
