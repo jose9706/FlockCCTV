@@ -21,7 +21,6 @@ from flock_cctv.commands import (
     _pie_png,
     _records_text,
     _report_is_ephemeral,
-    _execute_after_scope,
     _scope_ok,
     _stats_text,
     _bursts,
@@ -263,7 +262,9 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             timezone="America/Costa_Rica",
         )
         self.bot = SimpleNamespace(config=self.config, tree=FakeTree(), store=FakeStore())
-        self.bot.tracker = SimpleNamespace(connected=True, guild_is_available=True, last_error=None)
+        self.bot.tracker = SimpleNamespace(
+            connected=True, guild_is_available=True, collection_ready=True, last_error=None
+        )
         self.bot.get_channel = lambda channel_id: None
         self.bot.voice_snapshot = lambda: {}
 
@@ -794,7 +795,35 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("(full time with each person)", content)
         self.assertIn("Mon 3: **Alice** — 1h 0m", content)
         self.assertIn("can add up to more than the observed time", content)
+        self.assertNotIn("split share", content)
         self.assertIsNotNone(png)
+
+    async def test_company_visibility_is_checked_once_per_channel(self):
+        looked_up = []
+
+        def get_channel(channel_id):
+            looked_up.append(channel_id)
+            return SimpleNamespace(permissions_for=lambda viewer: SimpleNamespace(view_channel=channel_id == 40))
+
+        self.bot.get_channel = get_channel
+        _fake_guild(self.bot)
+        self.bot.store.company_rows = [
+            {"channel_id": channel_id, "member_id": member_id, "seconds": 60.0, "full_seconds": 60.0}
+            for channel_id in (40, 41) for member_id in (0, 50, 51)
+        ]
+        interaction = FakeInteraction()
+        interaction.guild = SimpleNamespace(default_role=object())
+        content, _ = await _company_report(self.bot, interaction, PERSON, "week")
+        self.assertEqual(sorted(looked_up), [40, 41])
+        self.assertIn("Observed time in visible channels: **3m**.", content)
+
+    async def test_empty_company_report_has_no_legacy_caveat(self):
+        content, png = await _company_report(self.bot, FakeInteraction(), PERSON, "week")
+        self.assertEqual(
+            content,
+            "No companion time has been observed for Leland this week in voice channels visible to this report.",
+        )
+        self.assertIsNone(png)
 
     async def test_leaderboard_ranks_full_shared_time_in_visible_channels(self):
         self.config.public_report_channel_ids = frozenset({20})
@@ -855,7 +884,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🥇 **Friend 12** — 12m", content)
         self.assertIn("10. **Friend 3** — 3m", content)
         self.assertNotIn("Friend 2**", content)
-        self.assertIn("…and 2 others.", content)
+        self.assertIn("…and 2 more.", content)
         self.assertNotIn("Time alone", content)
 
     async def test_leaderboard_without_companions(self):
@@ -1400,17 +1429,6 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Only configured tracker admins", interaction.response.sent[0]["content"])
         self.assertEqual(self.bot.store.deleted, [])
 
-    async def test_resume_permission_error_gets_clear_response(self):
-        interaction = FakeInteraction()
-
-        async def action():
-            raise PermissionError("opaque detail")
-
-        await _execute_after_scope(interaction, self.bot, "flock resume", action, ephemeral=True)
-        self.assertEqual(len(interaction.followup.sent), 1)
-        self.assertIn("You do not have permission", interaction.followup.sent[0]["content"])
-        self.assertNotIn("opaque detail", interaction.followup.sent[0]["content"])
-
     async def test_duplicate_delete_confirmation_is_one_shot(self):
         started = asyncio.Event()
         release = asyncio.Event()
@@ -1672,6 +1690,16 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             await roast.callback(second, user=_user(41, "Ana"))
             self.assertIn("shared roast cooldown", second.response.sent[0]["content"])
             self.assertTrue(second.response.sent[0]["ephemeral"])
+
+    async def test_cooldown_reply_rounds_the_wait_up(self):
+        for remaining, seconds in ((29.001, 30), (0.2, 1), (5.0, 5)):
+            with self.subTest(remaining=remaining):
+                cooldown = SimpleNamespace(consume=AsyncMock(return_value=remaining))
+                interaction = FakeInteraction()
+                self.assertFalse(await commands_module._cooldown_ok(interaction, cooldown, "Wait."))
+                self.assertEqual(
+                    interaction.response.sent[0]["content"], f"Wait. Try again in {seconds} seconds."
+                )
 
     async def test_leaderboard_and_company_for_a_person_apply_channel_visibility(self):
         self.config.public_report_channel_ids = frozenset({20})
@@ -2444,7 +2472,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         target = _user(41, "Alice")
         for name, args in (
             ("health", ()), ("uptime", ("last7",)), ("errors", ()),
-            ("person", (target,)), ("alerts", (None,)),
+            ("person", (target,)), ("person", (_user(46, "Robot", bot=True),)), ("alerts", (None,)),
         ):
             for user_id in (40, 30):  # Not an admin, and the Leland user.
                 with self.subTest(command=name, user=user_id):

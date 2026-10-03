@@ -426,7 +426,7 @@ mentions, never a mention. Options and defaults:
 | `admin add` | `user` (a server member); `admin remove`: `user_id` (string) |
 | `evil-mode`, `reaction-mode` | `mode`: `on` or `off` |
 | `debug uptime` | `period` (last7; same choices as trends) |
-| `debug person` | `user` (required; a bot replies "Bots aren't tracked.") |
+| `debug person` | `user` (required; after the admin check, a bot replies "Bots aren't tracked.") |
 | `debug alerts` | `minutes` (optional, 0–1440; omitted shows the current setting) |
 | `delete-data` | `user` or `user_id` (ID or mention string; works for departed members). Both optional, not together; everyone's data if both omitted |
 
@@ -442,7 +442,9 @@ or one named person's. Without `user` it calls `tracker.delete_data` and the tra
 list is kept; with `user` it calls `tracker.delete_user_data` and that person is
 untracked while collection for others continues. Roast uses a shared 30-second
 cooldown. Defer slow interactions and use followups; errors get a safe response and
-logged traceback.
+logged traceback. Every command checks the guild and output channel first, then
+admin or owner access, then its arguments. Charts are drawn on a worker thread,
+one at a time, after the store reads finish.
 Controls and deletion confirmation permission reads have the same two-second
 pre-acknowledgement timeout as report lookups, returning private busy/error
 replies without applying the control. Confirmation and cancellation serialize

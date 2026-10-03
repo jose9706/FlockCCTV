@@ -7,11 +7,12 @@ from io import BytesIO
 import logging
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any, Awaitable, Callable
-from zoneinfo import ZoneInfo
+from functools import lru_cache
+from typing import Any, Awaitable, Callable, TypeVar
 
 import discord
 from discord import app_commands
@@ -19,9 +20,15 @@ from PIL import Image, ImageDraw, ImageFont
 
 from . import update_status, version_string
 from .jokes import SharedRoastCooldown, make_roast
+from .stats import get_timezone, local_date
 from .storage import DELETED_COMPANION_ID
+from .text import clean_name as _clean_name
+from .text import duration as _duration
+from .text import local_time as _local_time
+from .text import safe_name as _safe_name
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 PERIOD_LABELS = {
     "today": "today",
@@ -56,6 +63,9 @@ _DELETED_COMPANION = int(DELETED_COMPANION_ID)
 # Seconds a pre-acknowledgement store read may take (Discord allows three).
 _LOOKUP_TIMEOUT = 2.0
 _FAILURE_TEXT = "The tracker could not complete that request. The error was logged."
+_BUSY_TEXT = "The tracker is busy right now. Try again in a moment."
+# Lists stop short of Discord's 2,000-character message limit.
+_LIST_LIMIT = 1850
 _USER_OPTION = "Whose activity to show (defaults to you)"
 _COMPANY_COUNT_OPTION = "How to count time shared with several people (split by default)"
 # Categorical palette in fixed slot order, validated for colour-vision deficiency.
@@ -71,34 +81,13 @@ def _leland_id(bot: Any) -> int | None:
     return getattr(_config(bot), "leland_user_id", None)
 
 
+def _guild(bot: Any) -> Any:
+    """The configured guild from the client cache, or ``None``."""
+    return bot.get_guild(_config(bot).guild_id) if hasattr(bot, "get_guild") else None
+
+
 def _period_label(period: str) -> str:
     return PERIOD_LABELS.get(period, "this period")
-
-
-def _local_time(timestamp: float | None, timezone: str, *, date_only: bool = False) -> str:
-    if timestamp is None:
-        return "not recorded"
-    local = datetime.fromtimestamp(float(timestamp), tz=ZoneInfo(timezone))
-    if date_only:
-        return local.strftime("%b %-d, %Y")
-    return local.strftime("%b %-d, %Y %H:%M %Z")
-
-
-def _duration(seconds: float) -> str:
-    whole = max(0, int(seconds))
-    days, remain = divmod(whole, 86_400)
-    hours, remain = divmod(remain, 3_600)
-    minutes, secs = divmod(remain, 60)
-    parts: list[str] = []
-    if days:
-        parts.append(f"{days}d")
-    if hours or days:
-        parts.append(f"{hours}h")
-    if minutes or hours or days:
-        parts.append(f"{minutes}m")
-    if not parts or (not days and not hours and not minutes):
-        parts.append(f"{secs}s")
-    return " ".join(parts)
 
 
 def _report_is_ephemeral(bot: Any, interaction: discord.Interaction) -> bool:
@@ -163,32 +152,43 @@ async def _can_control(interaction: discord.Interaction, bot: Any) -> bool:
     return user_id in config.admin_user_ids if override is None else override
 
 
-async def _control_permission_ok(
-    interaction: discord.Interaction,
-    bot: Any,
+async def _control_ok(
+    interaction: discord.Interaction, bot: Any, *, leland: bool = False
 ) -> bool:
+    """Apply the scope check, then require a tracker admin, replying privately on refusal.
+
+    With ``leland``, also refuse when Leland mode isn't configured.
+    """
+    if not await _scope_ok(interaction, bot):
+        return False
     try:
         can_control = await asyncio.wait_for(
             _can_control(interaction, bot), timeout=_LOOKUP_TIMEOUT
         )
     except TimeoutError:
-        await _send(interaction, "The tracker is busy right now. Try again in a moment.", ephemeral=True)
+        await _send(interaction, _BUSY_TEXT, ephemeral=True)
         return False
     except Exception:
         logger.exception("Tracker admin permission lookup failed")
         await _send(interaction, _FAILURE_TEXT, ephemeral=True)
         return False
-    if can_control:
-        return True
-    await _send(
-        interaction,
-        "Only configured tracker admins can change tracker settings.",
-        ephemeral=True,
-    )
-    return False
+    if not can_control:
+        await _send(
+            interaction,
+            "Only configured tracker admins can change tracker settings.",
+            ephemeral=True,
+        )
+        return False
+    if leland and _leland_id(bot) is None:
+        await _send(interaction, "Leland mode isn't configured.", ephemeral=True)
+        return False
+    return True
 
 
-async def _owner_permission_ok(interaction: discord.Interaction, bot: Any) -> bool:
+async def _owner_ok(interaction: discord.Interaction, bot: Any) -> bool:
+    """Apply the scope check, then require the configured owner, replying privately on refusal."""
+    if not await _scope_ok(interaction, bot):
+        return False
     if interaction.user.id == _config(bot).owner_user_id:
         return True
     await _send(
@@ -199,7 +199,23 @@ async def _owner_permission_ok(interaction: discord.Interaction, bot: Any) -> bo
     return False
 
 
-def _admin_id(raw: str) -> int | None:
+async def _cooldown_ok(
+    interaction: discord.Interaction, cooldown: SharedRoastCooldown, refusal: str
+) -> bool:
+    """Take a slot from a shared cooldown, or reply privately with the wait."""
+    remaining = await cooldown.consume()
+    if remaining <= 0:
+        return True
+    await _send(
+        interaction,
+        f"{refusal} Try again in {max(1, math.ceil(remaining))} seconds.",
+        ephemeral=True,
+    )
+    return False
+
+
+def _parse_user_id(raw: str) -> int | None:
+    """Read a positive Discord user ID from a plain ID or a user mention."""
     match = re.fullmatch(r"(?:<@!?(\d+)>|(\d+))", raw.strip())
     if match is None:
         return None
@@ -207,23 +223,58 @@ def _admin_id(raw: str) -> int | None:
     return user_id if user_id > 0 else None
 
 
-async def _execute(
+async def _run(
     interaction: discord.Interaction,
-    bot: Any,
     label: str,
-    action: Callable[[], Awaitable[str]],
+    action: Callable[[], Awaitable[str | tuple[str, bytes | None]]],
     *,
     ephemeral: bool,
+    note: str = "",
+    filename: str = "chart.png",
 ) -> None:
-    if not await _scope_ok(interaction, bot):
-        return
+    """Defer, run ``action``, and reply with its text and optional PNG chart.
+
+    Access checks have already happened. ``note`` is appended to a successful
+    reply; a failure is logged and gets the generic failure text instead.
+    """
     await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+    file = None
     try:
-        content = await action()
+        result = await action()
+        content, png = result if isinstance(result, tuple) else (result, None)
+        content += note
+        if png:
+            file = discord.File(BytesIO(png), filename=filename)
     except Exception:
         logger.exception("Slash command %s failed", label)
-        content = "The tracker could not complete that request. The error was logged."
-    await _send(interaction, content, ephemeral=ephemeral)
+        content, file = _FAILURE_TEXT, None
+    await _send(interaction, content, ephemeral=ephemeral, file=file)
+
+
+def _collection_problem(bot: Any) -> str | None:
+    """Why live collection can't be trusted right now, or ``None`` when it can.
+
+    Returns ``disconnected``, ``guild_unavailable``, or ``recovering``.
+    """
+    tracker = bot.tracker
+    if not getattr(tracker, "connected", False):
+        return "disconnected"
+    if not getattr(tracker, "guild_is_available", False):
+        return "guild_unavailable"
+    if not getattr(tracker, "collection_ready", False):
+        return "recovering"
+    return None
+
+
+def _collection_reliable(bot: Any) -> bool:
+    return _collection_problem(bot) is None
+
+
+_STATS_COLLECTION_NOTES = {
+    "disconnected": "Collection is currently unavailable because the bot is disconnected.",
+    "guild_unavailable": "Collection is currently unavailable because the configured server is unavailable.",
+    "recovering": "Collection is recovering. Voice time includes only saved observations until recovery finishes.",
+}
 
 
 async def _stats_text(bot: Any, person: _Person, period: str) -> str:
@@ -257,14 +308,9 @@ async def _stats_text(bot: Any, person: _Person, period: str) -> str:
         lines.append(f"Missing coverage during this period: **{_duration(gaps)}**.")
     if bool(result.get("paused", False)):
         lines.append("Collection is currently paused.")
-    tracker = getattr(bot, "tracker", None)
-    if tracker is not None:
-        if not bool(getattr(tracker, "connected", True)):
-            lines.append("Collection is currently unavailable because the bot is disconnected.")
-        elif not bool(getattr(tracker, "guild_is_available", True)):
-            lines.append("Collection is currently unavailable because the configured server is unavailable.")
-        elif not bool(getattr(tracker, "collection_ready", True)):
-            lines.append("Collection is recovering. Voice time includes only saved observations until recovery finishes.")
+    problem = _collection_problem(bot)
+    if problem is not None:
+        lines.append(_STATS_COLLECTION_NOTES[problem])
     return "\n".join(lines)
 
 
@@ -283,19 +329,10 @@ async def _seen_text(bot: Any, interaction: discord.Interaction, person: _Person
     channel_id = int(observation["channel_id"])
     channel = bot.get_channel(channel_id)
     channel_label = "a voice channel"
-    if channel is not None:
-        # A public reply must not reveal a channel name visible only to the caller.
-        if _report_is_ephemeral(bot, interaction):
-            viewer = interaction.user
-        else:
-            viewer = getattr(getattr(interaction, "guild", None), "default_role", None)
-        try:
-            can_view = viewer is not None and bool(channel.permissions_for(viewer).view_channel)
-        except (AttributeError, TypeError):
-            can_view = False
-        if can_view:
-            name = discord.utils.escape_markdown(str(channel.name))
-            channel_label = f"**#{name}**"
+    # A public reply must not reveal a channel name visible only to the caller.
+    if channel is not None and _audience_can_view(bot, interaction)(channel_id):
+        name = discord.utils.escape_markdown(str(channel.name))
+        channel_label = f"**#{name}**"
 
     if observation["current"]:
         since = _local_time(observation["observed_since"], bot.config.timezone)
@@ -313,14 +350,7 @@ def _pie_png(
     """Draw a pie with a legend; ``details`` replaces each slice's share and duration line."""
     image = Image.new("RGB", (1100, 640), "#ffffff")
     draw = ImageDraw.Draw(image)
-    try:
-        title_font = ImageFont.truetype("DejaVuSans.ttf", 38)
-        label_font = ImageFont.truetype("DejaVuSans.ttf", 32)
-        detail_font = ImageFont.truetype("DejaVuSans.ttf", 24)
-    except OSError:
-        title_font = ImageFont.load_default(size=38)
-        label_font = ImageFont.load_default(size=32)
-        detail_font = ImageFont.load_default(size=24)
+    title_font, label_font, detail_font = _font(38), _font(32), _font(24)
     title = f"{owner}'s voice company"
     while len(title) > 1 and title_font.getlength(title) > 1100 - 2 * 44:
         title = title[:-2] + "…"
@@ -346,9 +376,7 @@ def _pie_png(
         detail = details[index] if details else f"{seconds / total:.1%}  ·  {_duration(seconds)}"
         draw.text((660, legend_y + 36), detail, font=detail_font, fill="#48576b")
         angle = next_angle
-    output = BytesIO()
-    image.save(output, format="PNG")
-    return output.getvalue()
+    return _png_bytes(image)
 
 
 async def _lookup_user(bot: Any, guild: Any, user_id: int) -> Any:
@@ -375,10 +403,6 @@ async def _lookup_user(bot: Any, guild: Any, user_id: int) -> Any:
     return None
 
 
-def _clean_name(value: Any) -> str:
-    return " ".join(str(value).split())[:48] if value else ""
-
-
 async def _company_name(bot: Any, guild: Any, member_id: int) -> str:
     if member_id == 0:
         return "Alone"
@@ -400,17 +424,11 @@ def _user_label(found: Any, user_id: int) -> str:
         label = f"@{username}"
     else:
         label = display or "Unknown user"
-    safe = discord.utils.escape_mentions(discord.utils.escape_markdown(label))
-    return f"{safe} — {user_id}"
+    return f"{_safe_name(label)} — {user_id}"
 
 
 async def _admin_label(bot: Any, guild: Any, user_id: int) -> str:
     return _user_label(await _lookup_user(bot, guild, user_id), user_id)
-
-
-def _safe_name(name: str) -> str:
-    """Make a cleaned name safe to embed in Markdown text without pinging anyone."""
-    return discord.utils.escape_mentions(discord.utils.escape_markdown(name))
 
 
 @dataclass(frozen=True)
@@ -470,7 +488,7 @@ async def _resolve_person(
         # a backup or compaction must not use up Discord's three seconds.
         rows = await asyncio.wait_for(bot.store.tracked_users(), timeout=_LOOKUP_TIMEOUT)
     except TimeoutError:
-        await _send(interaction, "The tracker is busy right now. Try again in a moment.", ephemeral=True)
+        await _send(interaction, _BUSY_TEXT, ephemeral=True)
         return None
     except Exception:
         logger.exception("Slash command %s failed", label)
@@ -494,55 +512,39 @@ async def _resolve_person(
     return _Person(user_id, name, bool(row["active"]), float(row["tracking_since"]))
 
 
-async def _deliver(
-    interaction: discord.Interaction,
-    bot: Any,
-    label: str,
-    person: _Person,
-    action: Callable[[], Awaitable[str | tuple[str, bytes | None]]],
-    *,
-    ephemeral: bool,
-    filename: str = "chart.png",
-) -> None:
-    """Defer, run a report for ``person``, and reply with its text and optional chart.
+def _audience_can_view(bot: Any, interaction: discord.Interaction) -> Callable[[int], bool]:
+    """Return a check for whether the report's audience can view a channel.
 
-    The scope check and person lookup have already happened. A person who is no
-    longer tracked gets a note appended to the report.
+    A private reply is seen by the requester; a public one by ``@everyone``.
+    A missing channel or viewer is never visible. Answers are cached per
+    channel for the life of the returned check.
     """
-    await interaction.response.defer(ephemeral=ephemeral, thinking=True)
-    file = None
-    try:
-        result = await action()
-        content, png = result if isinstance(result, tuple) else (result, None)
-        content += person.note
-        if png:
-            file = discord.File(BytesIO(png), filename=filename)
-    except Exception:
-        logger.exception("Slash command %s failed", label)
-        content, file = _FAILURE_TEXT, None
-    await _send(interaction, content, ephemeral=ephemeral, file=file)
+    viewer = (
+        interaction.user if _report_is_ephemeral(bot, interaction)
+        else getattr(getattr(interaction, "guild", None), "default_role", None)
+    )
+
+    @lru_cache(maxsize=None)
+    def can_view(channel_id: int) -> bool:
+        if viewer is None:
+            return False
+        try:
+            return bool(bot.get_channel(channel_id).permissions_for(viewer).view_channel)
+        except (AttributeError, TypeError):
+            return False
+
+    return can_view
 
 
 def _visible_company_rows(
     bot: Any, interaction: discord.Interaction, rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Keep positive company rows from voice channels the report audience can view."""
-    viewer = (
-        interaction.user if _report_is_ephemeral(bot, interaction)
-        else getattr(getattr(interaction, "guild", None), "default_role", None)
-    )
-    visible_rows = []
-    for row in rows:
-        if float(row["seconds"]) <= 0:
-            continue
-        channel = bot.get_channel(int(row["channel_id"]))
-        try:
-            visible = viewer is not None and bool(channel.permissions_for(viewer).view_channel)
-        except (AttributeError, TypeError):
-            visible = False
-        if visible:
-            visible_rows.append(row)
-    return visible_rows
+    can_view = _audience_can_view(bot, interaction)
+    return [
+        row for row in rows
+        if float(row["seconds"]) > 0 and can_view(int(row["channel_id"]))
+    ]
 
 
 async def _visible_company_totals(
@@ -594,8 +596,7 @@ async def _company_report(
     label = _period_label(period)
     if not seconds_by_member:
         return (
-            f"No companion time has been observed for {person.safe} {label} in voice channels visible to this report. "
-            "Only time observed with companion tracking is included; earlier voice time cannot be reconstructed.",
+            f"No companion time has been observed for {person.safe} {label} in voice channels visible to this report.",
             None,
         )
     ranked_peers = sorted(
@@ -610,7 +611,7 @@ async def _company_report(
     rest = len(ranked_peers) - limit
     if rest > 0:
         top.append((-1, sum(seconds for _, seconds in ranked_peers[limit:])))
-    guild = bot.get_guild(bot.config.guild_id)
+    guild = _guild(bot)
     names = await asyncio.gather(*(
         _company_name(bot, guild, member_id) for member_id, _ in top
     ))
@@ -623,7 +624,7 @@ async def _company_report(
     ]
     details = []
     for index, ((member_id, _), (name, seconds)) in enumerate(zip(top, slices)):
-        safe_name = discord.utils.escape_mentions(discord.utils.escape_markdown(name))
+        safe_name = _safe_name(name)
         if full and member_id == -1:
             # Overlapping time with several people has no meaningful share of the whole.
             details.append(f"{_duration(seconds)} combined")
@@ -650,11 +651,17 @@ async def _company_report(
             "Each shared minute is split evenly among the people present; time alone has its own slice. "
             "Only observed time since companion tracking began is included."
         )
-    return "\n".join(lines), _pie_png(slices, person.name, details if full else None)
+    png = await _render(_pie_png, slices, person.name, details if full else None)
+    return "\n".join(lines), png
 
 
 _LEADERBOARD_SIZE = 10
 _LEADERBOARD_MEDALS = ("🥇", "🥈", "🥉")
+
+
+def _rank_label(index: int) -> str:
+    """A medal for the top three places, then ``4.``, ``5.``, and so on."""
+    return _LEADERBOARD_MEDALS[index] if index < len(_LEADERBOARD_MEDALS) else f"{index + 1}."
 
 
 async def _leaderboard_text(
@@ -674,15 +681,13 @@ async def _leaderboard_text(
             "Only observed time since companion tracking began is counted."
         )
     top = ranked[:_LEADERBOARD_SIZE]
-    guild = bot.get_guild(bot.config.guild_id)
+    guild = _guild(bot)
     names = await asyncio.gather(*(_company_name(bot, guild, member_id) for member_id, _ in top))
     lines = [f"**{person.safe}'s voice leaderboard — {label}**"]
     for index, (name, (_, seconds)) in enumerate(zip(names, top)):
-        rank = _LEADERBOARD_MEDALS[index] if index < len(_LEADERBOARD_MEDALS) else f"{index + 1}."
-        safe_name = discord.utils.escape_mentions(discord.utils.escape_markdown(name))
-        lines.append(f"{rank} **{safe_name}** — {_duration(seconds)}")
+        lines.append(f"{_rank_label(index)} **{_safe_name(name)}** — {_duration(seconds)}")
     if len(ranked) > len(top):
-        lines.append(f"…and {_plural(len(ranked) - len(top), 'other')}.")
+        lines.append(f"…and {len(ranked) - len(top):,} more.")
     if full_by_member.get(0, 0.0) > 0:
         lines.append(f"Time alone (not ranked): {_duration(full_by_member[0])}.")
     lines.append(
@@ -707,6 +712,7 @@ _SEGMENT_GAP = 3
 _DURATION_STEPS = (60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800)
 
 
+@lru_cache(maxsize=None)
 def _font(size: int) -> Any:
     try:
         return ImageFont.truetype("DejaVuSans.ttf", size)
@@ -833,6 +839,21 @@ def _png_bytes(image: Image.Image) -> bytes:
     return output.getvalue()
 
 
+# Cached fonts are shared, and FreeType faces are not safe to use from two
+# threads at once, so charts render one at a time.
+_RENDER_LOCK = threading.Lock()
+
+
+async def _render(draw: Callable[..., _T], /, *args: Any) -> _T:
+    """Run a function that draws a chart on a worker thread, off the event loop."""
+
+    def locked() -> _T:
+        with _RENDER_LOCK:
+            return draw(*args)
+
+    return await asyncio.to_thread(locked)
+
+
 def _bar_panels_png(
     title: str,
     labels: list[str],
@@ -936,11 +957,13 @@ def _plural(count: int, word: str) -> str:
     return f"{count:,} {word}{'' if count == 1 else 's'}"
 
 
-def _collection_reliable(bot: Any) -> bool:
-    tracker = bot.tracker
-    return all(bool(getattr(tracker, name, True)) for name in (
-        "connected", "guild_is_available", "collection_ready"
-    ))
+def _append_fitting(lines: list[str], entries: list[str]) -> int:
+    """Append ``entries`` to ``lines`` while the text fits; return how many were left out."""
+    for index, entry in enumerate(entries):
+        if len("\n".join((*lines, entry))) > _LIST_LIMIT:
+            return len(entries) - index
+        lines.append(entry)
+    return 0
 
 
 def _is_active(entry: dict[str, Any]) -> bool:
@@ -1149,7 +1172,7 @@ def _weekday_trend(series: list[dict[str, Any]], label: str, person: _Person) ->
 def _hour_trend(
     messages: dict[str, Any], voice: dict[str, Any], label: str, timezone: str, person: _Person
 ) -> tuple[str, bytes | None]:
-    zone = ZoneInfo(timezone)
+    zone = get_timezone(timezone)
     message_hours = [0.0] * 24
     for created_at in messages["times"]:
         message_hours[datetime.fromtimestamp(float(created_at), tz=zone).hour] += 1
@@ -1319,8 +1342,7 @@ async def _company_trend(
         )
     # Buckets run from the first day with company data, which started with that feature.
     first = min(date.fromisoformat(row["day"]) for row in rows)
-    last = datetime.fromtimestamp(now, tz=ZoneInfo(bot.config.timezone)).date()
-    last = max(last, max(date.fromisoformat(row["day"]) for row in rows))
+    last = max(local_date(now, bot.config.timezone), max(date.fromisoformat(row["day"]) for row in rows))
     day_count = (last - first).days + 1
     unit = _bucket_unit(day_count)
     keys = sorted({_bucket_key(first + timedelta(days=offset), unit) for offset in range(day_count)})
@@ -1352,7 +1374,7 @@ async def _company_trend(
         [member_id for member_id, _ in stacks]
         + [member_id for member_id in winners.values() if member_id is not None]
     ))
-    guild = bot.get_guild(bot.config.guild_id)
+    guild = _guild(bot)
     names = await asyncio.gather(*(_company_name(bot, guild, member_id) for member_id in named))
     name_of = dict(zip(named, names))
     full = count == "full"
@@ -1366,20 +1388,19 @@ async def _company_trend(
             alone = by_member.get(0, [0.0] * len(keys))[index]
             lines.append(f"{when}: {'alone — ' + _duration(alone) if alone > 0 else 'no company time'}")
         else:
-            safe = discord.utils.escape_mentions(discord.utils.escape_markdown(name_of[best]))
-            lines.append(f"{when}: **{safe}** — {_duration(by_member[best][index])}")
+            lines.append(f"{when}: **{_safe_name(name_of[best])}** — {_duration(by_member[best][index])}")
     if full:
         lines.append(
             "Each person is credited with every minute they shared, so stacked bars can add up to more "
-            "than the observed time; only observed time since companion tracking began is included, and "
-            "time recorded before whole shared time was tracked counts as its split share."
+            "than the observed time; only observed time since companion tracking began is included."
         )
     else:
         lines.append(
             "Each shared minute is split evenly among the people present; only observed time since "
             "companion tracking began is included."
         )
-    png = _stacked_png(
+    png = await _render(
+        _stacked_png,
         f"{person.name}'s company per {unit} — {label}",
         f"Full shared time per {unit}, by companion (overlapping)" if full
         else f"Observed voice time per {unit}, by companion",
@@ -1401,32 +1422,31 @@ async def _trend_report(
     timezone = bot.config.timezone
     reliable = _collection_reliable(bot)
     user_id = person.user_id
+    # Data is read here; each builder then writes its text and draws its chart
+    # on a worker thread.
     if kind == "hours":
         messages = await bot.store.message_times(user_id, period, now)
         voice = await bot.store.voice_hours(user_id, period, now, include_live=reliable)
-        return _hour_trend(messages, voice, label, timezone, person)
+        return await _render(_hour_trend, messages, voice, label, timezone, person)
     if kind == "bursts":
-        return _burst_trend(
-            await bot.store.message_times(user_id, period, now), label, timezone, person
-        )
+        result = await bot.store.message_times(user_id, period, now)
+        return await _render(_burst_trend, result, label, timezone, person)
     if kind == "compare":
-        return _compare_trend(
-            await bot.store.period_comparison(user_id, period, now, include_live=reliable),
-            period, label, person,
-        )
+        result = await bot.store.period_comparison(user_id, period, now, include_live=reliable)
+        return await _render(_compare_trend, result, period, label, person)
     if kind == "company":
         return await _company_trend(bot, interaction, person, period, label, count)
     series = await bot.store.daily_trend(user_id, period, now, include_live=reliable)
     if not any(_is_active(entry) for entry in series):
         return f"No activity has been recorded for {label}, so there is no trend to chart.", None
     if kind == "weekdays":
-        return _weekday_trend(series, label, person)
-    return _daily_trend(series, label, person)
+        return await _render(_weekday_trend, series, label, person)
+    return await _render(_daily_trend, series, label, person)
 
 
 async def _online_text(bot: Any, person: _Person) -> str:
     """Request a person's current guild presence without keeping a history."""
-    guild = bot.get_guild(bot.config.guild_id)
+    guild = _guild(bot)
     if guild is None or getattr(guild, "unavailable", False):
         return f"I can't check {person.safe}'s Discord status while the server is unavailable."
     try:
@@ -1486,8 +1506,7 @@ async def _records_text(bot: Any, interaction: discord.Interaction, person: _Per
     ]
     if peers:
         member_id, seconds = min(peers, key=lambda item: (-item[1], item[0]))
-        guild = bot.get_guild(bot.config.guild_id)
-        name = _safe_name(await _company_name(bot, guild, member_id))
+        name = _safe_name(await _company_name(bot, _guild(bot), member_id))
         lines.append(
             f"Top voice companion: **{name}** — {_duration(seconds)} of shared voice time "
             "since companion tracking began (split evenly when more people were present)."
@@ -1537,14 +1556,14 @@ async def _top_text(bot: Any, period: str, metric: str) -> str:
     if not ranked:
         return f"No {metric_label} to rank for {label}."
     top = ranked[:_LEADERBOARD_SIZE]
-    guild = bot.get_guild(bot.config.guild_id)
+    guild = _guild(bot)
     names = await asyncio.gather(*(_company_name(bot, guild, int(row["user_id"])) for row in top))
     lines = [f"**Top {metric_label} — {label}**"]
     for index, (name, row) in enumerate(zip(names, top)):
-        rank = _LEADERBOARD_MEDALS[index] if index < len(_LEADERBOARD_MEDALS) else f"{index + 1}."
         formerly = "" if row.get("tracked", True) else " (no longer tracked)"
         lines.append(
-            f"{rank} **{_safe_name(name)}** — {_top_value(field, float(row[field]))}{formerly}"
+            f"{_rank_label(index)} **{_safe_name(name)}** — "
+            f"{_top_value(field, float(row[field]))}{formerly}"
         )
     if len(ranked) > len(top):
         lines.append(f"…and {len(ranked) - len(top):,} more.")
@@ -1568,7 +1587,7 @@ async def _tracked_list_text(bot: Any) -> str:
     }
     active = [row for row in rows if row["active"]]
     former = [row for row in rows if not row["active"] and int(row["user_id"]) in with_history]
-    guild = bot.get_guild(bot.config.guild_id) if hasattr(bot, "get_guild") else None
+    guild = _guild(bot)
     shown = [*active, *former]
     labels = await asyncio.gather(*(
         _admin_label(bot, guild, int(row["user_id"])) for row in shown
@@ -1584,17 +1603,12 @@ async def _tracked_list_text(bot: Any) -> str:
     lines = [f"**Tracked people ({len(active):,})**"]
     if not active:
         lines.append("Nobody is tracked yet. An admin can add people with `/flock track add`.")
-    omitted = 0
-    for heading, entries in (
-        (None, active_entries), ("Formerly tracked (history kept):", former_entries)
-    ):
-        if heading is not None and entries and not omitted:
-            lines.append(heading)
-        for entry in entries:
-            if omitted or len("\n".join((*lines, entry))) > 1850:
-                omitted += 1
-            else:
-                lines.append(entry)
+    omitted = _append_fitting(lines, active_entries)
+    if omitted:
+        omitted += len(former_entries)
+    elif former_entries:
+        lines.append("Formerly tracked (history kept):")
+        omitted = _append_fitting(lines, former_entries)
     if omitted:
         lines.append(f"…and {omitted:,} more people")
     return "\n".join(lines)
@@ -1651,16 +1665,14 @@ async def _status_text(bot: Any) -> str:
     state = await bot.store.state()
     timezone = bot.config.timezone
     tracker = bot.tracker
-    connected = bool(getattr(tracker, "connected", False))
-    guild_available = bool(getattr(tracker, "guild_is_available", True))
     paused = bool(state.get("paused", False))
     last_checkpoint = state.get("last_checkpoint")
-    health = "connected" if connected else "disconnected"
-    if not guild_available:
+    health = "connected" if getattr(tracker, "connected", False) else "disconnected"
+    if not getattr(tracker, "guild_is_available", False):
         health += "; configured server unavailable"
     if paused:
         collection_state = "paused"
-    elif not connected or not guild_available or not bool(getattr(tracker, "collection_ready", True)):
+    elif not _collection_reliable(bot):
         collection_state = "unavailable"
     else:
         collection_state = "running"
@@ -1743,7 +1755,7 @@ def _gap_span(gap: dict[str, Any], timezone: str) -> str:
     start = _local_time(gap["started_at"], timezone)
     if gap.get("ended_at") is None:
         return f"{start} – still open"
-    zone = ZoneInfo(timezone)
+    zone = get_timezone(timezone)
     began = datetime.fromtimestamp(float(gap["started_at"]), tz=zone)
     ended = datetime.fromtimestamp(float(gap["ended_at"]), tz=zone)
     if began.date() == ended.date():
@@ -1784,18 +1796,19 @@ async def _health_text(bot: Any) -> str:
             f"Bot process: up **{_duration(now - started)}** (since {_local_time(started, timezone)})."
         )
     since = getattr(tracker, "collection_since", None)
+    problem = _collection_problem(bot)
     if state.get("paused", False):
         lines.append("Collection: **paused** by an admin.")
-    elif _collection_reliable(bot) and since is not None:
+    elif problem is None and since is not None:
         lines.append(
             f"Collection: **running** for {_duration(now - since)} "
             f"(since {_local_time(since, timezone)})."
         )
     else:
-        reason = "the Discord connection is down" if not getattr(tracker, "connected", False) else (
-            "the configured server is unavailable"
-            if not getattr(tracker, "guild_is_available", True) else "collection is still starting"
-        )
+        reason = {
+            "disconnected": "the Discord connection is down",
+            "guild_unavailable": "the configured server is unavailable",
+        }.get(problem, "collection is still starting")
         lines.append(f"Collection: **not running**; {reason}.")
     checkpoint = state.get("last_checkpoint")
     if checkpoint is None:
@@ -1804,7 +1817,7 @@ async def _health_text(bot: Any) -> str:
         age = max(0.0, now - float(checkpoint))
         line = f"Last checkpoint: {_local_time(checkpoint, timezone)} ({_ago(age)})."
         expected = 3 * float(getattr(bot.config, "checkpoint_seconds", 60))
-        if _collection_reliable(bot) and not state.get("paused", False) and age > expected:
+        if problem is None and not state.get("paused", False) and age > expected:
             line += " ⚠️ That is older than expected; checkpoints may be failing."
         lines.append(line)
     error = getattr(tracker, "last_error", None)
@@ -1898,7 +1911,8 @@ async def _uptime_report(bot: Any, period: str) -> tuple[str, bytes | None]:
         totals[1] += float(entry["outage"])
         totals[2] += float(entry["idle"])
     keys = sorted(buckets)
-    png = _stacked_png(
+    png = await _render(
+        _stacked_png,
         f"Flock uptime — {label}",
         f"Time per {unit}",
         [_bucket_label(key, unit, len(days)) for key in keys],
@@ -1928,16 +1942,13 @@ async def _errors_text(bot: Any) -> str:
         f"**{result['day']:,}** in the last day, {result['week']:,} in the last week, "
         f"{result['total']:,} kept in total. Newest first:"
     )
-    for entry in result["recent"]:
-        line = (
-            f"`{_local_time(entry['at'], timezone)}` {entry['level'].lower()} in "
-            f"{discord.utils.escape_markdown(entry['source'])}: "
-            f"{discord.utils.escape_mentions(discord.utils.escape_markdown(entry['summary']))}"
-        )
-        if len("\n".join((*lines, line))) > 1850:
-            lines.append("…older entries left out to fit Discord's limit")
-            break
-        lines.append(line)
+    entries = [
+        f"`{_local_time(entry['at'], timezone)}` {entry['level'].lower()} in "
+        f"{discord.utils.escape_markdown(entry['source'])}: {_safe_name(entry['summary'])}"
+        for entry in result["recent"]
+    ]
+    if _append_fitting(lines, entries):
+        lines.append("…older entries left out to fit Discord's limit")
     lines.append("Only log lines and error types are kept; the service journal has full tracebacks.")
     return "\n".join(lines)
 
@@ -1952,9 +1963,7 @@ async def _person_debug_text(bot: Any, interaction: discord.Interaction, user: A
     if not result["known"]:
         lines.append(f"{name} has never been tracked, so nothing is stored about them.")
         return "\n".join(lines)
-    guild = getattr(interaction, "guild", None) or (
-        bot.get_guild(bot.config.guild_id) if hasattr(bot, "get_guild") else None
-    )
+    guild = getattr(interaction, "guild", None) or _guild(bot)
     first = _local_time(result["tracking_since"], timezone)
     if result["active"]:
         line = f"Tracked: **yes**, first tracked {first}"
@@ -2086,8 +2095,6 @@ class DeleteDataConfirmation(discord.ui.View):
         self.message: discord.Message | None = None
         self._confirmation_lock = asyncio.Lock()
         self._processing = False
-        self._completed = False
-        self._expired = False
 
     async def _is_invoker(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.invoker_id:
@@ -2107,15 +2114,13 @@ class DeleteDataConfirmation(discord.ui.View):
     ) -> None:
         if not await self._is_invoker(interaction):
             return
-        if self._expired or self._completed or self.is_finished():
+        if self.is_finished():
             await _send(interaction, "This deletion confirmation has expired or finished.", ephemeral=True)
             return
-        if not await _scope_ok(interaction, self.bot):
-            return
-        if not await _control_permission_ok(interaction, self.bot):
+        if not await _control_ok(interaction, self.bot):
             return
         async with self._confirmation_lock:
-            if self._processing or self._completed or self._expired or self.is_finished():
+            if self._processing or self.is_finished():
                 await _send(interaction, "This deletion request is already being handled or has finished.", ephemeral=True)
                 return
             self._processing = True
@@ -2144,7 +2149,6 @@ class DeleteDataConfirmation(discord.ui.View):
                 await _send(interaction, "The tracker could not delete the data. The error was logged.", ephemeral=True)
             return
         self._processing = False
-        self._completed = True
         self.stop()
         if self.target_id is None:
             content = (
@@ -2178,10 +2182,9 @@ class DeleteDataConfirmation(discord.ui.View):
             if self._processing:
                 await _send(interaction, "This deletion request is already being handled and cannot be cancelled.", ephemeral=True)
                 return
-            if self._completed or self._expired or self.is_finished():
+            if self.is_finished():
                 await _send(interaction, "This deletion confirmation has expired or finished.", ephemeral=True)
                 return
-            self._completed = True
             self.stop()
         await interaction.response.edit_message(
             content="Data deletion cancelled.",
@@ -2190,7 +2193,9 @@ class DeleteDataConfirmation(discord.ui.View):
         )
 
     async def on_timeout(self) -> None:
-        self._expired = True
+        # discord.py finishes the view before calling this; stopping again is
+        # harmless and makes the buttons refuse even if this is called directly.
+        self.stop()
         for item in self.children:
             if isinstance(item, discord.ui.Button):
                 item.disabled = True
@@ -2214,6 +2219,13 @@ class DeleteDataConfirmation(discord.ui.View):
         )
 
 
+def _async_value(value: str) -> Callable[[], Awaitable[str]]:
+    async def result() -> str:
+        return value
+
+    return result
+
+
 def register_commands(bot: Any) -> None:
     """Add the ``/flock`` command group to ``bot.tree`` for the configured guild."""
     guild = discord.Object(id=bot.config.guild_id)
@@ -2224,6 +2236,45 @@ def register_commands(bot: Any) -> None:
         name="debug", description="Admin-only bot health, uptime, and troubleshooting", parent=flock
     )
 
+    async def person_report(
+        interaction: discord.Interaction,
+        label: str,
+        user: Any,
+        build: Callable[[_Person], Awaitable[str | tuple[str, bytes | None]]],
+        *,
+        ephemeral: bool | None = None,
+        require_active: bool = False,
+        gate: Callable[[], Awaitable[bool]] | None = None,
+        filename: str = "chart.png",
+    ) -> None:
+        """Resolve the person a report is about, then run and deliver it.
+
+        Replies are public in report channels unless ``ephemeral`` is given.
+        ``gate`` runs after the person is resolved and can refuse the report.
+        """
+        person = await _resolve_person(interaction, bot, label, user, require_active=require_active)
+        if person is None or (gate is not None and not await gate()):
+            return
+        await _run(
+            interaction,
+            label,
+            lambda: build(person),
+            ephemeral=_report_is_ephemeral(bot, interaction) if ephemeral is None else ephemeral,
+            note=person.note,
+            filename=filename,
+        )
+
+    async def control(
+        interaction: discord.Interaction,
+        label: str,
+        action: Callable[[], Awaitable[str | tuple[str, bytes | None]]],
+        *,
+        filename: str = "chart.png",
+    ) -> None:
+        """Run an admin-only command and reply privately."""
+        if await _control_ok(interaction, bot):
+            await _run(interaction, label, action, ephemeral=True, filename=filename)
+
     @flock.command(name="stats", description="Show activity statistics for a period")
     @app_commands.describe(period="The period to summarize", user=_USER_OPTION)
     @app_commands.choices(period=PERIOD_CHOICES)
@@ -2232,16 +2283,8 @@ def register_commands(bot: Any) -> None:
         period: str = "week",
         user: discord.User | None = None,
     ) -> None:
-        person = await _resolve_person(interaction, bot, "flock stats", user)
-        if person is None:
-            return
-        await _deliver(
-            interaction,
-            bot,
-            "flock stats",
-            person,
-            lambda: _stats_text(bot, person, period),
-            ephemeral=_report_is_ephemeral(bot, interaction),
+        await person_report(
+            interaction, "flock stats", user, lambda person: _stats_text(bot, person, period)
         )
 
     @flock.command(name="records", description="Show personal activity records")
@@ -2249,16 +2292,8 @@ def register_commands(bot: Any) -> None:
     async def records_command(
         interaction: discord.Interaction, user: discord.User | None = None
     ) -> None:
-        person = await _resolve_person(interaction, bot, "flock records", user)
-        if person is None:
-            return
-        await _deliver(
-            interaction,
-            bot,
-            "flock records",
-            person,
-            lambda: _records_text(bot, interaction, person),
-            ephemeral=_report_is_ephemeral(bot, interaction),
+        await person_report(
+            interaction, "flock records", user, lambda person: _records_text(bot, interaction, person)
         )
 
     @flock.command(name="where", description="Show when and where someone was last in voice")
@@ -2266,16 +2301,8 @@ def register_commands(bot: Any) -> None:
     async def where_command(
         interaction: discord.Interaction, user: discord.User | None = None
     ) -> None:
-        person = await _resolve_person(interaction, bot, "flock where", user)
-        if person is None:
-            return
-        await _deliver(
-            interaction,
-            bot,
-            "flock where",
-            person,
-            lambda: _seen_text(bot, interaction, person),
-            ephemeral=_report_is_ephemeral(bot, interaction),
+        await person_report(
+            interaction, "flock where", user, lambda person: _seen_text(bot, interaction, person)
         )
 
     @flock.command(name="company", description="Chart who shared someone's observed voice time")
@@ -2289,16 +2316,11 @@ def register_commands(bot: Any) -> None:
         count: str = "split",
         user: discord.User | None = None,
     ) -> None:
-        person = await _resolve_person(interaction, bot, "flock company", user)
-        if person is None:
-            return
-        await _deliver(
+        await person_report(
             interaction,
-            bot,
             "flock company",
-            person,
-            lambda: _company_report(bot, interaction, person, period, count),
-            ephemeral=_report_is_ephemeral(bot, interaction),
+            user,
+            lambda person: _company_report(bot, interaction, person, period, count),
             filename="flock-voice-company.png",
         )
 
@@ -2310,16 +2332,11 @@ def register_commands(bot: Any) -> None:
         period: str = "all",
         user: discord.User | None = None,
     ) -> None:
-        person = await _resolve_person(interaction, bot, "flock leaderboard", user)
-        if person is None:
-            return
-        await _deliver(
+        await person_report(
             interaction,
-            bot,
             "flock leaderboard",
-            person,
-            lambda: _leaderboard_text(bot, interaction, person, period),
-            ephemeral=_report_is_ephemeral(bot, interaction),
+            user,
+            lambda person: _leaderboard_text(bot, interaction, person, period),
         )
 
     @flock.command(name="trends", description="Chart how someone's activity changes over a period")
@@ -2337,16 +2354,11 @@ def register_commands(bot: Any) -> None:
         count: str = "split",
         user: discord.User | None = None,
     ) -> None:
-        person = await _resolve_person(interaction, bot, "flock trends", user)
-        if person is None:
-            return
-        await _deliver(
+        await person_report(
             interaction,
-            bot,
             "flock trends",
-            person,
-            lambda: _trend_report(bot, interaction, person, period, kind, count),
-            ephemeral=_report_is_ephemeral(bot, interaction),
+            user,
+            lambda person: _trend_report(bot, interaction, person, period, kind, count),
             filename=f"flock-trends-{kind}.png",
         )
 
@@ -2355,16 +2367,13 @@ def register_commands(bot: Any) -> None:
     async def online_command(
         interaction: discord.Interaction, user: discord.User | None = None
     ) -> None:
-        person = await _resolve_person(interaction, bot, "flock online", user, require_active=True)
-        if person is None:
-            return
-        await _deliver(
+        await person_report(
             interaction,
-            bot,
             "flock online",
-            person,
-            lambda: _online_text(bot, person),
+            user,
+            lambda person: _online_text(bot, person),
             ephemeral=True,
+            require_active=True,
         )
 
     @flock.command(name="roast", description="Get a light joke based on real activity")
@@ -2375,32 +2384,21 @@ def register_commands(bot: Any) -> None:
         period: str = "week",
         user: discord.User | None = None,
     ) -> None:
-        person = await _resolve_person(interaction, bot, "flock roast", user)
-        if person is None:
-            return
-        remaining = await _ROAST_COOLDOWN.consume()
-        if remaining > 0:
-            await _send(
-                interaction,
-                f"The shared roast cooldown is active. Try again in {max(1, int(remaining + 0.99))} seconds.",
-                ephemeral=True,
-            )
-            return
-
-        async def action() -> str:
+        async def roast(person: _Person) -> str:
             stats = await _read_stats(bot, person.user_id, period, time.time())
             joke = make_roast(stats, _period_label(period), name=person.name)
             if joke is None:
                 return f"There is no recorded activity to joke about for {_period_label(period)} yet."
             return joke
 
-        await _deliver(
+        await person_report(
             interaction,
-            bot,
             "flock roast",
-            person,
-            action,
-            ephemeral=_report_is_ephemeral(bot, interaction),
+            user,
+            roast,
+            gate=lambda: _cooldown_ok(
+                interaction, _ROAST_COOLDOWN, "The shared roast cooldown is active."
+            ),
         )
 
     @flock.command(name="top", description="Rank tracked people by messages, voice time, or active days")
@@ -2409,73 +2407,55 @@ def register_commands(bot: Any) -> None:
     async def top_command(
         interaction: discord.Interaction, period: str = "week", metric: str = "messages"
     ) -> None:
-        await _execute(
-            interaction,
-            bot,
-            "flock top",
-            lambda: _top_text(bot, period, metric),
-            ephemeral=_report_is_ephemeral(bot, interaction),
-        )
+        if await _scope_ok(interaction, bot):
+            await _run(
+                interaction,
+                "flock top",
+                lambda: _top_text(bot, period, metric),
+                ephemeral=_report_is_ephemeral(bot, interaction),
+            )
 
     @flock.command(name="introduce", description="Have the bot introduce itself in this channel")
     async def introduce_command(interaction: discord.Interaction) -> None:
         if not await _scope_ok(interaction, bot):
             return
-        remaining = await _INTRODUCE_COOLDOWN.consume()
-        if remaining > 0:
-            await _send(
-                interaction,
-                f"I just introduced myself. Try again in {max(1, int(remaining + 0.99))} seconds.",
-                ephemeral=True,
-            )
+        if not await _cooldown_ok(interaction, _INTRODUCE_COOLDOWN, "I just introduced myself."):
             return
-        await _execute_after_scope(
-            interaction,
-            bot,
-            "flock introduce",
-            _async_value(_introduction_text(bot)),
-            ephemeral=False,
+        await _run(
+            interaction, "flock introduce", _async_value(_introduction_text(bot)), ephemeral=False
         )
 
     @flock.command(name="help", description="Explain commands and what the bot measures")
     async def help_command(interaction: discord.Interaction) -> None:
-        await _execute(
-            interaction,
-            bot,
-            "flock help",
-            _async_value(_help_text(bot)),
-            ephemeral=_report_is_ephemeral(bot, interaction),
-        )
+        if await _scope_ok(interaction, bot):
+            await _run(
+                interaction,
+                "flock help",
+                _async_value(_help_text(bot)),
+                ephemeral=_report_is_ephemeral(bot, interaction),
+            )
 
     @flock.command(name="about", description="Show the bot version, connection, and coverage status")
     async def about_command(interaction: discord.Interaction) -> None:
-        await _execute(
-            interaction,
-            bot,
-            "flock about",
-            lambda: _status_text(bot),
-            ephemeral=True,
-        )
+        if await _scope_ok(interaction, bot):
+            await _run(interaction, "flock about", lambda: _status_text(bot), ephemeral=True)
 
     @flock.command(name="version", description="Show the running bot version")
     async def version_command(interaction: discord.Interaction) -> None:
-        await _execute(
-            interaction,
-            bot,
-            "flock version",
-            _async_value(f"Flock **{version_string()}**."),
-            ephemeral=True,
-        )
+        if await _scope_ok(interaction, bot):
+            await _run(
+                interaction,
+                "flock version",
+                _async_value(f"Flock **{version_string()}**."),
+                ephemeral=True,
+            )
 
     @admin.command(name="add", description="Grant tracker admin access to a server member")
     @app_commands.describe(user="Server member to grant tracker controls")
     async def admin_add_command(interaction: discord.Interaction, user: discord.Member) -> None:
-        if not await _scope_ok(interaction, bot):
+        if not await _owner_ok(interaction, bot):
             return
-        if not await _owner_permission_ok(interaction, bot):
-            return
-        config = _config(bot)
-        if user.id in (config.owner_user_id, _leland_id(bot)) or user.bot:
+        if user.id in (_config(bot).owner_user_id, _leland_id(bot)) or user.bot:
             await _send(
                 interaction,
                 "Choose a human member other than the owner or the configured Leland user.",
@@ -2487,37 +2467,31 @@ def register_commands(bot: Any) -> None:
             await bot.store.set_admin_override(user.id, True)
             return f"{_user_label(user, user.id)} now has tracker admin access."
 
-        await _execute_after_scope(interaction, bot, "flock admin add", action, ephemeral=True)
+        await _run(interaction, "flock admin add", action, ephemeral=True)
 
     @admin.command(name="remove", description="Revoke tracker admin access by user ID")
     @app_commands.describe(user_id="Discord user ID or mention; works after a member leaves")
     async def admin_remove_command(interaction: discord.Interaction, user_id: str) -> None:
-        if not await _scope_ok(interaction, bot):
+        if not await _owner_ok(interaction, bot):
             return
-        if not await _owner_permission_ok(interaction, bot):
-            return
-        parsed_id = _admin_id(user_id)
+        parsed_id = _parse_user_id(user_id)
         if parsed_id is None:
             await _send(interaction, "Enter a positive Discord user ID or user mention.", ephemeral=True)
             return
-        config = _config(bot)
-        if parsed_id == config.owner_user_id:
+        if parsed_id == _config(bot).owner_user_id:
             await _send(interaction, "The configured owner cannot be removed.", ephemeral=True)
             return
 
         async def action() -> str:
             await bot.store.set_admin_override(parsed_id, False)
-            guild = bot.get_guild(config.guild_id) if hasattr(bot, "get_guild") else None
-            label = await _admin_label(bot, guild, parsed_id)
+            label = await _admin_label(bot, _guild(bot), parsed_id)
             return f"{label} no longer has tracker admin access."
 
-        await _execute_after_scope(interaction, bot, "flock admin remove", action, ephemeral=True)
+        await _run(interaction, "flock admin remove", action, ephemeral=True)
 
     @admin.command(name="list", description="List the current tracker admins")
     async def admin_list_command(interaction: discord.Interaction) -> None:
-        if not await _scope_ok(interaction, bot):
-            return
-        if not await _owner_permission_ok(interaction, bot):
+        if not await _owner_ok(interaction, bot):
             return
 
         async def action() -> str:
@@ -2531,32 +2505,25 @@ def register_commands(bot: Any) -> None:
                     admins.discard(user_id)
             admins.discard(config.owner_user_id)
             admins.discard(_leland_id(bot))
-            guild = bot.get_guild(config.guild_id) if hasattr(bot, "get_guild") else None
-            ordered = sorted(admins)
+            guild = _guild(bot)
             owner_label, *admin_labels = await asyncio.gather(*(
                 _admin_label(bot, guild, user_id)
-                for user_id in (config.owner_user_id, *ordered)
+                for user_id in (config.owner_user_id, *sorted(admins))
             ))
             lines = [f"Owner: {owner_label}", "Tracker admins:"]
             if not admins:
                 lines.append("None")
-            else:
-                for index, label in enumerate(admin_labels):
-                    candidate = "\n".join((*lines, label))
-                    if len(candidate) > 1850:
-                        lines.append(f"…and {len(ordered) - index} more admins")
-                        break
-                    lines.append(label)
+            omitted = _append_fitting(lines, admin_labels)
+            if omitted:
+                lines.append(f"…and {omitted} more admins")
             return "\n".join(lines)
 
-        await _execute_after_scope(interaction, bot, "flock admin list", action, ephemeral=True)
+        await _run(interaction, "flock admin list", action, ephemeral=True)
 
     @track.command(name="add", description="Start tracking a server member")
     @app_commands.describe(user="Server member to start tracking")
     async def track_add_command(interaction: discord.Interaction, user: discord.Member) -> None:
-        if not await _scope_ok(interaction, bot):
-            return
-        if not await _control_permission_ok(interaction, bot):
+        if not await _control_ok(interaction, bot):
             return
         if user.bot:
             await _send(interaction, "Bots can't be tracked.", ephemeral=True)
@@ -2572,72 +2539,46 @@ def register_commands(bot: Any) -> None:
                 reply += " Collection is paused, so counting starts when it resumes."
             return reply
 
-        await _execute_after_scope(interaction, bot, "flock track add", action, ephemeral=True)
+        await _run(interaction, "flock track add", action, ephemeral=True)
 
     @track.command(name="remove", description="Stop tracking someone by user ID, keeping their history")
     @app_commands.describe(user_id="Discord user ID or mention; works after a member leaves")
     async def track_remove_command(interaction: discord.Interaction, user_id: str) -> None:
-        if not await _scope_ok(interaction, bot):
+        if not await _control_ok(interaction, bot):
             return
-        if not await _control_permission_ok(interaction, bot):
-            return
-        parsed_id = _admin_id(user_id)
+        parsed_id = _parse_user_id(user_id)
         if parsed_id is None:
             await _send(interaction, "Enter a positive Discord user ID or user mention.", ephemeral=True)
             return
 
         async def action() -> str:
             removed = await bot.tracker.untrack_user(parsed_id, interaction.user.id)
-            guild = bot.get_guild(_config(bot).guild_id) if hasattr(bot, "get_guild") else None
-            label = await _admin_label(bot, guild, parsed_id)
+            label = await _admin_label(bot, _guild(bot), parsed_id)
             if not removed:
                 return f"{label} isn't currently tracked."
             return f"{label} is no longer tracked. Their recorded history is kept."
 
-        await _execute_after_scope(interaction, bot, "flock track remove", action, ephemeral=True)
+        await _run(interaction, "flock track remove", action, ephemeral=True)
 
     @track.command(name="list", description="List who is tracked")
     async def track_list_command(interaction: discord.Interaction) -> None:
-        await _execute(
-            interaction,
-            bot,
-            "flock track list",
-            lambda: _tracked_list_text(bot),
-            ephemeral=True,
-        )
+        if await _scope_ok(interaction, bot):
+            await _run(interaction, "flock track list", lambda: _tracked_list_text(bot), ephemeral=True)
 
     @flock.command(name="update", description="Check GitHub for a new bot version now")
     async def update_command(interaction: discord.Interaction) -> None:
-        if not await _scope_ok(interaction, bot):
-            return
-        if not await _control_permission_ok(interaction, bot):
-            return
-
-        async def action() -> str:
-            return await _request_update_text(bot)
-
-        await _execute_after_scope(interaction, bot, "flock update", action, ephemeral=True)
+        await control(interaction, "flock update", lambda: _request_update_text(bot))
 
     @flock.command(name="pause", description="Pause activity collection")
     async def pause_command(interaction: discord.Interaction) -> None:
-        if not await _scope_ok(interaction, bot):
-            return
-        if not await _control_permission_ok(interaction, bot):
-            return
-
         async def action() -> str:
             await bot.tracker.pause(actor_id=interaction.user.id)
             return "Collection is paused. This setting persists across restarts."
 
-        await _execute_after_scope(interaction, bot, "flock pause", action, ephemeral=True)
+        await control(interaction, "flock pause", action)
 
     @flock.command(name="resume", description="Resume activity collection")
     async def resume_command(interaction: discord.Interaction) -> None:
-        if not await _scope_ok(interaction, bot):
-            return
-        if not await _control_permission_ok(interaction, bot):
-            return
-
         async def action() -> str:
             await bot.tracker.resume(interaction.user.id, bot.voice_snapshot)
             snapshot = bot.voice_snapshot()
@@ -2653,49 +2594,43 @@ def register_commands(bot: Any) -> None:
                 f"{'is' if watching == 1 else 'are'} being observed from now."
             )
 
-        await _execute_after_scope(interaction, bot, "flock resume", action, ephemeral=True)
+        await control(interaction, "flock resume", action)
 
-    @flock.command(name="evil-mode", description="Toggle upside-down reposts of Leland's messages")
-    @app_commands.describe(mode="Turn upside-down reposts on or off")
-    @app_commands.choices(mode=[
-        app_commands.Choice(name="On", value="on"),
-        app_commands.Choice(name="Off", value="off"),
-    ])
-    async def evil_mode_command(interaction: discord.Interaction, mode: str) -> None:
-        if not await _scope_ok(interaction, bot):
-            return
-        if not await _control_permission_ok(interaction, bot):
-            return
-        if _leland_id(bot) is None:
-            await _send(interaction, "Leland mode isn't configured.", ephemeral=True)
-            return
+    def add_leland_toggle(
+        name: str, description: str, mode_description: str, label: str, setter: str
+    ) -> None:
+        """Add an admin command that turns a Leland-only mode on or off."""
 
-        async def action() -> str:
-            await bot.store.set_evil_mode(mode == "on")
-            return f"Evil Leland mode is now **{mode}**."
+        @flock.command(name=name, description=description)
+        @app_commands.describe(mode=mode_description)
+        @app_commands.choices(mode=[
+            app_commands.Choice(name="On", value="on"),
+            app_commands.Choice(name="Off", value="off"),
+        ])
+        async def toggle_command(interaction: discord.Interaction, mode: str) -> None:
+            if not await _control_ok(interaction, bot, leland=True):
+                return
 
-        await _execute_after_scope(interaction, bot, "flock evil-mode", action, ephemeral=True)
+            async def action() -> str:
+                await getattr(bot.store, setter)(mode == "on")
+                return f"{label} is now **{mode}**."
 
-    @flock.command(name="reaction-mode", description="Toggle occasional reactions to Leland's messages")
-    @app_commands.describe(mode="Turn occasional emoji reactions on or off")
-    @app_commands.choices(mode=[
-        app_commands.Choice(name="On", value="on"),
-        app_commands.Choice(name="Off", value="off"),
-    ])
-    async def reaction_mode_command(interaction: discord.Interaction, mode: str) -> None:
-        if not await _scope_ok(interaction, bot):
-            return
-        if not await _control_permission_ok(interaction, bot):
-            return
-        if _leland_id(bot) is None:
-            await _send(interaction, "Leland mode isn't configured.", ephemeral=True)
-            return
+            await _run(interaction, f"flock {name}", action, ephemeral=True)
 
-        async def action() -> str:
-            await bot.store.set_reaction_mode(mode == "on")
-            return f"Reaction mode is now **{mode}**."
-
-        await _execute_after_scope(interaction, bot, "flock reaction-mode", action, ephemeral=True)
+    add_leland_toggle(
+        "evil-mode",
+        "Toggle upside-down reposts of Leland's messages",
+        "Turn upside-down reposts on or off",
+        "Evil Leland mode",
+        "set_evil_mode",
+    )
+    add_leland_toggle(
+        "reaction-mode",
+        "Toggle occasional reactions to Leland's messages",
+        "Turn occasional emoji reactions on or off",
+        "Reaction mode",
+        "set_reaction_mode",
+    )
 
     @flock.command(name="delete-data", description="Erase one person's statistics, or everyone's and pause collection")
     @app_commands.describe(
@@ -2707,34 +2642,27 @@ def register_commands(bot: Any) -> None:
         user: discord.User | None = None,
         user_id: str | None = None,
     ) -> None:
-        if not await _scope_ok(interaction, bot):
-            return
-        if not await _control_permission_ok(interaction, bot):
+        if not await _control_ok(interaction, bot):
             return
         if user is not None and user_id is not None:
             await _send(interaction, "Choose either `user` or `user_id`, not both.", ephemeral=True)
             return
-        if user is not None and user.bot:
-            await _send(interaction, "Bots aren't tracked.", ephemeral=True)
-            return
+        target = user
         target_id: int | None = None if user is None else int(user.id)
         if user_id is not None:
-            target_id = _admin_id(user_id)
+            target_id = _parse_user_id(user_id)
             if target_id is None:
                 await _send(interaction, "Enter a Discord user ID or mention.", ephemeral=True)
                 return
             # Cache only: this prompt is the interaction's first response, so a
             # Discord lookup could run past the acknowledgement window.
-            guild = getattr(interaction, "guild", None)
-            found = guild.get_member(target_id) if guild is not None else None
-            if found is None and hasattr(bot, "get_user"):
-                found = bot.get_user(target_id)
-            if getattr(found, "bot", False):
-                await _send(interaction, "Bots aren't tracked.", ephemeral=True)
-                return
-            name = _safe_name(_person_name(found, target_id))
-        elif user is not None:
-            name = _safe_name(_person_name(user, target_id))
+            server = getattr(interaction, "guild", None)
+            target = server.get_member(target_id) if server is not None else None
+            if target is None and hasattr(bot, "get_user"):
+                target = bot.get_user(target_id)
+        if getattr(target, "bot", False):
+            await _send(interaction, "Bots aren't tracked.", ephemeral=True)
+            return
         if target_id is None:
             view = DeleteDataConfirmation(bot, interaction.user.id)
             prompt = (
@@ -2742,6 +2670,7 @@ def register_commands(bot: Any) -> None:
                 "local backups, then pauses collection. The tracked list is kept. Continue?"
             )
         else:
+            name = _safe_name(_person_name(target, target_id))
             view = DeleteDataConfirmation(
                 bot, interaction.user.id, target_id=target_id, target_name=name
             )
@@ -2763,55 +2692,36 @@ def register_commands(bot: Any) -> None:
             # not expose the original response message.
             pass
 
-    async def _admin_report(
-        interaction: discord.Interaction,
-        label: str,
-        action: Callable[[], Awaitable[str | tuple[str, bytes | None]]],
-        *,
-        filename: str = "chart.png",
-    ) -> None:
-        """Run an admin-only debug report and reply privately, with an optional chart."""
-        if not await _scope_ok(interaction, bot):
-            return
-        if not await _control_permission_ok(interaction, bot):
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        file = None
-        try:
-            result = await action()
-            content, png = result if isinstance(result, tuple) else (result, None)
-            if png:
-                file = discord.File(BytesIO(png), filename=filename)
-        except Exception:
-            logger.exception("Slash command %s failed", label)
-            content, file = _FAILURE_TEXT, None
-        await _send(interaction, content, ephemeral=True, file=file)
-
     @debug.command(name="health", description="Show uptime, checkpoints, errors, storage, and backups")
     async def debug_health_command(interaction: discord.Interaction) -> None:
-        await _admin_report(interaction, "flock debug health", lambda: _health_text(bot))
+        await control(interaction, "flock debug health", lambda: _health_text(bot))
 
     @debug.command(name="uptime", description="Chart when the bot was watching and list its outages")
     @app_commands.describe(period="The period to check (last 7 days by default)")
     @app_commands.choices(period=TREND_PERIOD_CHOICES)
     async def debug_uptime_command(interaction: discord.Interaction, period: str = "last7") -> None:
-        await _admin_report(
+        await control(
             interaction, "flock debug uptime", lambda: _uptime_report(bot, period),
             filename="flock-uptime.png",
         )
 
     @debug.command(name="errors", description="List recent warnings and errors the bot logged")
     async def debug_errors_command(interaction: discord.Interaction) -> None:
-        await _admin_report(interaction, "flock debug errors", lambda: _errors_text(bot))
+        await control(interaction, "flock debug errors", lambda: _errors_text(bot))
 
     @debug.command(name="person", description="Show one person's tracking history, coverage, and stored data")
     @app_commands.describe(user="The person to inspect")
     async def debug_person_command(interaction: discord.Interaction, user: discord.User) -> None:
+        if not await _control_ok(interaction, bot):
+            return
         if getattr(user, "bot", False):
             await _send(interaction, "Bots aren't tracked.", ephemeral=True)
             return
-        await _admin_report(
-            interaction, "flock debug person", lambda: _person_debug_text(bot, interaction, user)
+        await _run(
+            interaction,
+            "flock debug person",
+            lambda: _person_debug_text(bot, interaction, user),
+            ephemeral=True,
         )
 
     @debug.command(name="alerts", description="Show or set when the owner is DMed about an outage")
@@ -2820,7 +2730,7 @@ def register_commands(bot: Any) -> None:
         interaction: discord.Interaction,
         minutes: app_commands.Range[int, 0, 1440] | None = None,
     ) -> None:
-        await _admin_report(interaction, "flock debug alerts", lambda: _alerts_text(bot, minutes))
+        await control(interaction, "flock debug alerts", lambda: _alerts_text(bot, minutes))
 
     bot.tree.add_command(flock, guild=guild)
 
@@ -2834,37 +2744,6 @@ def register_commands(bot: Any) -> None:
             getattr(command, "qualified_name", "unknown"),
             exc_info=(type(error), error, error.__traceback__),
         )
-        await _send(
-            interaction,
-            "The tracker could not complete that request. The error was logged.",
-            ephemeral=True,
-        )
+        await _send(interaction, _FAILURE_TEXT, ephemeral=True)
 
     bot.tree.on_error = on_tree_error
-
-
-async def _execute_after_scope(
-    interaction: discord.Interaction,
-    bot: Any,
-    label: str,
-    action: Callable[[], Awaitable[str]],
-    *,
-    ephemeral: bool,
-) -> None:
-    """Run an action after a callback has already applied its scope checks."""
-    await interaction.response.defer(ephemeral=ephemeral, thinking=True)
-    try:
-        content = await action()
-    except PermissionError:
-        content = "You do not have permission to change the tracker."
-    except Exception:
-        logger.exception("Slash command %s failed", label)
-        content = "The tracker could not complete that request. The error was logged."
-    await _send(interaction, content, ephemeral=ephemeral)
-
-
-def _async_value(value: str) -> Callable[[], Awaitable[str]]:
-    async def result() -> str:
-        return value
-
-    return result
