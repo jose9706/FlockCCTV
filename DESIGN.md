@@ -250,6 +250,7 @@ src/flock_cctv/
   stats.py           # Period boundaries, totals and records
   commands.py        # Slash commands and access checks
   jokes.py           # Templates
+  text.py            # Shared name, duration and local time formatting
   avatar.py          # Bot name, description and bundled avatar
   assets/avatar.jpg  # Flock camera profile picture
   evil.py            # Upside-down text and message splitting (Leland legacy)

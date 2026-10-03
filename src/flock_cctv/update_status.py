@@ -11,10 +11,10 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
+
+from .text import local_time
 
 STATUS_NAME = "update-status.json"
 READY_NAME = "bot-ready.json"
@@ -66,10 +66,9 @@ def request_update(database_path: Path, now: float | None = None) -> None:
 
 def _when(timestamp: Any, timezone: str) -> str:
     try:
-        local = datetime.fromtimestamp(float(timestamp), tz=ZoneInfo(timezone))
+        return local_time(float(timestamp), timezone)
     except (TypeError, ValueError, OverflowError):
         return "an unknown time"
-    return local.strftime("%b %-d, %Y %H:%M %Z")
 
 
 def _short(revision: Any) -> str:
