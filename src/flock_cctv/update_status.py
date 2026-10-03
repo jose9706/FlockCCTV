@@ -71,7 +71,7 @@ def _short(revision: Any) -> str:
 
 
 def status_line(status: dict[str, Any] | None, timezone: str) -> str:
-    """Summarize the last update check for ``/leland about``."""
+    """Summarize the last update check for ``/flock about``."""
     if status is None:
         return "Auto-update: **no status recorded** (the updater has not run since this was installed)."
     checked = _when(status.get("checked_at"), timezone)
@@ -108,10 +108,10 @@ def mark_alerted(status: dict[str, Any], database_path: Path) -> None:
 
 def alert_text(status: dict[str, Any], timezone: str) -> str:
     return (
-        "Leland Tracker automatic updates are failing.\n"
+        "Flock CCTV automatic updates are failing.\n"
         + status_line(status, timezone)
         + "\nOn the Pi: `sudo journalctl -u flock-cctv-update.service -n 100 --no-pager`. "
-        "You'll get one message per failure streak; `/leland about` shows the latest."
+        "You'll get one message per failure streak; `/flock about` shows the latest."
     )
 
 

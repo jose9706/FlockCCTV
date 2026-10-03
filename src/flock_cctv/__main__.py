@@ -1,4 +1,4 @@
-"""Command-line entry point for the Leland tracker bot."""
+"""Command-line entry point for the Flock CCTV bot."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ async def _run_bot(bot: object, token: str, *, stop_event: asyncio.Event | None 
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="flock-cctv", description="Run the Leland tracker bot.")
+    parser = argparse.ArgumentParser(prog="flock-cctv", description="Run the Flock CCTV bot.")
     parser.add_argument("--version", action="version", version=f"flock-cctv {version_string()}")
     parser.parse_args(argv)
     logging.basicConfig(

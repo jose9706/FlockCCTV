@@ -1,8 +1,8 @@
 [Unit]
-Description=Start a Leland Tracker update check when the bot requests one
+Description=Start a Flock CCTV update check when the bot requests one
 
 [Path]
-# Written by /leland update; the updater removes it when it starts.
+# Written by /flock update; the updater removes it when it starts.
 PathExists=/var/lib/flock-cctv/update-requested.json
 Unit=flock-cctv-update.service
 

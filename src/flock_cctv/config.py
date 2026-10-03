@@ -64,7 +64,6 @@ def _public_channel_ids(value: str | None) -> frozenset[int] | None:
 class Config:
     token: str = field(repr=False)
     guild_id: int
-    target_user_id: int
     owner_user_id: int
     output_channel_id: int | None
     text_channel_ids: frozenset[int] | None
@@ -76,6 +75,7 @@ class Config:
     public_report_channel_ids: frozenset[int] | None = frozenset()
     checkpoint_seconds: int = 60
     retention_days: int = 90
+    leland_user_id: int | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -86,11 +86,15 @@ class Config:
             raise ValueError("DISCORD_TOKEN is required and must not contain whitespace")
 
         guild_id = _positive_id(env.get("GUILD_ID"), "GUILD_ID")
-        target_user_id = _positive_id(env.get("TARGET_USER_ID"), "TARGET_USER_ID")
         owner_user_id = _positive_id(env.get("OWNER_USER_ID"), "OWNER_USER_ID")
         admin_user_ids = _user_ids(env.get("ADMIN_USER_IDS"), "ADMIN_USER_IDS")
-        if target_user_id == owner_user_id or target_user_id in admin_user_ids:
-            raise ValueError("TARGET_USER_ID cannot be a tracker admin")
+        # Optional: enables the legacy Leland-only features. A leftover
+        # TARGET_USER_ID from the single-target bot is deliberately ignored.
+        leland_user_id = _positive_id(env.get("LELAND_USER_ID"), "LELAND_USER_ID", optional=True)
+        if leland_user_id is not None and (
+            leland_user_id == owner_user_id or leland_user_id in admin_user_ids
+        ):
+            raise ValueError("LELAND_USER_ID cannot be a tracker admin")
         output_channel_id = _positive_id(
             env.get("OUTPUT_CHANNEL_ID"), "OUTPUT_CHANNEL_ID", optional=True
         )
@@ -118,7 +122,6 @@ class Config:
         return cls(
             token=token,
             guild_id=int(guild_id),
-            target_user_id=int(target_user_id),
             owner_user_id=int(owner_user_id),
             output_channel_id=output_channel_id,
             text_channel_ids=_channel_ids(env.get("TEXT_CHANNEL_IDS", "*"), "TEXT_CHANNEL_IDS"),
@@ -132,4 +135,5 @@ class Config:
                 env.get("CHECKPOINT_SECONDS"), "CHECKPOINT_SECONDS", 60
             ),
             retention_days=_positive_int(env.get("RETENTION_DAYS"), "RETENTION_DAYS", 90),
+            leland_user_id=leland_user_id,
         )

@@ -14,7 +14,6 @@ class ConfigTests(unittest.TestCase):
         env = {
             "DISCORD_TOKEN": "test.token.value",
             "GUILD_ID": "123456789",
-            "TARGET_USER_ID": "234567891",
             "OWNER_USER_ID": "345678912",
             "DATABASE_PATH": str(root / "data" / "tracker.sqlite3"),
             "BACKUP_DIR": str(root / "data" / "backups"),
@@ -28,7 +27,7 @@ class ConfigTests(unittest.TestCase):
                 config = Config.from_env()
 
         self.assertEqual(config.guild_id, 123456789)
-        self.assertEqual(config.target_user_id, 234567891)
+        self.assertIsNone(config.leland_user_id)
         self.assertEqual(config.owner_user_id, 345678912)
         self.assertEqual(config.admin_user_ids, frozenset())
         self.assertIsNone(config.text_channel_ids)
@@ -100,13 +99,17 @@ class ConfigTests(unittest.TestCase):
                 self._env(root, DISCORD_TOKEN=""),
                 self._env(root, DISCORD_TOKEN="has whitespace"),
                 self._env(root, GUILD_ID="0"),
-                self._env(root, TARGET_USER_ID="-1"),
+                self._env(root, LELAND_USER_ID="-1"),
+                self._env(root, LELAND_USER_ID="abc"),
+                self._env(root, LELAND_USER_ID="0"),
                 self._env(root, OWNER_USER_ID=""),
                 self._env(root, OWNER_USER_ID="nope"),
                 self._env(root, ADMIN_USER_IDS="12,"),
                 self._env(root, ADMIN_USER_IDS="-1"),
-                self._env(root, OWNER_USER_ID="234567891"),
-                self._env(root, ADMIN_USER_IDS="234567891"),
+                self._env(root, LELAND_USER_ID="345678912"),
+                self._env(root, LELAND_USER_ID="234567891", OWNER_USER_ID="234567891"),
+                self._env(root, LELAND_USER_ID="234567891", ADMIN_USER_IDS="234567891"),
+                self._env(root, LELAND_USER_ID="234567891", ADMIN_USER_IDS="1, 234567891"),
                 self._env(root, OUTPUT_CHANNEL_ID="nope"),
                 self._env(root, TIMEZONE="Mars/Olympus_Mons"),
                 self._env(root, CHECKPOINT_SECONDS="0"),
@@ -121,6 +124,55 @@ class ConfigTests(unittest.TestCase):
                     with self.subTest(values=values):
                         with self.assertRaises(ValueError):
                             Config.from_env()
+
+    def test_leland_user_id_is_optional_and_parsed(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for blank in ("", "   "):
+                with patch.dict(os.environ, self._env(root, LELAND_USER_ID=blank), clear=True):
+                    self.assertIsNone(Config.from_env().leland_user_id)
+            values = self._env(root, LELAND_USER_ID=" 234567891 ", ADMIN_USER_IDS="456")
+            with patch.dict(os.environ, values, clear=True):
+                self.assertEqual(Config.from_env().leland_user_id, 234567891)
+
+    def test_leland_user_id_cannot_be_a_tracker_admin(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for overrides in (
+                {"LELAND_USER_ID": "345678912"},  # the owner
+                {"LELAND_USER_ID": "456", "ADMIN_USER_IDS": "123,456"},
+            ):
+                with patch.dict(os.environ, self._env(root, **overrides), clear=True):
+                    with self.subTest(overrides=overrides):
+                        with self.assertRaisesRegex(
+                            ValueError, "LELAND_USER_ID cannot be a tracker admin"
+                        ):
+                            Config.from_env()
+
+    def test_leftover_target_user_id_is_ignored(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Even an invalid or admin-colliding legacy value has no effect.
+            for legacy in ("234567891", "345678912", "not-a-number", ""):
+                values = self._env(root, TARGET_USER_ID=legacy)
+                with patch.dict(os.environ, values, clear=True):
+                    with self.subTest(legacy=legacy):
+                        config = Config.from_env()
+                        self.assertIsNone(config.leland_user_id)
+                        self.assertFalse(hasattr(config, "target_user_id"))
+
+    def test_field_order_matches_the_spec(self):
+        from dataclasses import fields
+
+        self.assertEqual(
+            [item.name for item in fields(Config)],
+            [
+                "token", "guild_id", "owner_user_id", "output_channel_id",
+                "text_channel_ids", "voice_channel_ids", "timezone", "database_path",
+                "backup_dir", "admin_user_ids", "public_report_channel_ids",
+                "checkpoint_seconds", "retention_days", "leland_user_id",
+            ],
+        )
 
     def test_required_values_are_required(self):
         with patch.dict(os.environ, {"DISCORD_TOKEN": "token"}, clear=True):

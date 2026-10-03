@@ -1,5 +1,5 @@
 [Unit]
-Description=Poll for Leland Tracker updates
+Description=Poll for Flock CCTV updates
 
 [Timer]
 OnBootSec=10min

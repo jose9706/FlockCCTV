@@ -36,7 +36,7 @@ OUTPUT_TAIL_LINES = 40
 STATUS_NAME = "update-status.json"
 READY_NAME = "bot-ready.json"
 HOLD_NAME = ".flock-cctv.hold"
-# Written by the bot's /leland update; flock-cctv-update.path starts a poll.
+# Written by the bot's /flock update; flock-cctv-update.path starts a poll.
 REQUEST_NAME = "update-requested.json"
 READY_TIMEOUT_SECONDS = 180
 SETTLE_SECONDS = 15
@@ -158,7 +158,7 @@ class Updater:
         )
         (candidate / REVISION_FILE).write_text(revision + "\n", encoding="ascii")
         # Installed packages cannot see the tree they came from, so stamp the
-        # commit into the package for `--version` and `/leland about`.
+        # commit into the package for `--version` and `/flock about`.
         (candidate / BUILD_STAMP).write_text(f'REVISION = "{revision}"\n', encoding="ascii")
         if self.stage_user is not None:
             account = pwd.getpwnam(self.stage_user)
@@ -429,7 +429,7 @@ class Updater:
         failed_revision: str | None = None,
         attempted: bool = True,
     ) -> None:
-        """Write the outcome the bot shows in /leland about and alerts on.
+        """Write the outcome the bot shows in /flock about and alerts on.
 
         ``result`` is ``current``, ``updated``, ``held``, or ``failed``. A
         failure that was not attempted again keeps the streak's first time.

@@ -1,5 +1,5 @@
 [Unit]
-Description=Check for and install Leland Tracker updates
+Description=Check for and install Flock CCTV updates
 Wants=network-online.target
 After=network-online.target
 

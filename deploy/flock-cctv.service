@@ -1,5 +1,5 @@
 [Unit]
-Description=Leland Tracker Discord bot
+Description=Flock CCTV Discord bot
 Wants=network-online.target
 After=network-online.target
 

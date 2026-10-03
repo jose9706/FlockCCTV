@@ -7,6 +7,7 @@ uses the configured IANA timezone, including daylight-saving transitions.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from typing import Iterable
 from zoneinfo import ZoneInfo
 
 
@@ -145,12 +146,46 @@ def interval_overlap(start: float, end: float, window_start: float, window_end: 
     return max(0.0, min(end, window_end) - max(start, window_start))
 
 
+def merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Return sorted, non-overlapping half-open intervals; empty ones are dropped."""
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(item for item in intervals if item[1] > item[0]):
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def intersect_intervals(
+    first: Iterable[tuple[float, float]], second: Iterable[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Return the sorted overlap of two sets of half-open intervals."""
+    left = merge_intervals(first)
+    right = merge_intervals(second)
+    result: list[tuple[float, float]] = []
+    i = j = 0
+    while i < len(left) and j < len(right):
+        start = max(left[i][0], right[j][0])
+        end = min(left[i][1], right[j][1])
+        if end > start:
+            result.append((start, end))
+        if left[i][1] < right[j][1]:
+            i += 1
+        else:
+            j += 1
+    return result
+
+
 __all__ = [
     "get_timezone",
+    "intersect_intervals",
     "interval_overlap",
     "local_date",
     "local_day",
     "local_midnight",
+    "merge_intervals",
     "period_bounds",
     "previous_period_bounds",
     "split_interval_by_day",

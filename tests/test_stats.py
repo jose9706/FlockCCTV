@@ -4,8 +4,10 @@ import unittest
 from datetime import datetime, timezone
 
 from flock_cctv.stats import (
+    intersect_intervals,
     interval_overlap,
     local_day,
+    merge_intervals,
     period_bounds,
     previous_period_bounds,
     split_interval_by_day,
@@ -114,6 +116,25 @@ class DateHelpersTests(unittest.TestCase):
     def test_overlap_is_clipped_and_never_negative(self) -> None:
         self.assertEqual(interval_overlap(0, 10, 4, 14), 6)
         self.assertEqual(interval_overlap(0, 4, 5, 10), 0)
+
+    def test_merge_sorts_joins_overlaps_and_drops_empty_intervals(self) -> None:
+        self.assertEqual(
+            merge_intervals([(10, 20), (0, 5), (4, 8), (20, 25), (30, 30), (40, 35)]),
+            [(0, 8), (10, 25)],
+        )
+        self.assertEqual(merge_intervals([]), [])
+
+    def test_intersection_returns_only_shared_time(self) -> None:
+        self.assertEqual(
+            intersect_intervals([(0, 10), (20, 30)], [(5, 25), (28, 40)]),
+            [(5, 10), (20, 25), (28, 30)],
+        )
+        # Touching intervals share no time; unsorted input and open ends are fine.
+        self.assertEqual(intersect_intervals([(0, 5)], [(5, 10)]), [])
+        self.assertEqual(
+            intersect_intervals([(20, 30), (0, 10)], [(5, float("inf"))]), [(5, 10), (20, 30)]
+        )
+        self.assertEqual(intersect_intervals([], [(0, 10)]), [])
 
     def test_unknown_period_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
