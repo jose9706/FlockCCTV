@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flock-cctv"
+dynamic = ["version"]
+description = "Discord message and voice statistics for a shared friend server"
+requires-python = ">=3.11"
+dependencies = ["discord.py==2.7.1", "Pillow==12.3.0", "regex==2026.9.10"]
+
+[project.scripts]
+flock-cctv = "flock_cctv.__main__:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "flock_cctv.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

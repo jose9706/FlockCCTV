@@ -1,0 +1,15 @@
+# Runtime constraints tested on Debian 13, Python 3.13, aarch64.
+# Install with: python -m pip install -c requirements.lock -e .
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+attrs==26.1.0
+audioop-lts==0.2.2; python_version >= "3.13"
+discord.py==2.7.1
+frozenlist==1.8.0
+idna==3.20
+multidict==6.9.1
+Pillow==12.3.0
+propcache==0.5.4
+regex==2026.9.10
+yarl==1.25.1

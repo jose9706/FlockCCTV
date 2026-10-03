@@ -1,0 +1,27 @@
+[Unit]
+Description=Leland Tracker Discord bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=flock-cctv
+Group=flock-cctv
+WorkingDirectory=-/opt/flock-cctv
+EnvironmentFile=/etc/flock-cctv.env
+ExecStartPre=+/usr/bin/python3 /usr/local/libexec/flock-cctv-update.py --recover-only
+ExecStart=/opt/flock-cctv/.venv/bin/python -m flock_cctv
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=60s
+StateDirectory=flock-cctv
+StateDirectoryMode=0750
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/flock-cctv
+
+[Install]
+WantedBy=multi-user.target

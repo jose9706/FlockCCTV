@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for and install Leland Tracker updates
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# A read-only GitHub deploy key, pinned to GitHub's host keys; see README.
+Environment="GIT_SSH_COMMAND=ssh -i /etc/flock-cctv-deploy/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/flock-cctv-deploy/known_hosts"
+ExecStart=/usr/bin/python3 /usr/local/libexec/flock-cctv-update.py --repository git@github.com:jose9706/FlockCCTV.git
+TimeoutStartSec=0

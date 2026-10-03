@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll for Leland Tracker updates
+
+[Timer]
+OnBootSec=10min
+OnCalendar=*:0/15
+Persistent=true
+Unit=flock-cctv-update.service
+
+[Install]
+WantedBy=timers.target

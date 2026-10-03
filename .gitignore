@@ -1,0 +1,27 @@
+# Local credentials and runtime data
+.env
+.env.*
+!.env.example
+data/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3.lock
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Python environment and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+src/flock_cctv/_build.py
+.pytest_cache/
+.coverage
+htmlcov/
