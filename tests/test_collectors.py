@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import closing
 from datetime import datetime, timezone
 import json
@@ -8,7 +9,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from flock_cctv.collectors import Tracker
 from flock_cctv.config import Config
@@ -229,6 +230,38 @@ def roster(path: Path, user_id: int) -> list[int] | None:
 
 
 class CollectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recovery_waiting_for_lock_samples_time_with_snapshot(self):
+        for operation in ("ready", "guild_available"):
+            with self.subTest(operation=operation):
+                store = FakeStore()
+                tracker = Tracker(make_config(), store)
+                await tracker.gateway_ready()
+                await tracker._lock.acquire()
+                with patch("flock_cctv.collectors.time.time", return_value=180.0):
+                    recovering = asyncio.create_task(getattr(tracker, operation)({20: 40}))
+                    await asyncio.sleep(0)
+                with patch("flock_cctv.collectors.time.time", return_value=200.0):
+                    tracker._lock.release()
+                    await recovering
+                self.assertEqual(store.connections, [200.0])
+                self.assertEqual(store.transitions, [(20, 40, 200.0, False)])
+                self.assertFalse(await tracker.message(message(created=190.0)))
+
+    async def test_resume_waiting_for_lock_uses_actual_resume_boundary(self):
+        store = FakeStore(paused=True)
+        tracker = Tracker(make_config(), store)
+        await tracker.ready({}, now=150.0)
+        await tracker._lock.acquire()
+        with patch("flock_cctv.collectors.time.time", return_value=180.0):
+            resuming = asyncio.create_task(tracker.resume(99, {20: 40}))
+            await asyncio.sleep(0)
+        with patch("flock_cctv.collectors.time.time", return_value=200.0):
+            tracker._lock.release()
+            await resuming
+        self.assertEqual(store.transitions, [(20, 40, 200.0, False)])
+        self.assertFalse(await tracker.message(message(created=190.0)))
+        self.assertTrue(await tracker.message(message(created=201.0)))
+
     async def test_gateway_resume_continues_visit_with_real_store(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -363,6 +396,26 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.active_channels, {20: 40})
         self.assertEqual(store.transitions[-1], (20, 40, 300.0, False))
         self.assertEqual(store.operations[-3:], ["disconnect", "connect", "voice"])
+
+    async def test_voice_failure_with_failed_disconnect_blocks_checkpoints_until_retry(self):
+        store = RecoveringStore()
+        tracker = Tracker(make_config(), store)
+        await tracker.ready({20: 40}, now=150.0)
+        with patch("flock_cctv.collectors.time.time", return_value=170.0):
+            await tracker.checkpoint()
+        store.fail_next_disconnect = True
+        with patch.object(store, "voice_transition", new=AsyncMock(side_effect=OSError("disk"))):
+            with self.assertRaises(OSError):
+                await tracker.voice(member(20), in_channel(voice_channel(40, 20)), NO_CHANNEL)
+        self.assertFalse(tracker.collection_ready)
+        self.assertEqual(store.active_channels, {20: 40})
+        with patch("flock_cctv.collectors.time.time", return_value=300.0):
+            await tracker.checkpoint()
+        self.assertEqual(store.checkpoints, [170.0])
+        await tracker.guild_available({}, now=310.0)
+        self.assertTrue(tracker.collection_ready)
+        self.assertEqual(store.closed_voice, [(20, 40, 170.0)])
+        self.assertIsNone(tracker.last_error)
 
     async def test_voice_filters_guild_allowlist_and_afk_channel(self):
         store = FakeStore()
@@ -809,6 +862,56 @@ class MultiPersonStoreTests(unittest.IsolatedAsyncioTestCase):
     async def voice(self, now, who, before, after):
         with patch("flock_cctv.collectors.time.time", return_value=now):
             await self.tracker.voice(who, before, after)
+
+    async def test_failed_voice_leave_stops_credit_until_snapshot_recovery(self):
+        await self.tracker.ready({20: 40, 21: 40}, now=100.0)
+        with patch("flock_cctv.collectors.time.time", return_value=110.0):
+            await self.tracker.checkpoint()
+        with patch.object(self.store, "voice_transition", new=AsyncMock(side_effect=OSError("disk"))):
+            with self.assertRaises(OSError):
+                await self.voice(120.0, member(20), in_channel(voice_channel(40, 20, 21)), NO_CHANNEL)
+        self.assertFalse(self.tracker.collection_ready)
+        self.assertEqual(self.tracker.last_error, "voice collection failed (OSError)")
+        with patch("flock_cctv.collectors.time.time", return_value=130.0):
+            await self.tracker.checkpoint()
+        for user_id in (20, 21):
+            self.assertEqual((await self.store.stats(user_id, "all", 130.0))["voice_seconds"], 10.0)
+        await self.tracker.guild_available({21: 40}, now=140.0)
+        self.assertTrue(self.tracker.collection_ready)
+        self.assertIsNone(self.tracker.last_error)
+        self.assertEqual(roster(self.database, 21), [])
+        self.assertIsNone(roster(self.database, 20))
+        self.assertEqual((await self.store.stats(20, "all", 150.0))["voice_seconds"], 10.0)
+        self.assertEqual((await self.store.stats(21, "all", 150.0))["voice_seconds"], 20.0)
+
+    async def test_failed_untracked_companion_leave_stops_stale_roster_credit(self):
+        await self.tracker.ready({20: 40, 22: 40}, now=100.0)
+        with patch("flock_cctv.collectors.time.time", return_value=110.0):
+            await self.tracker.checkpoint()
+        with patch.object(self.store, "companion_transition", new=AsyncMock(side_effect=OSError("disk"))):
+            with self.assertRaises(OSError):
+                await self.voice(120.0, member(22), in_channel(voice_channel(40, 20, 22)), NO_CHANNEL)
+        self.assertFalse(self.tracker.collection_ready)
+        await self.tracker.guild_available({20: 40}, now=140.0)
+        self.assertEqual(roster(self.database, 20), [])
+        self.assertEqual((await self.store.stats(20, "all", 150.0))["voice_seconds"], 20.0)
+
+    async def test_pause_and_resume_after_voice_failure_reconcile_current_snapshot(self):
+        await self.tracker.ready({20: 40, 21: 40}, now=100.0)
+        with patch.object(self.store, "voice_transition", new=AsyncMock(side_effect=OSError("disk"))):
+            with self.assertRaises(OSError):
+                await self.voice(120.0, member(20), in_channel(voice_channel(40, 20, 21)), NO_CHANNEL)
+        with patch("flock_cctv.collectors.time.time", return_value=130.0):
+            await self.tracker.pause(99)
+        self.assertFalse(await self.tracker.message(message(created=135.0)))
+        with patch("flock_cctv.collectors.time.time", return_value=140.0):
+            await self.tracker.resume(99, {21: 40})
+        self.assertTrue(self.tracker.collection_ready)
+        self.assertIsNone(self.tracker.last_error)
+        self.assertIsNone(roster(self.database, 20))
+        self.assertEqual(roster(self.database, 21), [])
+        self.assertEqual((await self.store.stats(20, "all", 150.0))["voice_seconds"], 0.0)
+        self.assertEqual((await self.store.stats(21, "all", 150.0))["voice_seconds"], 10.0)
 
     async def test_two_tracked_people_in_one_channel_are_each_others_companions(self):
         await self.tracker.ready({}, now=100.0)

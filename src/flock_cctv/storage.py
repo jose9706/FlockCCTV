@@ -1001,7 +1001,7 @@ class Store:
 
             def action() -> tuple[bool, bool]:
                 settings = self._settings(conn)
-                if bool(settings["paused"]):
+                if bool(settings["paused"]) or not bool(settings["connected"]):
                     return False, False
                 person_start = self._collection_start(conn, user_text)
                 if person_start is None:
@@ -1758,9 +1758,12 @@ class Store:
                 day_end = local_midnight(day + timedelta(days=1), self.timezone)
                 series[day.isoformat()] = {
                     "day": day.isoformat(), "messages": 0, "voice_seconds": 0.0, "voice_visits": 0,
-                    # One second of slack absorbs float rounding at interval joins.
+                    # Allow only floating-point rounding, not short real gaps.
                     "watched": day_end <= now
-                    and watched.get(day.isoformat(), 0.0) >= day_end - day_start - 1.0,
+                    and math.isclose(
+                        watched.get(day.isoformat(), 0.0), day_end - day_start,
+                        rel_tol=0.0, abs_tol=1e-6,
+                    ),
                 }
                 day += timedelta(days=1)
             for row in conn.execute(
@@ -2074,12 +2077,22 @@ class Store:
         conn.execute("VACUUM")
 
     def _remove_managed_backups(self) -> None:
-        if not self.backup_dir.exists():
-            return
-        for path in self.backup_dir.iterdir():
+        if self.backup_dir.exists():
+            for path in self.backup_dir.iterdir():
+                if (
+                    path.is_file() or path.is_symlink()
+                ) and _is_managed_backup(path.name):
+                    path.unlink()
+        # An interrupted updater restore can leave a database snapshot beside
+        # the live database, outside BACKUP_DIR. Include both the former fixed
+        # name and the randomized temporary names used by current recovery.
+        restore_name = f"{self.path.name}.update-restore"
+        restore_prefix = f".{self.path.name}.update-restore-"
+        for path in self.path.parent.iterdir():
             if (
-                path.is_file() or path.is_symlink()
-            ) and _is_managed_backup(path.name):
+                path.name == restore_name
+                or (path.name.startswith(restore_prefix) and path.name.endswith(".tmp"))
+            ) and (path.is_file() or path.is_symlink()):
                 path.unlink()
 
     def _write_backup(self, conn: sqlite3.Connection, now: float) -> Path:

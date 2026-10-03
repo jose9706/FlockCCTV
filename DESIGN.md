@@ -293,6 +293,12 @@ historical daily totals are already grouped by that timezone.
   flag it incomplete. Never count the entire downtime as connected voice time.
 - A person's watched time is the collector's coverage intersected with their
   tracking intervals. Ghost days, weekday averages, and period comparisons use it.
+  Even a subsecond interruption makes an otherwise quiet day incompletely watched.
+- If a voice channel or companion update cannot be saved, stop collection and
+  close voice at reliable checkpoints. Reconcile the current voice snapshot
+  before collecting again, leaving the uncertain interval as missing coverage.
+- Controls and recovery snapshots use the time they acquire the collector lock,
+  so waiting commands cannot backdate resumed observation into paused or lost time.
 - On reconnect, reconcile current voice state for every tracked person. If someone
   is already connected, start an observed segment at that point; their original
   join time is unknown. The same applies to someone added while connected.

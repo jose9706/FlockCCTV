@@ -2044,6 +2044,100 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("busy", sent["content"])
         self.assertFalse(interaction.response.deferred)
 
+    async def test_controls_say_busy_before_acknowledgement_when_admin_lookup_stalls(self):
+        async def slow_override(user_id):
+            await asyncio.sleep(1)
+            return True
+
+        self.bot.store.admin_override = slow_override
+        self.bot.tracker.pause = AsyncMock()
+        interaction = FakeInteraction(user=SimpleNamespace(id=33))
+        with patch.object(commands_module, "_LOOKUP_TIMEOUT", 0.01):
+            await self.command("pause").callback(interaction)
+        self.assertTrue(interaction.response.sent[0]["ephemeral"])
+        self.assertIn("busy", interaction.response.sent[0]["content"])
+        self.assertFalse(interaction.response.deferred)
+        self.bot.tracker.pause.assert_not_awaited()
+
+    async def test_delete_confirmation_says_busy_when_admin_lookup_stalls(self):
+        async def slow_override(user_id):
+            await asyncio.sleep(1)
+            return True
+
+        self.bot.store.admin_override = slow_override
+        self.bot.tracker.delete_data = AsyncMock()
+        view = DeleteDataConfirmation(self.bot, invoker_id=33)
+        interaction = FakeInteraction(user=SimpleNamespace(id=33))
+        with patch.object(commands_module, "_LOOKUP_TIMEOUT", 0.01):
+            await view.children[0].callback(interaction)
+        self.assertIn("busy", interaction.response.sent[0]["content"])
+        self.assertTrue(interaction.response.sent[0]["ephemeral"])
+        self.assertFalse(view.is_finished())
+        self.bot.tracker.delete_data.assert_not_awaited()
+
+    async def test_permission_lookup_failure_is_logged_and_replies_privately(self):
+        self.bot.store.admin_override = AsyncMock(side_effect=RuntimeError("synthetic failure"))
+        self.bot.tracker.pause = AsyncMock()
+        interaction = FakeInteraction(user=SimpleNamespace(id=33))
+        with self.assertLogs("flock_cctv.commands", level="ERROR"):
+            await self.command("pause").callback(interaction)
+        self.assertEqual(interaction.response.sent[0]["content"], commands_module._FAILURE_TEXT)
+        self.assertTrue(interaction.response.sent[0]["ephemeral"])
+        self.bot.tracker.pause.assert_not_awaited()
+
+    async def test_cancel_during_deletion_reports_processing_instead_of_cancelled(self):
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def delete_data(actor_id):
+            started.set()
+            await release.wait()
+
+        self.bot.tracker.delete_data = AsyncMock(side_effect=delete_data)
+        view = DeleteDataConfirmation(self.bot, invoker_id=31)
+        confirmation = FakeInteraction(user=SimpleNamespace(id=31))
+        task = asyncio.create_task(view.children[0].callback(confirmation))
+        await started.wait()
+        try:
+            cancellation = FakeInteraction(user=SimpleNamespace(id=31))
+            await view.children[1].callback(cancellation)
+            self.assertIn("already being handled", cancellation.response.sent[0]["content"])
+            self.assertTrue(cancellation.response.sent[0]["ephemeral"])
+            self.assertFalse(view.is_finished())
+        finally:
+            release.set()
+            await task
+
+    async def test_cancel_while_confirmation_checks_access_prevents_deletion(self):
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def admin_override(user_id):
+            started.set()
+            await release.wait()
+            return True
+
+        self.bot.store.admin_override = admin_override
+        self.bot.tracker.delete_data = AsyncMock()
+        view = DeleteDataConfirmation(self.bot, invoker_id=33)
+        confirmation = FakeInteraction(user=SimpleNamespace(id=33))
+        task = asyncio.create_task(view.children[0].callback(confirmation))
+        await started.wait()
+        cancellation = FakeInteraction(user=SimpleNamespace(id=33))
+        await view.children[1].callback(cancellation)
+        release.set()
+        await task
+        self.assertEqual(cancellation.response.sent[0]["content"], "Data deletion cancelled.")
+        self.bot.tracker.delete_data.assert_not_awaited()
+
+    def test_trend_title_with_maximum_width_name_stays_inside_canvas(self):
+        png = commands_module._bar_panels_png(
+            "W" * 48 + "'s average day of the week — the last 7 days",
+            ["Mon"], [("Messages", [1.0], "#000000", "count")],
+        )
+        with Image.open(BytesIO(png)) as chart:
+            title_band = chart.convert("L").crop((0, 0, chart.width, 90))
+            self.assertEqual(min(title_band.crop((chart.width - 30, 0, chart.width, 90)).getdata()), 255)
+            self.assertLess(min(title_band.crop((36, 20, 400, 80)).getdata()), 100)
+
     async def test_deleted_companions_are_named_but_never_ranked(self):
         self.bot.get_guild = lambda guild_id: SimpleNamespace(
             get_member=lambda member_id: SimpleNamespace(display_name=f"P{member_id}")

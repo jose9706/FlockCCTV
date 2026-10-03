@@ -5,7 +5,7 @@ an admin-managed list of people and measures their observed time in configured
 voice channels. It stores statistics in SQLite and is designed to run as a
 systemd service on the Raspberry Pi. It requires Python 3.11 or newer; the
 pinned dependencies were checked on Debian 13, aarch64, with Python 3.13.
-This is release 1.0.0. It replaces the single-person Leland Tracker; existing
+This is release 1.0.1. It replaces the single-person Leland Tracker; existing
 Leland Tracker data moves over once with the import in
 [Migrating from Leland Tracker](#migrating-from-leland-tracker).
 
@@ -409,7 +409,9 @@ The two named copies above remain until overwritten or deleted. `/flock delete-d
 removes them, the daily backups, and temporary backup files along with the
 tracked statistics, whether it erases everyone's data or one person's, because
 every backup contains that person's data. Keep these exact filenames in
-`BACKUP_DIR` so they remain covered by deletion. Copies placed elsewhere are
+`BACKUP_DIR` so they remain covered by deletion. Deletion also removes abandoned
+updater restore snapshots beside the database: `<database-name>.update-restore`
+and `.<database-name>.update-restore-*.tmp`. Copies placed elsewhere are
 operator-managed and need separate deletion. Restoring a backup also restores
 the tracked list and each person's history as they were when it was taken.
 
@@ -521,6 +523,11 @@ it leaves the deletion in place and reports the rollback problem. A failed
 candidate may lose activity observed during its brief startup check when the
 pre-update database is restored.
 
+Rollback writes a unique temporary snapshot through its newly created file
+descriptor before replacing the database. A failed copy keeps the live
+database and its SQLite sidecars intact. Abandoned restore snapshots are
+covered by data deletion as described above.
+
 A root-owned pending record beside the installed tree lets the bot's startup
 helper recover an interrupted swap before the bot starts, including after a
 power loss. A bad network connection is retried on the next poll. A commit that
@@ -560,7 +567,7 @@ and the updater rolls back to the current code.
 The release number lives in `src/flock_cctv/__init__.py` (`__version__`,
 semantic versioning) and is bumped by hand in the pull request that changes
 behavior. The updater also stamps the deployed commit into the installed package,
-so the running version is `release (short commit)`, for example `1.0.0 (1a2b3c4)`:
+so the running version is `release (short commit)`, for example `1.0.1 (1a2b3c4)`:
 
 - `/flock version` replies privately with it; `/flock about` also shows it on its second line.
 - The service journal logs `Starting flock-cctv <version>` at every start.
@@ -690,7 +697,8 @@ today, this week, this month, or all time unless stated otherwise.
     week or month for long periods), busiest day, active-day streaks, and ghost
     days. A ghost day is a finished day the tracker watched in full, while the
     person was tracked, with no messages or voice; days it was disconnected or
-    paused, or the person was not tracked, are never ghost days.
+    paused, or the person was not tracked, are never ghost days, even when the
+    interruption lasts less than a second.
   - `compare`: this period so far against the previous day, week, 7 days, or month up
     to the same point, from retained detail. It declines for all time, when
     tracking began during the previous period, or when that period is older
@@ -737,9 +745,11 @@ today, this week, this month, or all time unless stated otherwise.
   Pausing and resuming apply to everyone.
 - `/flock delete-data user:` (or `user_id:` with an ID or mention, which also
   works after someone leaves the server) requires an ephemeral confirmation and
-  checks access again. Without either option it erases the statistics of
-  everyone and all managed local backups, then pauses collection; the tracked
-  list is kept, so everyone who was tracked starts a fresh history when
+  checks access again. Cancel works until deletion starts; once it is processing,
+  cancellation reports that it cannot stop the operation. Without either option
+  it erases everyone's statistics and all managed local backups, then pauses
+  collection; the tracked list is kept, so everyone who was tracked starts a
+  fresh history when
   collection resumes. With one it erases only that person's statistics and
   managed backups and removes them from the tracked list, while collection for
   everyone else continues. Time the erased person shared with others stays in

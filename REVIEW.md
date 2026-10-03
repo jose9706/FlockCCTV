@@ -20,6 +20,44 @@ Flock CCTV is built on. Each fix applies to every tracked person in Flock.
    If compaction fails, statistics remain deleted. After a global deletion
    collection remains paused; a per-person deletion never pauses collection.
 
+## Flock 1.0.1 review fixes
+
+The review covered collection and Gateway recovery, storage and measurement,
+command permissions and reports, deletion, imports, and deployment rollback.
+Regression tests use synthetic events and temporary databases.
+
+1. **Failed voice updates left stale activity accruing.** A failed channel or
+   companion transition now disables collection and closes voice conservatively.
+   Checkpoints and live reports stay disabled until cached snapshots reconcile.
+2. **Queued controls and recovery backdated observation.** Control and default
+   recovery timestamps are sampled after acquiring the collector lock, so waiting
+   resumes cannot count paused time and snapshots cannot backfill an outage.
+3. **Admin checks could miss Discord's acknowledgement window.** Permission
+   reads for controls and deletion confirmations now time out after two seconds,
+   returning a private busy reply; lookup errors also get a safe private reply.
+4. **Cancellation raced with deletion.** Confirmation and cancellation now
+   share state checks. A cancellation during permission lookup prevents deletion,
+   and an operation already processing cannot falsely report that it was cancelled.
+5. **Wide trend titles ran outside the image.** Titles use an ellipsis if they
+   still exceed the canvas at the minimum font size.
+6. **Storage accepted messages while disconnected.** Both ordinary message
+   insertion and reaction counting now require connected collection in storage,
+   as voice operations already did.
+7. **Short gaps could become quiet days.** Fully watched days no longer allow
+   a one-second coverage shortfall. Brief outages or untracked stretches remain
+   missing coverage and cannot produce ghost days or quiet-day averages.
+8. **Rollback followed a predictable temporary symlink.** Restoration now
+   writes through a newly created exclusive descriptor and only removes SQLite
+   sidecars once copying succeeds. Failed copies preserve the existing database.
+9. **Interrupted restores left undeleted snapshots.** Global and per-person
+   deletion now remove matching restore snapshots beside the database, including
+   the former fixed name, even when the backup directory is absent. Symlink
+   targets and unrelated files are preserved.
+
+The updater/recovery helper lives outside the automatically updated code tree.
+Reinstall `deploy/update.py` following the README update instructions to apply
+the rollback fix on an existing Pi.
+
 ## Current behavior checks
 
 - Guild, channel, and tracked-person filters apply before message and voice
@@ -56,7 +94,8 @@ Flock CCTV is built on. Each fix applies to every tracked person in Flock.
 
 ## Validation snapshot
 
-Validation snapshot: see the latest release notes.
+Flock 1.0.1: the full standard-library suite passes 354 tests, including the
+regressions above. `git diff --check` passes.
 
 The unit tests use fake events and a temporary database. They do not verify
 live Discord behavior: a live Gateway connection, server permissions,
