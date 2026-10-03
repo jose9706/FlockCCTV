@@ -68,6 +68,15 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.store.add_message(USER, 5, 30, stamp + 10))
         self.assertEqual((await self.store.stats(USER, "all", stamp + 11))["messages"], 3)
 
+    async def test_coverage_gap_seconds_totals_global_outages_through_now(self) -> None:
+        self.assertEqual(await self.store.coverage_gap_seconds(150.0), 0.0)
+        await self.store.connect(100.0)
+        await self.store.checkpoint(160.0)
+        await self.store.disconnect(200.0)  # Gap starts at the 160 checkpoint.
+        self.assertEqual(await self.store.coverage_gap_seconds(190.0), 30.0)
+        await self.store.connect(220.0)
+        self.assertEqual(await self.store.coverage_gap_seconds(500.0), 60.0)
+
     async def test_evil_mode_persists_and_deletion_disables_it(self) -> None:
         self.assertFalse((await self.store.state())["evil_mode"])
         await self.store.set_evil_mode(True)

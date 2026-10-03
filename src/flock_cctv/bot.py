@@ -82,9 +82,7 @@ class TrackerClient(discord.Client):
                 self.config.backup_dir,
                 self.config.timezone,
             )
-            await self.store.initialize(
-                time.time(), self.config.guild_id, self.config.target_user_id
-            )
+            await self.store.initialize(time.time(), self.config.guild_id)
             self.tracker = Tracker(self.config, self.store)
 
             # Import here so the adapter's configuration and storage tests can
@@ -141,10 +139,7 @@ class TrackerClient(discord.Client):
         if tracker.connected and not tracker.collection_ready and self.is_ready():
             guild = self.get_guild(self.config.guild_id)
             if guild is not None and not getattr(guild, "unavailable", False):
-                await tracker.guild_available(
-                    self.current_voice_channel_id(),
-                    companions=self.current_voice_companions(),
-                )
+                await tracker.guild_available(self.voice_snapshot())
         await tracker.checkpoint()
 
     async def _maintenance_loop(self) -> None:
@@ -197,17 +192,21 @@ class TrackerClient(discord.Client):
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except discord.Forbidden:
-            # Closed DMs will not open by retrying; /leland about still shows it.
+            # Closed DMs will not open by retrying; /flock about still shows it.
             logger.warning("Could not DM the owner about failing updates (DMs are closed)")
         await asyncio.to_thread(update_status.mark_alerted, status, database_path)
         logger.warning("Automatic updates are failing; the owner was notified")
 
     async def _sync_avatar(self) -> None:
-        """Mirror the target's current server avatar with inverted colours."""
+        """Mirror Leland's current server avatar with inverted colours (legacy)."""
+        leland_user_id = self.config.leland_user_id
         guild = self.get_guild(self.config.guild_id)
-        if guild is None or getattr(guild, "unavailable", False) or self.user is None:
+        if (
+            leland_user_id is None or guild is None
+            or getattr(guild, "unavailable", False) or self.user is None
+        ):
             return
-        member = await guild.fetch_member(self.config.target_user_id)
+        member = await guild.fetch_member(leland_user_id)
         asset = member.display_avatar.with_size(256)
         source_hash = hashlib.sha256(str(asset).encode("utf-8")).hexdigest()
         marker_path = self.config.database_path.with_name("avatar-source.json")
@@ -229,43 +228,41 @@ class TrackerClient(discord.Client):
             encoding="utf-8",
         )
         os.replace(temporary, marker_path)
-        logger.info("Updated the bot avatar from the configured user's current server avatar")
+        logger.info("Updated the bot avatar from the Leland user's current server avatar")
 
-    def current_voice_channel_id(self) -> int | None:
-        """Return the target's currently cached eligible channel, if known."""
+    def voice_snapshot(self) -> dict[int, int]:
+        """Map each non-bot member in an eligible cached voice channel to that channel.
+
+        Built from the cached guild's voice and stage channels. The AFK channel,
+        channels outside the ``VOICE_CHANNEL_IDS`` allowlist, channels that do
+        not belong to the configured guild, and bots are all excluded. An
+        unknown or unavailable guild yields an empty snapshot.
+        """
         guild = self.get_guild(self.config.guild_id)
         if guild is None or getattr(guild, "unavailable", False):
-            return None
-        member = guild.get_member(self.config.target_user_id)
-        if member is None:
-            return None
-        voice = getattr(member, "voice", None)
-        channel = getattr(voice, "channel", None)
-        if channel is None:
-            return None
-        channel_id = int(channel.id)
+            return {}
         afk_channel = getattr(guild, "afk_channel", None)
-        if afk_channel is not None and int(afk_channel.id) == channel_id:
-            return None
+        afk_id = int(afk_channel.id) if afk_channel is not None else None
         allowlist = self.config.voice_channel_ids
-        if allowlist is not None and channel_id not in allowlist:
-            return None
-        channel_guild = getattr(channel, "guild", None)
-        if channel_guild is not None and int(channel_guild.id) != self.config.guild_id:
-            return None
-        return channel_id
-
-    def current_voice_companions(self) -> frozenset[int]:
-        channel_id = self.current_voice_channel_id()
-        guild = self.get_guild(self.config.guild_id)
-        member = guild.get_member(self.config.target_user_id) if guild is not None else None
-        channel = getattr(getattr(member, "voice", None), "channel", None)
-        if channel_id is None or getattr(channel, "id", None) != channel_id:
-            return frozenset()
-        return frozenset(
-            peer.id for peer in getattr(channel, "members", ())
-            if peer.id != self.config.target_user_id and not peer.bot
-        )
+        snapshot: dict[int, int] = {}
+        channels = [
+            *getattr(guild, "voice_channels", ()),
+            *getattr(guild, "stage_channels", ()),
+        ]
+        for channel in channels:
+            channel_id = int(channel.id)
+            if channel_id == afk_id:
+                continue
+            if allowlist is not None and channel_id not in allowlist:
+                continue
+            channel_guild = getattr(channel, "guild", None)
+            if channel_guild is not None and int(channel_guild.id) != self.config.guild_id:
+                continue
+            for member in getattr(channel, "members", ()):
+                if getattr(member, "bot", False):
+                    continue
+                snapshot[int(member.id)] = channel_id
+        return snapshot
 
     async def _reconcile_gateway_ready(self) -> None:
         tracker = self.tracker
@@ -277,14 +274,16 @@ class TrackerClient(discord.Client):
         if guild is None or getattr(guild, "unavailable", False):
             return
         if not was_connected or not tracker.guild_is_available or not tracker.collection_ready:
-            await tracker.ready(
-                self.current_voice_channel_id(), companions=self.current_voice_companions()
-            )
+            await tracker.ready(self.voice_snapshot())
 
     async def on_ready(self) -> None:
         try:
             await self._reconcile_gateway_ready()
-            if self._avatar_task is None and not self._closing:
+            if (
+                self.config.leland_user_id is not None
+                and self._avatar_task is None
+                and not self._closing
+            ):
                 self._avatar_task = asyncio.create_task(
                     self._avatar_loop(), name="flock-cctv-avatar"
                 )
@@ -324,9 +323,7 @@ class TrackerClient(discord.Client):
         if tracker is None:
             return
         try:
-            await tracker.guild_available(
-                self.current_voice_channel_id(), companions=self.current_voice_companions()
-            )
+            await tracker.guild_available(self.voice_snapshot())
         except Exception:
             logger.exception("Could not reconcile collection after guild recovery")
 
@@ -361,9 +358,7 @@ class TrackerClient(discord.Client):
         if tracker is None:
             return
         try:
-            await tracker.guild_available(
-                self.current_voice_channel_id(), companions=self.current_voice_companions()
-            )
+            await tracker.guild_available(self.voice_snapshot())
         except Exception:
             logger.exception("Could not reconcile collection after joining configured guild")
 
@@ -372,15 +367,25 @@ class TrackerClient(discord.Client):
         inserted = False
         reaction_due = False
         ordinary = getattr(message, "type", discord.MessageType.default) == discord.MessageType.default
+        leland_user_id = self.config.leland_user_id
+        # Reactions and evil-mode reposts are legacy Leland features. Everyone
+        # else who is tracked is only counted.
+        from_leland = (
+            leland_user_id is not None
+            and getattr(getattr(message, "author", None), "id", None) == leland_user_id
+        )
         if tracker is not None:
             try:
-                inserted, reaction_due = await tracker.message_with_reaction(
-                    message, ordinary=ordinary
-                )
+                if from_leland:
+                    inserted, reaction_due = await tracker.message_with_reaction(
+                        message, ordinary=ordinary
+                    )
+                else:
+                    inserted = await tracker.message(message)
             except Exception:
                 # Never log message objects or their contents.
                 logger.exception("Message collection failed")
-        if inserted and ordinary:
+        if from_leland and inserted and ordinary:
             try:
                 if reaction_due:
                     await message.add_reaction(random.choice(("😂", "👸")))
@@ -400,6 +405,8 @@ class TrackerClient(discord.Client):
         await self._reply_to_mention(message)
 
     async def _reply_to_mention(self, message: discord.Message) -> None:
+        if self.config.leland_user_id is None:
+            return  # The fixed evil-Leland reply is a legacy feature.
         bot_user = self.user
         guild = getattr(message, "guild", None)
         author = getattr(message, "author", None)

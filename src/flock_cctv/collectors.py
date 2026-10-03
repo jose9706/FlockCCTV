@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,7 +41,13 @@ def _id(obj: Any) -> int | None:
 
 
 class Tracker:
-    """Serializes collector state and forwards eligible metadata to ``Store``."""
+    """Serializes collector state and forwards eligible metadata to ``Store``.
+
+    A *voice snapshot* is a mapping of member ID to the eligible voice channel
+    ID that member is currently in (allowlist applied, AFK excluded, bots left
+    out). The Discord adapter builds it; the tracker derives every tracked
+    person's companions from it.
+    """
 
     def __init__(self, config: Config, store: Store) -> None:
         self.config = config
@@ -53,6 +60,9 @@ class Tracker:
         self._lock = asyncio.Lock()
         self._collection_since: float | None = None
         self._shutdown = False
+        # Active tracked people. Refreshed from the Store whenever guild
+        # collection starts and after every track, untrack, or deletion.
+        self.tracked_ids: frozenset[int] = frozenset()
 
     def _record_error(self, operation: str, exc: BaseException) -> None:
         # Error text from a dependency can include implementation details. Keep
@@ -83,12 +93,37 @@ class Tracker:
         allowlist = self.config.voice_channel_ids
         return channel_id if allowlist is None or channel_id in allowlist else None
 
-    async def _start_guild_collection(
-        self, voice_channel_id: int | None, now: float, companions: frozenset[int]
+    async def _refresh_tracked(self) -> None:
+        self.tracked_ids = frozenset(await self.store.active_user_ids())
+
+    @staticmethod
+    def _snapshot_companions(
+        snapshot: Mapping[int, int], user_id: int, channel_id: int
+    ) -> frozenset[int]:
+        """Return the other members the snapshot places in ``channel_id``."""
+        return frozenset(
+            member_id for member_id, member_channel in snapshot.items()
+            if member_channel == channel_id and member_id != user_id
+        )
+
+    async def _start_visit_from_snapshot(
+        self, user_id: int, snapshot: Mapping[int, int], now: float
     ) -> None:
+        """Begin an incomplete-start visit when the snapshot places a person in voice."""
+        channel_id = self._eligible_voice_channel(snapshot.get(user_id))
+        if channel_id is None:
+            return
+        await self.store.voice_transition(
+            user_id, channel_id, now,
+            complete_start=False,
+            companions=self._snapshot_companions(snapshot, user_id, channel_id),
+        )
+
+    async def _start_guild_collection(self, snapshot: Mapping[int, int], now: float) -> None:
         self.collection_ready = False
         state = await self.store.state()
         self._collection_since = now
+        await self._refresh_tracked()
         if state["paused"]:
             self.collection_ready = True
             return
@@ -97,11 +132,8 @@ class Tracker:
         # span the outage when Store.connect sees it as already open.
         await self.store.disconnect(now)
         await self.store.connect(now)
-        channel_id = self._eligible_voice_channel(voice_channel_id)
-        if channel_id is not None:
-            await self.store.voice_transition(
-                channel_id, now, complete_start=False, companions=companions
-            )
+        for user_id in sorted(self.tracked_ids):
+            await self._start_visit_from_snapshot(user_id, snapshot, now)
         self.collection_ready = True
         self._recovered("disconnect")
         self._recovered("guild unavailable")
@@ -114,11 +146,8 @@ class Tracker:
             self.connected = True
             self._shutdown = False
 
-    async def ready(
-        self, voice_channel_id: int | None, now: float | None = None,
-        *, companions: frozenset[int] = frozenset(),
-    ) -> None:
-        """Handle the initial ready event or a fresh session for the target guild."""
+    async def ready(self, snapshot: Mapping[int, int], now: float | None = None) -> None:
+        """Handle the initial ready event or a fresh session for the configured guild."""
         current = self._now(now)
         async with self._lock:
             try:
@@ -126,7 +155,7 @@ class Tracker:
                 self._shutdown = False
                 self.guild_is_available = True
                 self.collection_ready = False
-                await self._start_guild_collection(voice_channel_id, current, companions)
+                await self._start_guild_collection(snapshot, current)
                 self._recovered("ready")
                 self._recovered("guild recovery")
             except Exception as exc:
@@ -134,8 +163,7 @@ class Tracker:
                 raise
 
     async def guild_available(
-        self, voice_channel_id: int | None, now: float | None = None,
-        *, companions: frozenset[int] = frozenset(),
+        self, snapshot: Mapping[int, int], now: float | None = None
     ) -> None:
         """Reconcile cached voice state when the configured guild returns."""
         current = self._now(now)
@@ -144,7 +172,7 @@ class Tracker:
                 was_available = self.guild_is_available
                 self.guild_is_available = True
                 if self.connected and (not was_available or not self.collection_ready):
-                    await self._start_guild_collection(voice_channel_id, current, companions)
+                    await self._start_guild_collection(snapshot, current)
                 self._recovered("guild recovery")
             except Exception as exc:
                 self._record_error("guild recovery", exc)
@@ -188,14 +216,18 @@ class Tracker:
                 raise
 
     async def message(self, message: Any) -> bool:
-        """Count one eligible message; return whether it was newly inserted."""
+        """Count one eligible message from a tracked person; return whether it was new."""
         inserted, _ = await self._message(message, reaction_eligible=False, ordinary=False)
         return inserted
 
     async def message_with_reaction(
         self, message: Any, *, ordinary: bool
     ) -> tuple[bool, bool]:
-        """Count a message and return whether a reaction is due for it."""
+        """Count a message and return whether a reaction is due for it.
+
+        The reaction countdown is the single global Leland-mode countdown, so
+        the adapter uses this only for ``Config.leland_user_id``.
+        """
         return await self._message(message, reaction_eligible=True, ordinary=ordinary)
 
     async def _message(
@@ -217,7 +249,7 @@ class Tracker:
             created_at = _timestamp(getattr(message, "created_at", None))
             if (
                 guild_id != self.config.guild_id
-                or _id(author) != self.config.target_user_id
+                or _id(author) not in self.tracked_ids
                 or message_id is None
                 or channel_id is None
                 or created_at is None
@@ -235,12 +267,18 @@ class Tracker:
                 )
                 if state["paused"] or created_at < boundary:
                     return False, False
+                author_id = _id(author)
                 if reaction_eligible:
                     result = await self.store.add_message_with_reaction(
-                        message_id, channel_id, created_at, ordinary=ordinary
+                        author_id, message_id, channel_id, created_at, ordinary=ordinary
                     )
                 else:
-                    result = await self.store.add_message(message_id, channel_id, created_at), False
+                    result = (
+                        await self.store.add_message(
+                            author_id, message_id, channel_id, created_at
+                        ),
+                        False,
+                    )
                 self._recovered("message collection")
                 return result
             except Exception as exc:
@@ -264,16 +302,18 @@ class Tracker:
             return None
         return self._eligible_voice_channel(channel_id)
 
-    def _companions(self, channel: Any) -> frozenset[int]:
+    @staticmethod
+    def _companions(channel: Any, member_id: int) -> frozenset[int]:
+        """Return the humans in ``channel`` other than ``member_id``."""
         return frozenset(
-            member_id for peer in getattr(channel, "members", ())
+            peer_id for peer in getattr(channel, "members", ())
             if not bool(getattr(peer, "bot", False))
-            if (member_id := _id(peer)) is not None
-            if member_id != self.config.target_user_id
+            if (peer_id := _id(peer)) is not None
+            if peer_id != member_id
         )
 
     async def voice(self, member: Any, before: Any, after: Any) -> None:
-        """Process target channel changes and peers entering or leaving it."""
+        """Process a member's channel change for them (if tracked) and for every roster."""
         async with self._lock:
             if (
                 self._shutdown
@@ -286,27 +326,32 @@ class Tracker:
             member_id = _id(member)
             if guild_id != self.config.guild_id or member_id is None:
                 return
+            # Bots are never tracked and never count as company.
+            if bool(getattr(member, "bot", False)):
+                return
             previous = self._channel_id_for_state(member, before)
             current_channel = self._channel_id_for_state(member, after)
             if previous == current_channel:
-                return
-            if member_id != self.config.target_user_id and bool(getattr(member, "bot", False)):
                 return
             try:
                 state = await self.store.state()
                 if state["paused"]:
                     return
                 now = time.time()
-                if member_id == self.config.target_user_id:
-                    companions = self._companions(getattr(after, "channel", None))
-                    await self.store.voice_transition(
-                        current_channel, now, companions=companions
+                if member_id in self.tracked_ids:
+                    companions = (
+                        self._companions(getattr(after, "channel", None), member_id)
+                        if current_channel is not None else frozenset()
                     )
-                else:
-                    if previous is not None:
-                        await self.store.companion_transition(previous, member_id, False, now)
-                    if current_channel is not None:
-                        await self.store.companion_transition(current_channel, member_id, True, now)
+                    await self.store.voice_transition(
+                        member_id, current_channel, now, companions=companions
+                    )
+                # Everyone else already in either channel gains or loses this
+                # member as company; the Store skips rosters that already match.
+                if previous is not None:
+                    await self.store.companion_transition(previous, member_id, False, now)
+                if current_channel is not None:
+                    await self.store.companion_transition(current_channel, member_id, True, now)
                 self._recovered("voice collection")
             except Exception as exc:
                 self._record_error("voice collection", exc)
@@ -343,10 +388,7 @@ class Tracker:
                 self._record_error("pause", exc)
                 raise
 
-    async def resume(
-        self, actor_id: int, voice_channel_id: int | None,
-        *, companions: frozenset[int] = frozenset(),
-    ) -> None:
+    async def resume(self, actor_id: int, snapshot: Mapping[int, int]) -> None:
         current = time.time()
         async with self._lock:
             try:
@@ -357,7 +399,7 @@ class Tracker:
                 self._collection_since = current
                 self.collection_ready = False
                 if self.connected and self.guild_is_available:
-                    await self._start_guild_collection(voice_channel_id, current, companions)
+                    await self._start_guild_collection(snapshot, current)
                 self._recovered("resume")
             except PermissionError:
                 raise
@@ -372,10 +414,79 @@ class Tracker:
                 await self.store.delete_data(actor_id, current)
                 self._collection_since = current
                 self.collection_ready = True
+                await self._refresh_tracked()
                 self._recovered("data deletion")
             except Exception as exc:
                 self._record_error("data deletion", exc)
                 raise
+
+    async def track_user(
+        self, user_id: int, actor_id: int, snapshot: Mapping[int, int]
+    ) -> bool:
+        """Start tracking a person; return False when they were already tracked.
+
+        If collection is live and the snapshot places the person in an eligible
+        channel, an incomplete-start visit begins at this moment: the bot did
+        not observe them joining.
+        """
+        current = time.time()
+        async with self._lock:
+            try:
+                added = await self.store.track_user(user_id, actor_id, current)
+                await self._refresh_tracked()
+                if added and self._collecting():
+                    state = await self.store.state()
+                    if not state["paused"]:
+                        await self._start_visit_from_snapshot(user_id, snapshot, current)
+                self._recovered("track user")
+                return added
+            except Exception as exc:
+                self._record_error("track user", exc)
+                raise
+
+    async def untrack_user(self, user_id: int, actor_id: int) -> bool:
+        """Stop tracking a person now; an open visit ends incomplete, history stays."""
+        current = time.time()
+        async with self._lock:
+            try:
+                removed = await self.store.untrack_user(user_id, actor_id, current)
+                await self._refresh_tracked()
+                self._recovered("untrack user")
+                return removed
+            except Exception as exc:
+                self._record_error("untrack user", exc)
+                raise
+
+    async def delete_user_data(self, user_id: int, actor_id: int) -> bool:
+        """Erase one person's data and untrack them; collection for others continues.
+
+        Deleting the configured Leland also switches the Leland-only evil and
+        reaction modes off, as global deletion does.
+        """
+        current = time.time()
+        async with self._lock:
+            try:
+                existed = await self.store.delete_user_data(
+                    user_id, actor_id, current,
+                    reset_legacy_modes=(
+                        self.config.leland_user_id is not None
+                        and user_id == self.config.leland_user_id
+                    ),
+                )
+                await self._refresh_tracked()
+                self._recovered("user data deletion")
+                return existed
+            except Exception as exc:
+                self._record_error("user data deletion", exc)
+                raise
+
+    def _collecting(self) -> bool:
+        return (
+            not self._shutdown
+            and self.connected
+            and self.guild_is_available
+            and self.collection_ready
+        )
 
     async def shutdown(self) -> None:
         """Close a cleanly observed visit and release the Store."""
@@ -388,8 +499,8 @@ class Tracker:
                     await self.store.checkpoint(current)
                 # Also retry closure after a prior disconnect failure. A process
                 # boundary ends coverage; keep any active visit incomplete so it
-                # cannot claim a longest-visit record when the target may still
-                # be connected.
+                # cannot claim a longest-visit record when a tracked person may
+                # still be connected.
                 await self.store.disconnect(current)
             except Exception as exc:
                 self._record_error("shutdown", exc)

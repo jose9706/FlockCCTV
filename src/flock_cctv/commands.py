@@ -8,6 +8,7 @@ import logging
 import math
 import re
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
@@ -34,17 +35,28 @@ PERIOD_CHOICES = [
     app_commands.Choice(name="This month", value="month"),
     app_commands.Choice(name="All time", value="all"),
 ]
+TOP_METRIC_CHOICES = [
+    app_commands.Choice(name="Messages", value="messages"),
+    app_commands.Choice(name="Voice time", value="voice"),
+    app_commands.Choice(name="Active days", value="active_days"),
+]
 # Trends default to a rolling window so early in the week the chart still has data.
 TREND_PERIOD_CHOICES = [app_commands.Choice(name="Last 7 days", value="last7"), *PERIOD_CHOICES]
 
 _ROAST_COOLDOWN = SharedRoastCooldown(seconds=30)
 _FAILURE_TEXT = "The tracker could not complete that request. The error was logged."
+_USER_OPTION = "Whose activity to show (defaults to you)"
 # Categorical palette in fixed slot order, validated for colour-vision deficiency.
 _PIE_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948")
 
 
 def _config(bot: Any) -> Any:
     return bot.config
+
+
+def _leland_id(bot: Any) -> int | None:
+    """The configured legacy Leland user, or ``None`` when Leland mode is off."""
+    return getattr(_config(bot), "leland_user_id", None)
 
 
 def _period_label(period: str) -> str:
@@ -133,7 +145,7 @@ async def _can_control(interaction: discord.Interaction, bot: Any) -> bool:
     user_id = interaction.user.id
     if user_id == config.owner_user_id:
         return True
-    if user_id == config.target_user_id:
+    if user_id == _leland_id(bot):
         return False
     override = await bot.store.admin_override(user_id)
     return user_id in config.admin_user_ids if override is None else override
@@ -191,13 +203,13 @@ async def _execute(
     await _send(interaction, content, ephemeral=ephemeral)
 
 
-async def _stats_text(bot: Any, period: str) -> str:
+async def _stats_text(bot: Any, person: _Person, period: str) -> str:
     now = time.time()
-    result = await _read_stats(bot, period, now)
+    result = await _read_stats(bot, person.user_id, period, now)
     timezone = bot.config.timezone
     label = _period_label(period)
     tracking_since = _local_time(result["tracking_since"], timezone, date_only=True)
-    lines = [f"**Leland's activity — {label}**"]
+    lines = [f"**The {person.safe} Report — {label}**"]
     if not any(
         (
             int(result.get("messages", 0) or 0) > 0,
@@ -233,23 +245,17 @@ async def _stats_text(bot: Any, period: str) -> str:
     return "\n".join(lines)
 
 
-async def _read_stats(bot: Any, period: str, now: float) -> dict[str, Any]:
-    tracker = bot.tracker
-    reliable = all(bool(getattr(tracker, name, True)) for name in (
-        "connected", "guild_is_available", "collection_ready"
-    ))
-    return await bot.store.stats(period, now, include_live=reliable)
+async def _read_stats(bot: Any, user_id: int, period: str, now: float) -> dict[str, Any]:
+    return await bot.store.stats(user_id, period, now, include_live=_collection_reliable(bot))
 
 
-async def _seen_text(bot: Any, interaction: discord.Interaction) -> str:
+async def _seen_text(bot: Any, interaction: discord.Interaction, person: _Person) -> str:
     now = time.time()
-    tracker = bot.tracker
-    reliable = all(bool(getattr(tracker, name, True)) for name in (
-        "connected", "guild_is_available", "collection_ready"
-    ))
-    observation = await bot.store.last_voice(now, include_live=reliable)
+    observation = await bot.store.last_voice(
+        person.user_id, now, include_live=_collection_reliable(bot)
+    )
     if observation is None:
-        return "I haven't observed Leland in a tracked voice channel yet."
+        return f"I haven't observed {person.safe} in a tracked voice channel yet."
 
     channel_id = int(observation["channel_id"])
     channel = bot.get_channel(channel_id)
@@ -270,15 +276,15 @@ async def _seen_text(bot: Any, interaction: discord.Interaction) -> str:
 
     if observation["current"]:
         since = _local_time(observation["observed_since"], bot.config.timezone)
-        return f"Leland is currently in {channel_label}. I've observed him there since {since}."
+        return f"{person.safe} is currently in {channel_label}. I've observed them there since {since}."
 
     seen_at = float(observation["seen_at"])
     elapsed = _duration(max(0.0, now - seen_at))
     date = _local_time(seen_at, bot.config.timezone)
-    return f"Leland was last seen in {channel_label} **{elapsed} ago** ({date})."
+    return f"{person.safe} was last seen in {channel_label} **{elapsed} ago** ({date})."
 
 
-def _pie_png(slices: list[tuple[str, float]]) -> bytes:
+def _pie_png(slices: list[tuple[str, float]], owner: str) -> bytes:
     image = Image.new("RGB", (1100, 640), "#ffffff")
     draw = ImageDraw.Draw(image)
     try:
@@ -289,7 +295,10 @@ def _pie_png(slices: list[tuple[str, float]]) -> bytes:
         title_font = ImageFont.load_default(size=38)
         label_font = ImageFont.load_default(size=32)
         detail_font = ImageFont.load_default(size=24)
-    draw.text((44, 28), "Leland's voice company", font=title_font, fill="#17212f")
+    title = f"{owner}'s voice company"
+    while len(title) > 1 and title_font.getlength(title) > 1100 - 2 * 44:
+        title = title[:-2] + "…"
+    draw.text((44, 28), title, font=title_font, fill="#17212f")
     total = sum(seconds for _, seconds in slices)
     angle = -90.0
     for index, (name, seconds) in enumerate(slices):
@@ -373,6 +382,116 @@ async def _admin_label(bot: Any, guild: Any, user_id: int) -> str:
     return _user_label(await _lookup_user(bot, guild, user_id), user_id)
 
 
+def _safe_name(name: str) -> str:
+    """Make a cleaned name safe to embed in Markdown text without pinging anyone."""
+    return discord.utils.escape_mentions(discord.utils.escape_markdown(name))
+
+
+@dataclass(frozen=True)
+class _Person:
+    """The tracked person a report is about, resolved from the ``user`` option."""
+
+    user_id: int
+    name: str  # cleaned display name; plain text, so only fit for images
+    active: bool  # currently on the tracked list
+    since: float  # when they were first tracked
+
+    @property
+    def safe(self) -> str:
+        """The display name escaped for Markdown and mentions."""
+        return _safe_name(self.name)
+
+    @property
+    def note(self) -> str:
+        """A line to add to reports about someone who is no longer tracked."""
+        if self.active:
+            return ""
+        return f"\n{self.safe} is no longer tracked; showing recorded history."
+
+
+def _person_name(user: Any, user_id: int) -> str:
+    return (
+        _clean_name(getattr(user, "display_name", None))
+        or _clean_name(getattr(user, "name", None))
+        or f"User {user_id}"
+    )
+
+
+async def _resolve_person(
+    interaction: discord.Interaction,
+    bot: Any,
+    label: str,
+    user: Any,
+    *,
+    require_active: bool = False,
+) -> _Person | None:
+    """Apply the scope check and look up the person a report is about.
+
+    Replies privately and returns ``None`` for a bot, someone who was never
+    tracked, or (with ``require_active``) someone no longer tracked. The reply
+    is private whatever the channel, so it must happen before the report defers.
+    """
+    if not await _scope_ok(interaction, bot):
+        return None
+    target = interaction.user if user is None else user
+    if getattr(target, "bot", False):
+        await _send(interaction, "Bots aren't tracked.", ephemeral=True)
+        return None
+    user_id = int(target.id)
+    name = _person_name(target, user_id)
+    try:
+        rows = await bot.store.tracked_users()
+    except Exception:
+        logger.exception("Slash command %s failed", label)
+        await _send(interaction, _FAILURE_TEXT, ephemeral=True)
+        return None
+    row = next((item for item in rows if int(item["user_id"]) == user_id), None)
+    if row is None:
+        await _send(
+            interaction,
+            f"{_safe_name(name)} isn't tracked. An admin can add them with `/flock track add`.",
+            ephemeral=True,
+        )
+        return None
+    if require_active and not row["active"]:
+        await _send(
+            interaction,
+            f"{_safe_name(name)} is no longer tracked. An admin can add them again with `/flock track add`.",
+            ephemeral=True,
+        )
+        return None
+    return _Person(user_id, name, bool(row["active"]), float(row["tracking_since"]))
+
+
+async def _deliver(
+    interaction: discord.Interaction,
+    bot: Any,
+    label: str,
+    person: _Person,
+    action: Callable[[], Awaitable[str | tuple[str, bytes | None]]],
+    *,
+    ephemeral: bool,
+    filename: str = "chart.png",
+) -> None:
+    """Defer, run a report for ``person``, and reply with its text and optional chart.
+
+    The scope check and person lookup have already happened. A person who is no
+    longer tracked gets a note appended to the report.
+    """
+    await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+    file = None
+    try:
+        result = await action()
+        content, png = result if isinstance(result, tuple) else (result, None)
+        content += person.note
+        if png:
+            file = discord.File(BytesIO(png), filename=filename)
+    except Exception:
+        logger.exception("Slash command %s failed", label)
+        content, file = _FAILURE_TEXT, None
+    await _send(interaction, content, ephemeral=ephemeral, file=file)
+
+
 def _visible_company_rows(
     bot: Any, interaction: discord.Interaction, rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -396,17 +515,15 @@ def _visible_company_rows(
 
 
 async def _company_seconds(
-    bot: Any, interaction: discord.Interaction, period: str, field: str = "seconds"
+    bot: Any, interaction: discord.Interaction, person: _Person, period: str, field: str = "seconds"
 ) -> dict[int, float]:
     """Return seconds by peer (0 means alone) in channels the audience can view.
 
     ``field`` is ``seconds`` for the even split or ``full_seconds`` for whole shared time.
     """
-    tracker = bot.tracker
-    reliable = all(bool(getattr(tracker, name, True)) for name in (
-        "connected", "guild_is_available", "collection_ready"
-    ))
-    rows = await bot.store.company_totals(period, time.time(), include_live=reliable)
+    rows = await bot.store.company_totals(
+        person.user_id, period, time.time(), include_live=_collection_reliable(bot)
+    )
     seconds_by_member: dict[int, float] = {}
     for row in _visible_company_rows(bot, interaction, rows):
         seconds = float(row.get(field, 0.0))
@@ -418,15 +535,15 @@ async def _company_seconds(
 
 
 async def _company_report(
-    bot: Any, interaction: discord.Interaction, period: str
+    bot: Any, interaction: discord.Interaction, person: _Person, period: str
 ) -> tuple[str, bytes | None]:
-    seconds_by_member = await _company_seconds(bot, interaction, period)
+    seconds_by_member = await _company_seconds(bot, interaction, person, period)
 
     label = _period_label(period)
     if not seconds_by_member:
         return (
-            f"No companion time has been observed for {label} in voice channels visible to this report. "
-            "Companion tracking starts with this update; earlier voice time cannot be reconstructed.",
+            f"No companion time has been observed for {person.safe} {label} in voice channels visible to this report. "
+            "Only time observed with companion tracking is included; earlier voice time cannot be reconstructed.",
             None,
         )
     ranked_peers = sorted(
@@ -447,7 +564,7 @@ async def _company_report(
     slices = [(name, seconds) for name, (_, seconds) in zip(names, top)]
     total = sum(seconds_by_member.values())
     lines = [
-        f"**Leland's voice company — {label}**",
+        f"**{person.safe}'s voice company — {label}**",
         f"Observed time in visible channels: **{_duration(total)}**.",
     ]
     for index, (name, seconds) in enumerate(slices):
@@ -459,16 +576,18 @@ async def _company_report(
         "Each shared minute is split evenly among the people present; time alone has its own slice. "
         "Only observed time since companion tracking began is included."
     )
-    return "\n".join(lines), _pie_png(slices)
+    return "\n".join(lines), _pie_png(slices, person.name)
 
 
 _LEADERBOARD_SIZE = 10
 _LEADERBOARD_MEDALS = ("🥇", "🥈", "🥉")
 
 
-async def _leaderboard_text(bot: Any, interaction: discord.Interaction, period: str) -> str:
-    """Rank people by the whole voice time they shared with Leland."""
-    full_by_member = await _company_seconds(bot, interaction, period, "full_seconds")
+async def _leaderboard_text(
+    bot: Any, interaction: discord.Interaction, person: _Person, period: str
+) -> str:
+    """Rank people by the whole voice time they shared with ``person``."""
+    full_by_member = await _company_seconds(bot, interaction, person, period, "full_seconds")
     label = _period_label(period)
     ranked = sorted(
         ((member_id, seconds) for member_id, seconds in full_by_member.items() if member_id != 0),
@@ -476,13 +595,13 @@ async def _leaderboard_text(bot: Any, interaction: discord.Interaction, period: 
     )
     if not ranked:
         return (
-            f"No time with other people has been observed for {label} in voice channels visible to this report. "
+            f"No time with other people has been observed for {person.safe} {label} in voice channels visible to this report. "
             "Only observed time since companion tracking began is counted."
         )
     top = ranked[:_LEADERBOARD_SIZE]
     guild = bot.get_guild(bot.config.guild_id)
     names = await asyncio.gather(*(_company_name(bot, guild, member_id) for member_id, _ in top))
-    lines = [f"**Leland's voice leaderboard — {label}**"]
+    lines = [f"**{person.safe}'s voice leaderboard — {label}**"]
     for index, (name, (_, seconds)) in enumerate(zip(names, top)):
         rank = _LEADERBOARD_MEDALS[index] if index < len(_LEADERBOARD_MEDALS) else f"{index + 1}."
         safe_name = discord.utils.escape_mentions(discord.utils.escape_markdown(name))
@@ -492,9 +611,9 @@ async def _leaderboard_text(bot: Any, interaction: discord.Interaction, period: 
     if full_by_member.get(0, 0.0) > 0:
         lines.append(f"Time alone (not ranked): {_duration(full_by_member[0])}.")
     lines.append(
-        "Each person gets the whole time they were in a tracked voice channel with Leland, so "
+        f"Each person gets the whole time they were in a tracked voice channel with {person.safe}, so "
         "group calls count fully for everyone. Time recorded before that change counts as its "
-        "even split, as in `/leland company`."
+        "even split, as in `/flock company`."
     )
     return "\n".join(lines)
 
@@ -870,7 +989,7 @@ TREND_CHOICES = [
 ]
 
 
-def _daily_trend(series: list[dict[str, Any]], label: str) -> tuple[str, bytes]:
+def _daily_trend(series: list[dict[str, Any]], label: str, person: _Person) -> tuple[str, bytes]:
     unit, labels, messages, voice = _bucket_series(series)
     busiest = max(series, key=lambda entry: (int(entry["messages"]), float(entry["voice_seconds"])))
     active = sum(1 for entry in series if _is_active(entry))
@@ -878,7 +997,7 @@ def _daily_trend(series: list[dict[str, Any]], label: str) -> tuple[str, bytes]:
     longest, current = _streaks(series)
     ghosts, ghost_run, ghost_start, ghost_end = _ghost_days(series)
     lines = [
-        f"**Leland's day-by-day trend — {label}**",
+        f"**{person.safe}'s day-by-day trend — {label}**",
         f"Busiest day: **{_short_day(busiest['day'])}** — {int(busiest['messages']):,} messages, "
         f"{_duration(float(busiest['voice_seconds']))} in voice.",
         f"Active days: **{active}** of {observed} observed "
@@ -900,7 +1019,7 @@ def _daily_trend(series: list[dict[str, Any]], label: str) -> tuple[str, bytes]:
     if unit != "day":
         lines.append(f"The chart groups days by {unit} so the bars stay readable.")
     png = _bar_panels_png(
-        f"Leland's activity per {unit} — {label}",
+        f"{person.name}'s activity per {unit} — {label}",
         labels,
         [
             (f"Messages per {unit}", messages, _PIE_COLORS[0], "count"),
@@ -910,7 +1029,7 @@ def _daily_trend(series: list[dict[str, Any]], label: str) -> tuple[str, bytes]:
     return "\n".join(lines), png
 
 
-def _weekday_trend(series: list[dict[str, Any]], label: str) -> tuple[str, bytes]:
+def _weekday_trend(series: list[dict[str, Any]], label: str, person: _Person) -> tuple[str, bytes]:
     occurrences = [0] * 7
     messages = [0.0] * 7
     voice = [0.0] * 7
@@ -925,7 +1044,7 @@ def _weekday_trend(series: list[dict[str, Any]], label: str) -> tuple[str, bytes
     avg_voice = [total / count if count else 0.0 for total, count in zip(voice, occurrences)]
     chattiest = max(range(7), key=lambda day: (avg_messages[day], -day))
     loudest = max(range(7), key=lambda day: (avg_voice[day], -day))
-    lines = [f"**Leland's week pattern — {label}**"]
+    lines = [f"**{person.safe}'s week pattern — {label}**"]
     if avg_messages[chattiest] > 0:
         lines.append(
             f"Chattiest day: **{_WEEKDAY_NAMES[chattiest]}** — {avg_messages[chattiest]:.1f} messages on average."
@@ -941,7 +1060,7 @@ def _weekday_trend(series: list[dict[str, Any]], label: str) -> tuple[str, bytes
     if sum(occurrences) < 14:
         lines.append("Each weekday appears at most twice here; a longer period gives a fairer pattern.")
     png = _bar_panels_png(
-        f"Leland's average day of the week — {label}",
+        f"{person.name}'s average day of the week — {label}",
         list(_WEEKDAYS),
         [
             ("Average messages per day", avg_messages, _PIE_COLORS[0], "average"),
@@ -952,7 +1071,7 @@ def _weekday_trend(series: list[dict[str, Any]], label: str) -> tuple[str, bytes
 
 
 def _hour_trend(
-    messages: dict[str, Any], voice: dict[str, Any], label: str, timezone: str
+    messages: dict[str, Any], voice: dict[str, Any], label: str, timezone: str, person: _Person
 ) -> tuple[str, bytes | None]:
     zone = ZoneInfo(timezone)
     message_hours = [0.0] * 24
@@ -962,7 +1081,7 @@ def _hour_trend(
     message_total, voice_total = sum(message_hours), sum(voice_hours)
     if message_total == 0 and voice_total == 0:
         return f"No messages or voice time with retained times have been recorded for {label}.", None
-    lines = [f"**Leland's clock — {label}**"]
+    lines = [f"**{person.safe}'s clock — {label}**"]
     if message_total:
         peak = max(range(24), key=lambda hour: (message_hours[hour], -hour))
         lines.append(
@@ -986,7 +1105,7 @@ def _hour_trend(
     if note:
         lines.append(note)
     png = _bar_panels_png(
-        f"Leland by hour of day — {label}",
+        f"{person.name} by hour of day — {label}",
         [f"{hour:02d}" for hour in range(24)],
         [
             ("Messages by hour", message_hours, _PIE_COLORS[0], "count"),
@@ -1005,7 +1124,9 @@ def _change(current: float, previous: float) -> str:
     return f"{'up' if ratio > 0 else 'down'} {abs(ratio):.0%}"
 
 
-def _compare_trend(result: dict[str, Any], period: str, label: str) -> tuple[str, bytes | None]:
+def _compare_trend(
+    result: dict[str, Any], period: str, label: str, person: _Person
+) -> tuple[str, bytes | None]:
     previous = result["previous"]
     if previous is None:
         reason = result.get("reason")
@@ -1025,7 +1146,7 @@ def _compare_trend(result: dict[str, Any], period: str, label: str) -> tuple[str
     current = result["current"]
     previous_label = _PREVIOUS_LABELS[period]
     lines = [
-        f"**Leland vs {previous_label} — {label} so far**",
+        f"**{person.safe} vs {previous_label} — {label} so far**",
         f"Compared with {previous_label} up to the same point.",
         f"Messages: **{current['messages']:,}** vs {previous['messages']:,} "
         f"({_change(current['messages'], previous['messages'])}).",
@@ -1047,7 +1168,7 @@ def _compare_trend(result: dict[str, Any], period: str, label: str) -> tuple[str
         )
     names = [previous_label.capitalize(), f"{label.capitalize()}"]
     png = _bar_panels_png(
-        f"Leland vs {previous_label} — same point in time",
+        f"{person.name} vs {previous_label} — same point in time",
         names,
         [
             ("Messages", [float(previous["messages"]), float(current["messages"])], _PIE_COLORS[0], "count"),
@@ -1074,7 +1195,9 @@ def _bursts(times: list[float]) -> list[tuple[float, float, int]]:
     return bursts
 
 
-def _burst_trend(result: dict[str, Any], label: str, timezone: str) -> tuple[str, bytes | None]:
+def _burst_trend(
+    result: dict[str, Any], label: str, timezone: str, person: _Person
+) -> tuple[str, bytes | None]:
     bursts = _bursts(sorted(float(value) for value in result["times"]))
     if not bursts:
         return f"No messages with retained send times have been recorded for {label}.", None
@@ -1082,7 +1205,7 @@ def _burst_trend(result: dict[str, Any], label: str, timezone: str) -> tuple[str
     biggest = max(bursts, key=lambda burst: (burst[2], -burst[0]))
     rapid = sum(count for _, _, count in bursts if count >= 5)
     lines = [
-        f"**Leland's message bursts — {label}**",
+        f"**{person.safe}'s message bursts — {label}**",
         f"Biggest burst: **{biggest[2]:,} messages** in {_duration(biggest[1] - biggest[0])} "
         f"({_local_time(biggest[0], timezone)}).",
         f"Average burst: **{total / len(bursts):.1f} messages** across {len(bursts):,} bursts.",
@@ -1097,7 +1220,7 @@ def _burst_trend(result: dict[str, Any], label: str, timezone: str) -> tuple[str
         for low, high, _ in _BURST_BINS
     ]
     png = _bar_panels_png(
-        f"Leland's burst sizes — {label}",
+        f"{person.name}'s burst sizes — {label}",
         [name for _, _, name in _BURST_BINS],
         [("Bursts, by messages in each burst", counts, _PIE_COLORS[0], "count")],
     )
@@ -1105,14 +1228,16 @@ def _burst_trend(result: dict[str, Any], label: str, timezone: str) -> tuple[str
 
 
 async def _company_trend(
-    bot: Any, interaction: discord.Interaction, period: str, label: str
+    bot: Any, interaction: discord.Interaction, person: _Person, period: str, label: str
 ) -> tuple[str, bytes | None]:
     now = time.time()
-    rows = await bot.store.company_daily(period, now, include_live=_collection_reliable(bot))
+    rows = await bot.store.company_daily(
+        person.user_id, period, now, include_live=_collection_reliable(bot)
+    )
     rows = _visible_company_rows(bot, interaction, rows)
     if not rows:
         return (
-            f"No companion time has been observed for {label} in voice channels visible to this report.",
+            f"No companion time has been observed for {person.safe} {label} in voice channels visible to this report.",
             None,
         )
     # Buckets run from the first day with company data, which started with that feature.
@@ -1151,7 +1276,7 @@ async def _company_trend(
     guild = bot.get_guild(bot.config.guild_id)
     names = await asyncio.gather(*(_company_name(bot, guild, member_id) for member_id in named))
     name_of = dict(zip(named, names))
-    lines = [f"**Leland's company over time — {label}**"]
+    lines = [f"**{person.safe}'s company over time — {label}**"]
     lines.append(f"Top companion each {unit} (most recent last):")
     for index, key in recent:
         best = winners[index]
@@ -1167,7 +1292,7 @@ async def _company_trend(
         "companion tracking began is included."
     )
     png = _stacked_png(
-        f"Leland's company per {unit} — {label}",
+        f"{person.name}'s company per {unit} — {label}",
         f"Observed voice time per {unit}, by companion",
         [_bucket_label(key, unit, day_count) for key in keys],
         [
@@ -1179,72 +1304,73 @@ async def _company_trend(
 
 
 async def _trend_report(
-    bot: Any, interaction: discord.Interaction, period: str, kind: str
+    bot: Any, interaction: discord.Interaction, person: _Person, period: str, kind: str
 ) -> tuple[str, bytes | None]:
     now = time.time()
     label = _period_label(period)
     timezone = bot.config.timezone
     reliable = _collection_reliable(bot)
+    user_id = person.user_id
     if kind == "hours":
-        messages = await bot.store.message_times(period, now)
-        voice = await bot.store.voice_hours(period, now, include_live=reliable)
-        return _hour_trend(messages, voice, label, timezone)
+        messages = await bot.store.message_times(user_id, period, now)
+        voice = await bot.store.voice_hours(user_id, period, now, include_live=reliable)
+        return _hour_trend(messages, voice, label, timezone, person)
     if kind == "bursts":
-        return _burst_trend(await bot.store.message_times(period, now), label, timezone)
+        return _burst_trend(
+            await bot.store.message_times(user_id, period, now), label, timezone, person
+        )
     if kind == "compare":
         return _compare_trend(
-            await bot.store.period_comparison(period, now, include_live=reliable), period, label
+            await bot.store.period_comparison(user_id, period, now, include_live=reliable),
+            period, label, person,
         )
     if kind == "company":
-        return await _company_trend(bot, interaction, period, label)
-    series = await bot.store.daily_trend(period, now, include_live=reliable)
+        return await _company_trend(bot, interaction, person, period, label)
+    series = await bot.store.daily_trend(user_id, period, now, include_live=reliable)
     if not any(_is_active(entry) for entry in series):
         return f"No activity has been recorded for {label}, so there is no trend to chart.", None
     if kind == "weekdays":
-        return _weekday_trend(series, label)
-    return _daily_trend(series, label)
+        return _weekday_trend(series, label, person)
+    return _daily_trend(series, label, person)
 
 
-async def _online_text(bot: Any) -> str:
-    """Request the target's current guild presence without keeping a history."""
+async def _online_text(bot: Any, person: _Person) -> str:
+    """Request a person's current guild presence without keeping a history."""
     guild = bot.get_guild(bot.config.guild_id)
     if guild is None or getattr(guild, "unavailable", False):
-        return "I can't check Leland's Discord status while the server is unavailable."
+        return f"I can't check {person.safe}'s Discord status while the server is unavailable."
     try:
         members = await asyncio.wait_for(
-            guild.query_members(
-                user_ids=[bot.config.target_user_id], presences=True, cache=False
-            ),
+            guild.query_members(user_ids=[person.user_id], presences=True, cache=False),
             timeout=10,
         )
     except (TimeoutError, discord.ClientException):
-        return "I couldn't check Leland's Discord status right now. Try again shortly."
-    member = next((item for item in members if item.id == bot.config.target_user_id), None)
+        return f"I couldn't check {person.safe}'s Discord status right now. Try again shortly."
+    member = next((item for item in members if item.id == person.user_id), None)
     if member is None:
-        return "I couldn't find Leland in this server to check his Discord status."
+        return f"I couldn't find {person.safe} in this server to check their Discord status."
     status = member.status
     if status == discord.Status.online:
-        return "Leland is online right now."
+        return f"{person.safe} is online right now."
     if status == discord.Status.idle:
-        return "Leland is online (away) right now."
+        return f"{person.safe} is online (away) right now."
     if status == discord.Status.dnd:
-        return "Leland is online (Do Not Disturb) right now."
+        return f"{person.safe} is online (Do Not Disturb) right now."
     if status in (discord.Status.offline, discord.Status.invisible):
-        return "Leland appears offline or invisible right now."
-    return "I couldn't determine Leland's Discord status right now."
+        return f"{person.safe} appears offline or invisible right now."
+    return f"I couldn't determine {person.safe}'s Discord status right now."
 
 
-async def _records_text(bot: Any, interaction: discord.Interaction) -> str:
+async def _records_text(bot: Any, interaction: discord.Interaction, person: _Person) -> str:
     now = time.time()
-    tracker = bot.tracker
-    reliable = all(bool(getattr(tracker, name, True)) for name in (
-        "connected", "guild_is_available", "collection_ready"
-    ))
-    records = await bot.store.records(now, include_live=reliable)
+    records = await bot.store.records(person.user_id, now, include_live=_collection_reliable(bot))
     state = await bot.store.state()
     timezone = bot.config.timezone
-    started = _local_time(state["tracking_since"], timezone, date_only=True)
-    lines = ["**Leland's personal records**", f"Measurement period: since {started} ({timezone})."]
+    # A person's clock starts when both the database and their tracking began.
+    started = _local_time(
+        max(float(state["tracking_since"]), person.since), timezone, date_only=True
+    )
+    lines = [f"**{person.safe}'s personal records**", f"Measurement period: since {started} ({timezone})."]
 
     busiest_day = records.get("busiest_day")
     busiest_messages = int(records.get("busiest_day_messages", 0) or 0)
@@ -1265,15 +1391,13 @@ async def _records_text(bot: Any, interaction: discord.Interaction) -> str:
         has_record = True
     peers = [
         (member_id, seconds)
-        for member_id, seconds in (await _company_seconds(bot, interaction, "all")).items()
+        for member_id, seconds in (await _company_seconds(bot, interaction, person, "all")).items()
         if member_id != 0
     ]
     if peers:
         member_id, seconds = min(peers, key=lambda item: (-item[1], item[0]))
         guild = bot.get_guild(bot.config.guild_id)
-        name = discord.utils.escape_mentions(
-            discord.utils.escape_markdown(await _company_name(bot, guild, member_id))
-        )
+        name = _safe_name(await _company_name(bot, guild, member_id))
         lines.append(
             f"Top voice companion: **{name}** — {_duration(seconds)} of shared voice time "
             "since companion tracking began (split evenly when more people were present)."
@@ -1293,34 +1417,131 @@ async def _records_text(bot: Any, interaction: discord.Interaction) -> str:
     return "\n".join(lines)
 
 
+def _top_metric(metric: str) -> tuple[str, str]:
+    """Return the ranking field and label for a ``top`` metric choice."""
+    key = str(metric).strip().lower().replace(" ", "_")
+    if key == "voice":
+        return "voice_seconds", "observed voice time"
+    if key == "active_days":
+        return "active_days", "active days"
+    return "messages", "messages"
+
+
+def _top_value(field: str, value: float) -> str:
+    if field == "voice_seconds":
+        return _duration(value)
+    if field == "active_days":
+        return _plural(int(value), "day")
+    return _plural(int(value), "message")
+
+
+async def _top_text(bot: Any, period: str, metric: str) -> str:
+    """Rank tracked people (and formerly tracked people with activity) by one metric."""
+    field, metric_label = _top_metric(metric)
+    label = _period_label(period)
+    rows = await bot.store.ranking(period, time.time(), include_live=_collection_reliable(bot))
+    ranked = sorted(
+        (row for row in rows if float(row[field]) > 0),
+        key=lambda row: (-float(row[field]), int(row["user_id"])),
+    )
+    if not ranked:
+        return f"No {metric_label} to rank for {label}."
+    top = ranked[:_LEADERBOARD_SIZE]
+    guild = bot.get_guild(bot.config.guild_id)
+    names = await asyncio.gather(*(_company_name(bot, guild, int(row["user_id"])) for row in top))
+    lines = [f"**Top {metric_label} — {label}**"]
+    for index, (name, row) in enumerate(zip(names, top)):
+        rank = _LEADERBOARD_MEDALS[index] if index < len(_LEADERBOARD_MEDALS) else f"{index + 1}."
+        formerly = "" if row.get("tracked", True) else " (no longer tracked)"
+        lines.append(
+            f"{rank} **{_safe_name(name)}** — {_top_value(field, float(row[field]))}{formerly}"
+        )
+    if len(ranked) > len(top):
+        lines.append(f"…and {len(ranked) - len(top):,} more.")
+    lines.append("Only activity observed while each person was tracked is counted.")
+    return "\n".join(lines)
+
+
+async def _tracked_list_text(bot: Any) -> str:
+    """List who is tracked now, then former people whose history is still kept."""
+    now = time.time()
+    rows = await bot.store.tracked_users()
+    timezone = bot.config.timezone
+    # A former person still "has history" when the all-time ranking shows activity.
+    with_history = {
+        int(row["user_id"])
+        for row in await bot.store.ranking("all", now, include_live=False)
+        if (
+            int(row["messages"]) > 0 or float(row["voice_seconds"]) > 0
+            or int(row["voice_visits"]) > 0 or int(row["active_days"]) > 0
+        )
+    }
+    active = [row for row in rows if row["active"]]
+    former = [row for row in rows if not row["active"] and int(row["user_id"]) in with_history]
+    guild = bot.get_guild(bot.config.guild_id) if hasattr(bot, "get_guild") else None
+    shown = [*active, *former]
+    labels = await asyncio.gather(*(
+        _admin_label(bot, guild, int(row["user_id"])) for row in shown
+    ))
+    active_entries: list[str] = []
+    former_entries: list[str] = []
+    for row, name in zip(shown, labels):
+        date_text = _local_time(row["updated_at"], timezone, date_only=True)
+        if row["active"]:
+            active_entries.append(f"{name} (since {date_text})")
+        else:
+            former_entries.append(f"{name} (stopped {date_text})")
+    lines = [f"**Tracked people ({len(active):,})**"]
+    if not active:
+        lines.append("Nobody is tracked yet. An admin can add people with `/flock track add`.")
+    omitted = 0
+    for heading, entries in (
+        (None, active_entries), ("Formerly tracked (history kept):", former_entries)
+    ):
+        if heading is not None and entries and not omitted:
+            lines.append(heading)
+        for entry in entries:
+            if omitted or len("\n".join((*lines, entry))) > 1850:
+                omitted += 1
+            else:
+                lines.append(entry)
+    if omitted:
+        lines.append(f"…and {omitted:,} more people")
+    return "\n".join(lines)
+
+
 def _help_text(bot: Any) -> str:
     timezone = bot.config.timezone
-    return "\n".join(
+    lines = [
+        "**Flock commands**",
+        "Flock tracks an admin-managed list of people. Per-person reports take an optional `user` (default: you).",
+        "`/flock stats` — messages, observed voice time, active days, visits, and coverage gaps (week by default).",
+        "`/flock records` — busiest message day, longest fully observed voice visit, and top voice companion.",
+        "`/flock where` — last observed voice channel and time.",
+        "`/flock company` — pie chart of who shared observed voice time, or time alone.",
+        "`/flock leaderboard` — who spent the most voice time with someone, counting whole group calls (all time by default).",
+        "`/flock trends` — day by day, versus last period, time of day, day of week, company, or message bursts (last 7 days by default).",
+        "`/flock online` — Discord status of a tracked person; away counts as online.",
+        "`/flock roast` — a light joke from a recorded statistic.",
+        "`/flock top` — ranks everyone tracked by messages, voice time, or active days (this week by default).",
+        "`/flock track list` — who is tracked now, plus former people whose history is kept.",
+        "`/flock track add` and `remove` — tracker admins choose who is tracked; untracking keeps history.",
+        "`/flock help`, `/flock about`, and `/flock version` — this guide, status with tracked people, and release number.",
+        "`/flock update`, `/flock pause`, and `/flock resume` — tracker admins check for updates or pause and resume collection.",
+        "`/flock delete-data` — tracker admins erase one person's statistics (with `user`) or everyone's, after confirmation.",
+    ]
+    if _leland_id(bot) is not None:
+        lines.append(
+            "`/flock evil-mode` and `/flock reaction-mode` — tracker admins toggle Leland's upside-down reposts and 😂/👸 reactions."
+        )
+    lines.extend(
         [
-            "**Leland Tracker commands**",
-            "`/leland stats` — message totals, observed voice time, active days, visits, and coverage gaps.",
-            "Stats periods: today, week (default), month, or all time.",
-            "`/leland records` — busiest message day, longest fully observed voice visit, "
-            "and top voice companion.",
-            "`/leland where` — last observed voice channel and time.",
-            "`/leland company` — pie chart of observed voice time attributed to companions or time alone.",
-            "`/leland leaderboard` — ranks who spent the most observed voice time with Leland, counting the whole time in group calls (all time by default).",
-            "`/leland trends` — charts how activity changes: day by day with streaks and ghost days, compared with last period, time of day, day of week, company over time, or message bursts (the last 7 days by default).",
-            "`/leland online` — current Discord status; away counts as online.",
-            "`/leland roast` — a light joke based on a recorded statistic.",
-            "`/leland help` — show this command guide.",
-            "`/leland about` — bot version, connection, collection, checkpoint, and coverage status.",
-            "`/leland version` — release number and deployed commit of the running bot.",
-            "`/leland update` — configured tracker admins can make the Pi check GitHub for a new version now.",
-            "`/leland pause` and `/leland resume` — configured tracker admins can pause or resume collection.",
-            "`/leland delete-data` — configured tracker admins can erase tracked statistics after confirmation.",
-            "`/leland evil-mode mode:on/off` — configured tracker admins can toggle upside-down message reposts.",
-            "`/leland reaction-mode mode:on/off` — configured tracker admins can toggle occasional 😂 or 👸 reactions.",
-            "`/leland admin add`, `remove`, and `list` — the configured owner manages tracker admins privately.",
-            f"Reports use the **{timezone}** timezone. Message counts use message creation events; voice time means observed connection time, not speaking time.",
-            "Collection is limited to the configured server and configured visible channels. No message text is stored.",
+            "`/flock admin add`, `remove`, and `list` — the owner manages tracker admins privately.",
+            f"Reports use the **{timezone}** timezone. Message counts use creation events; voice time is observed connection time, not speaking time.",
+            "Collection is limited to the configured server and channels. No message text is stored.",
         ]
     )
+    return "\n".join(lines)
 
 
 async def _status_text(bot: Any) -> str:
@@ -1340,19 +1561,32 @@ async def _status_text(bot: Any) -> str:
         collection_state = "unavailable"
     else:
         collection_state = "running"
+    collector_state = "paused" if paused else ("enabled" if collection_state == "running" else "unavailable")
     lines = [
-        "**About Leland Tracker**",
+        "**About Flock**",
         f"Version: **{version_string()}**.",
         f"Gateway: **{health}**.",
         f"Collection: **{collection_state}**.",
-        f"Evil Leland mode: **{'on' if state.get('evil_mode', False) else 'off'}**.",
-        f"Reaction mode: **{'on' if state.get('reaction_mode', False) else 'off'}**.",
-        f"Message collector: **{'paused' if paused else ('enabled' if collection_state == 'running' else 'unavailable')}**; voice collector: **{'paused' if paused else ('enabled' if collection_state == 'running' else 'unavailable')}**.",
-        f"Last checkpoint: {_local_time(last_checkpoint, timezone)}.",
     ]
     try:
-        all_stats = await _read_stats(bot, "all", time.time())
-        gaps = float(all_stats.get("gap_seconds", 0) or 0)
+        tracked = sum(1 for row in await bot.store.tracked_users() if row["active"])
+        lines.append(f"Tracked people: **{tracked:,}**.")
+    except Exception:
+        logger.exception("Could not read the tracked people count")
+        lines.append("The tracked people count is temporarily unavailable; the error was logged.")
+    if _leland_id(bot) is not None:
+        lines.extend(
+            [
+                f"Evil Leland mode: **{'on' if state.get('evil_mode', False) else 'off'}**.",
+                f"Reaction mode: **{'on' if state.get('reaction_mode', False) else 'off'}**.",
+            ]
+        )
+    lines.append(
+        f"Message collector: **{collector_state}**; voice collector: **{collector_state}**."
+    )
+    lines.append(f"Last checkpoint: {_local_time(last_checkpoint, timezone)}.")
+    try:
+        gaps = float(await bot.store.coverage_gap_seconds(time.time()) or 0)
         lines.append(f"Recorded coverage gaps: **{_duration(gaps)}**.")
     except Exception:
         logger.exception("Could not read status coverage totals")
@@ -1384,17 +1618,31 @@ async def _request_update_text(bot: Any) -> str:
     return (
         "Update check requested. The Pi checks GitHub within a few seconds "
         "(or at its next scheduled check if on-demand updates aren't installed there). "
-        "If there is a new commit, the bot restarts while it installs; `/leland about` shows the result."
+        "If there is a new commit, the bot restarts while it installs; `/flock about` shows the result."
     )
 
 
 class DeleteDataConfirmation(discord.ui.View):
-    """Short-lived confirmation restricted to the original invoker."""
+    """Short-lived confirmation restricted to the original invoker.
 
-    def __init__(self, bot: Any, invoker_id: int, *, timeout: float = 60.0) -> None:
+    Without a target it erases everyone's data; with ``target_id`` only that
+    person's. ``target_name`` is already escaped for Markdown.
+    """
+
+    def __init__(
+        self,
+        bot: Any,
+        invoker_id: int,
+        *,
+        timeout: float = 60.0,
+        target_id: int | None = None,
+        target_name: str = "that person",
+    ) -> None:
         super().__init__(timeout=timeout)
         self.bot = bot
         self.invoker_id = invoker_id
+        self.target_id = target_id
+        self.target_name = target_name
         self.message: discord.Message | None = None
         self._confirmation_lock = asyncio.Lock()
         self._processing = False
@@ -1436,7 +1684,13 @@ class DeleteDataConfirmation(discord.ui.View):
             # acknowledges an update to the original ephemeral message, so the
             # confirmation controls can be removed after the database finishes.
             await interaction.response.defer()
-            await self.bot.tracker.delete_data(actor_id=interaction.user.id)
+            if self.target_id is None:
+                existed = True
+                await self.bot.tracker.delete_data(actor_id=interaction.user.id)
+            else:
+                existed = await self.bot.tracker.delete_user_data(
+                    self.target_id, interaction.user.id
+                )
         except Exception:
             logger.exception("Confirmed data deletion failed")
             self._processing = False
@@ -1452,8 +1706,20 @@ class DeleteDataConfirmation(discord.ui.View):
         self._processing = False
         self._completed = True
         self.stop()
+        if self.target_id is None:
+            content = (
+                "Everyone's tracked statistics and managed local backups were deleted. "
+                "The tracked list was kept. Collection remains paused."
+            )
+        elif existed:
+            content = (
+                f"{self.target_name}'s statistics and managed local backups were deleted, and "
+                "they are no longer tracked. Collection for everyone else continues."
+            )
+        else:
+            content = f"No statistics were recorded for {self.target_name}."
         await interaction.edit_original_response(
-            content="Tracked statistics and managed local backups were deleted. Collection remains paused.",
+            content=content,
             view=None,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -1501,116 +1767,158 @@ class DeleteDataConfirmation(discord.ui.View):
 
 
 def register_commands(bot: Any) -> None:
-    """Add the ``/leland`` command group to ``bot.tree`` for the configured guild."""
+    """Add the ``/flock`` command group to ``bot.tree`` for the configured guild."""
     guild = discord.Object(id=bot.config.guild_id)
-    leland = app_commands.Group(name="leland", description="Leland's activity reports and bot controls")
-    admin = app_commands.Group(name="admin", description="Manage tracker admins", parent=leland)
+    flock = app_commands.Group(name="flock", description="Activity reports for tracked people and bot controls")
+    admin = app_commands.Group(name="admin", description="Manage tracker admins", parent=flock)
+    track = app_commands.Group(name="track", description="Manage who is tracked", parent=flock)
 
-    @leland.command(name="stats", description="Show activity statistics for a period")
-    @app_commands.describe(period="The period to summarize")
+    @flock.command(name="stats", description="Show activity statistics for a period")
+    @app_commands.describe(period="The period to summarize", user=_USER_OPTION)
     @app_commands.choices(period=PERIOD_CHOICES)
     async def stats_command(
         interaction: discord.Interaction,
         period: str = "week",
+        user: discord.User | None = None,
     ) -> None:
-        await _execute(
+        person = await _resolve_person(interaction, bot, "flock stats", user)
+        if person is None:
+            return
+        await _deliver(
             interaction,
             bot,
-            "leland stats",
-            lambda: _stats_text(bot, period),
+            "flock stats",
+            person,
+            lambda: _stats_text(bot, person, period),
             ephemeral=_report_is_ephemeral(bot, interaction),
         )
 
-    @leland.command(name="records", description="Show personal activity records")
-    async def records_command(interaction: discord.Interaction) -> None:
-        await _execute(
+    @flock.command(name="records", description="Show personal activity records")
+    @app_commands.describe(user=_USER_OPTION)
+    async def records_command(
+        interaction: discord.Interaction, user: discord.User | None = None
+    ) -> None:
+        person = await _resolve_person(interaction, bot, "flock records", user)
+        if person is None:
+            return
+        await _deliver(
             interaction,
             bot,
-            "leland records",
-            lambda: _records_text(bot, interaction),
+            "flock records",
+            person,
+            lambda: _records_text(bot, interaction, person),
             ephemeral=_report_is_ephemeral(bot, interaction),
         )
 
-    @leland.command(name="where", description="Show when and where Leland was last in voice")
-    async def where_command(interaction: discord.Interaction) -> None:
-        await _execute(
+    @flock.command(name="where", description="Show when and where someone was last in voice")
+    @app_commands.describe(user=_USER_OPTION)
+    async def where_command(
+        interaction: discord.Interaction, user: discord.User | None = None
+    ) -> None:
+        person = await _resolve_person(interaction, bot, "flock where", user)
+        if person is None:
+            return
+        await _deliver(
             interaction,
             bot,
-            "leland where",
-            lambda: _seen_text(bot, interaction),
+            "flock where",
+            person,
+            lambda: _seen_text(bot, interaction, person),
             ephemeral=_report_is_ephemeral(bot, interaction),
         )
 
-    @leland.command(name="company", description="Chart who shared Leland's observed voice time")
-    @app_commands.describe(period="The period to summarize")
+    @flock.command(name="company", description="Chart who shared someone's observed voice time")
+    @app_commands.describe(period="The period to summarize", user=_USER_OPTION)
     @app_commands.choices(period=PERIOD_CHOICES)
     async def company_command(
-        interaction: discord.Interaction, period: str = "week"
+        interaction: discord.Interaction,
+        period: str = "week",
+        user: discord.User | None = None,
     ) -> None:
-        if not await _scope_ok(interaction, bot):
+        person = await _resolve_person(interaction, bot, "flock company", user)
+        if person is None:
             return
-        ephemeral = _report_is_ephemeral(bot, interaction)
-        await interaction.response.defer(ephemeral=ephemeral, thinking=True)
-        try:
-            content, png = await _company_report(bot, interaction, period)
-            file = discord.File(BytesIO(png), filename="leland-voice-company.png") if png else None
-        except Exception:
-            logger.exception("Slash command leland company failed")
-            content = "The tracker could not complete that request. The error was logged."
-            file = None
-        await _send(interaction, content, ephemeral=ephemeral, file=file)
-
-    @leland.command(name="leaderboard", description="Rank who spent the most voice time with Leland")
-    @app_commands.describe(period="The period to rank (all time by default)")
-    @app_commands.choices(period=PERIOD_CHOICES)
-    async def leaderboard_command(
-        interaction: discord.Interaction, period: str = "all"
-    ) -> None:
-        await _execute(
+        await _deliver(
             interaction,
             bot,
-            "leland leaderboard",
-            lambda: _leaderboard_text(bot, interaction, period),
+            "flock company",
+            person,
+            lambda: _company_report(bot, interaction, person, period),
+            ephemeral=_report_is_ephemeral(bot, interaction),
+            filename="flock-voice-company.png",
+        )
+
+    @flock.command(name="leaderboard", description="Rank who spent the most voice time with someone")
+    @app_commands.describe(period="The period to rank (all time by default)", user=_USER_OPTION)
+    @app_commands.choices(period=PERIOD_CHOICES)
+    async def leaderboard_command(
+        interaction: discord.Interaction,
+        period: str = "all",
+        user: discord.User | None = None,
+    ) -> None:
+        person = await _resolve_person(interaction, bot, "flock leaderboard", user)
+        if person is None:
+            return
+        await _deliver(
+            interaction,
+            bot,
+            "flock leaderboard",
+            person,
+            lambda: _leaderboard_text(bot, interaction, person, period),
             ephemeral=_report_is_ephemeral(bot, interaction),
         )
 
-    @leland.command(name="trends", description="Chart how Leland's activity changes over a period")
-    @app_commands.describe(period="The period to chart", kind="Which trend to chart")
+    @flock.command(name="trends", description="Chart how someone's activity changes over a period")
+    @app_commands.describe(
+        period="The period to chart", kind="Which trend to chart", user=_USER_OPTION
+    )
     @app_commands.choices(period=TREND_PERIOD_CHOICES, kind=TREND_CHOICES)
     async def trends_command(
-        interaction: discord.Interaction, period: str = "last7", kind: str = "daily"
+        interaction: discord.Interaction,
+        period: str = "last7",
+        kind: str = "daily",
+        user: discord.User | None = None,
     ) -> None:
-        if not await _scope_ok(interaction, bot):
+        person = await _resolve_person(interaction, bot, "flock trends", user)
+        if person is None:
             return
-        ephemeral = _report_is_ephemeral(bot, interaction)
-        await interaction.response.defer(ephemeral=ephemeral, thinking=True)
-        try:
-            content, png = await _trend_report(bot, interaction, period, kind)
-            file = discord.File(BytesIO(png), filename=f"leland-trends-{kind}.png") if png else None
-        except Exception:
-            logger.exception("Slash command leland trends failed")
-            content = _FAILURE_TEXT
-            file = None
-        await _send(interaction, content, ephemeral=ephemeral, file=file)
-
-    @leland.command(name="online", description="Check whether Leland is online, away, or offline")
-    async def online_command(interaction: discord.Interaction) -> None:
-        await _execute(
+        await _deliver(
             interaction,
             bot,
-            "leland online",
-            lambda: _online_text(bot),
+            "flock trends",
+            person,
+            lambda: _trend_report(bot, interaction, person, period, kind),
+            ephemeral=_report_is_ephemeral(bot, interaction),
+            filename=f"flock-trends-{kind}.png",
+        )
+
+    @flock.command(name="online", description="Check whether someone is online, away, or offline")
+    @app_commands.describe(user=_USER_OPTION)
+    async def online_command(
+        interaction: discord.Interaction, user: discord.User | None = None
+    ) -> None:
+        person = await _resolve_person(interaction, bot, "flock online", user, require_active=True)
+        if person is None:
+            return
+        await _deliver(
+            interaction,
+            bot,
+            "flock online",
+            person,
+            lambda: _online_text(bot, person),
             ephemeral=True,
         )
 
-    @leland.command(name="roast", description="Get a light joke based on real activity")
-    @app_commands.describe(period="The period to use for the joke")
+    @flock.command(name="roast", description="Get a light joke based on real activity")
+    @app_commands.describe(period="The period to use for the joke", user=_USER_OPTION)
     @app_commands.choices(period=PERIOD_CHOICES)
     async def roast_command(
         interaction: discord.Interaction,
         period: str = "week",
+        user: discord.User | None = None,
     ) -> None:
-        if not await _scope_ok(interaction, bot):
+        person = await _resolve_person(interaction, bot, "flock roast", user)
+        if person is None:
             return
         remaining = await _ROAST_COOLDOWN.consume()
         if remaining > 0:
@@ -1622,47 +1930,62 @@ def register_commands(bot: Any) -> None:
             return
 
         async def action() -> str:
-            stats = await _read_stats(bot, period, time.time())
-            joke = make_roast(stats, _period_label(period))
+            stats = await _read_stats(bot, person.user_id, period, time.time())
+            joke = make_roast(stats, _period_label(period), name=person.name)
             if joke is None:
                 return f"There is no recorded activity to joke about for {_period_label(period)} yet."
             return joke
 
-        await _execute_after_scope(
+        await _deliver(
             interaction,
             bot,
-            "leland roast",
+            "flock roast",
+            person,
             action,
             ephemeral=_report_is_ephemeral(bot, interaction),
         )
 
-    @leland.command(name="help", description="Explain commands and what the bot measures")
+    @flock.command(name="top", description="Rank tracked people by messages, voice time, or active days")
+    @app_commands.describe(period="The period to rank", metric="What to rank by (messages by default)")
+    @app_commands.choices(period=PERIOD_CHOICES, metric=TOP_METRIC_CHOICES)
+    async def top_command(
+        interaction: discord.Interaction, period: str = "week", metric: str = "messages"
+    ) -> None:
+        await _execute(
+            interaction,
+            bot,
+            "flock top",
+            lambda: _top_text(bot, period, metric),
+            ephemeral=_report_is_ephemeral(bot, interaction),
+        )
+
+    @flock.command(name="help", description="Explain commands and what the bot measures")
     async def help_command(interaction: discord.Interaction) -> None:
         await _execute(
             interaction,
             bot,
-            "leland help",
+            "flock help",
             _async_value(_help_text(bot)),
             ephemeral=_report_is_ephemeral(bot, interaction),
         )
 
-    @leland.command(name="about", description="Show the bot version, connection, and coverage status")
+    @flock.command(name="about", description="Show the bot version, connection, and coverage status")
     async def about_command(interaction: discord.Interaction) -> None:
         await _execute(
             interaction,
             bot,
-            "leland about",
+            "flock about",
             lambda: _status_text(bot),
             ephemeral=True,
         )
 
-    @leland.command(name="version", description="Show the running bot version")
+    @flock.command(name="version", description="Show the running bot version")
     async def version_command(interaction: discord.Interaction) -> None:
         await _execute(
             interaction,
             bot,
-            "leland version",
-            _async_value(f"Leland Tracker **{version_string()}**."),
+            "flock version",
+            _async_value(f"Flock **{version_string()}**."),
             ephemeral=True,
         )
 
@@ -1674,15 +1997,19 @@ def register_commands(bot: Any) -> None:
         if not await _owner_permission_ok(interaction, bot):
             return
         config = _config(bot)
-        if user.id in (config.owner_user_id, config.target_user_id) or user.bot:
-            await _send(interaction, "Choose a human member other than the owner or tracked user.", ephemeral=True)
+        if user.id in (config.owner_user_id, _leland_id(bot)) or user.bot:
+            await _send(
+                interaction,
+                "Choose a human member other than the owner or the configured Leland user.",
+                ephemeral=True,
+            )
             return
 
         async def action() -> str:
             await bot.store.set_admin_override(user.id, True)
             return f"{_user_label(user, user.id)} now has tracker admin access."
 
-        await _execute_after_scope(interaction, bot, "leland admin add", action, ephemeral=True)
+        await _execute_after_scope(interaction, bot, "flock admin add", action, ephemeral=True)
 
     @admin.command(name="remove", description="Revoke tracker admin access by user ID")
     @app_commands.describe(user_id="Discord user ID or mention; works after a member leaves")
@@ -1706,7 +2033,7 @@ def register_commands(bot: Any) -> None:
             label = await _admin_label(bot, guild, parsed_id)
             return f"{label} no longer has tracker admin access."
 
-        await _execute_after_scope(interaction, bot, "leland admin remove", action, ephemeral=True)
+        await _execute_after_scope(interaction, bot, "flock admin remove", action, ephemeral=True)
 
     @admin.command(name="list", description="List the current tracker admins")
     async def admin_list_command(interaction: discord.Interaction) -> None:
@@ -1725,7 +2052,7 @@ def register_commands(bot: Any) -> None:
                 else:
                     admins.discard(user_id)
             admins.discard(config.owner_user_id)
-            admins.discard(config.target_user_id)
+            admins.discard(_leland_id(bot))
             guild = bot.get_guild(config.guild_id) if hasattr(bot, "get_guild") else None
             ordered = sorted(admins)
             owner_label, *admin_labels = await asyncio.gather(*(
@@ -1744,9 +2071,64 @@ def register_commands(bot: Any) -> None:
                     lines.append(label)
             return "\n".join(lines)
 
-        await _execute_after_scope(interaction, bot, "leland admin list", action, ephemeral=True)
+        await _execute_after_scope(interaction, bot, "flock admin list", action, ephemeral=True)
 
-    @leland.command(name="update", description="Check GitHub for a new bot version now")
+    @track.command(name="add", description="Start tracking a server member")
+    @app_commands.describe(user="Server member to start tracking")
+    async def track_add_command(interaction: discord.Interaction, user: discord.Member) -> None:
+        if not await _scope_ok(interaction, bot):
+            return
+        if not await _control_permission_ok(interaction, bot):
+            return
+        if user.bot:
+            await _send(interaction, "Bots can't be tracked.", ephemeral=True)
+            return
+
+        async def action() -> str:
+            added = await bot.tracker.track_user(user.id, interaction.user.id, bot.voice_snapshot())
+            label = _user_label(user, user.id)
+            if not added:
+                return f"{label} is already tracked."
+            reply = f"{label} is now tracked. Their messages and voice time are counted from now."
+            if (await bot.store.state()).get("paused", False):
+                reply += " Collection is paused, so counting starts when it resumes."
+            return reply
+
+        await _execute_after_scope(interaction, bot, "flock track add", action, ephemeral=True)
+
+    @track.command(name="remove", description="Stop tracking someone by user ID, keeping their history")
+    @app_commands.describe(user_id="Discord user ID or mention; works after a member leaves")
+    async def track_remove_command(interaction: discord.Interaction, user_id: str) -> None:
+        if not await _scope_ok(interaction, bot):
+            return
+        if not await _control_permission_ok(interaction, bot):
+            return
+        parsed_id = _admin_id(user_id)
+        if parsed_id is None:
+            await _send(interaction, "Enter a positive Discord user ID or user mention.", ephemeral=True)
+            return
+
+        async def action() -> str:
+            removed = await bot.tracker.untrack_user(parsed_id, interaction.user.id)
+            guild = bot.get_guild(_config(bot).guild_id) if hasattr(bot, "get_guild") else None
+            label = await _admin_label(bot, guild, parsed_id)
+            if not removed:
+                return f"{label} isn't currently tracked."
+            return f"{label} is no longer tracked. Their recorded history is kept."
+
+        await _execute_after_scope(interaction, bot, "flock track remove", action, ephemeral=True)
+
+    @track.command(name="list", description="List who is tracked")
+    async def track_list_command(interaction: discord.Interaction) -> None:
+        await _execute(
+            interaction,
+            bot,
+            "flock track list",
+            lambda: _tracked_list_text(bot),
+            ephemeral=True,
+        )
+
+    @flock.command(name="update", description="Check GitHub for a new bot version now")
     async def update_command(interaction: discord.Interaction) -> None:
         if not await _scope_ok(interaction, bot):
             return
@@ -1756,9 +2138,9 @@ def register_commands(bot: Any) -> None:
         async def action() -> str:
             return await _request_update_text(bot)
 
-        await _execute_after_scope(interaction, bot, "leland update", action, ephemeral=True)
+        await _execute_after_scope(interaction, bot, "flock update", action, ephemeral=True)
 
-    @leland.command(name="pause", description="Pause activity collection")
+    @flock.command(name="pause", description="Pause activity collection")
     async def pause_command(interaction: discord.Interaction) -> None:
         if not await _scope_ok(interaction, bot):
             return
@@ -1769,9 +2151,9 @@ def register_commands(bot: Any) -> None:
             await bot.tracker.pause(actor_id=interaction.user.id)
             return "Collection is paused. This setting persists across restarts."
 
-        await _execute_after_scope(interaction, bot, "leland pause", action, ephemeral=True)
+        await _execute_after_scope(interaction, bot, "flock pause", action, ephemeral=True)
 
-    @leland.command(name="resume", description="Resume activity collection")
+    @flock.command(name="resume", description="Resume activity collection")
     async def resume_command(interaction: discord.Interaction) -> None:
         if not await _scope_ok(interaction, bot):
             return
@@ -1779,19 +2161,23 @@ def register_commands(bot: Any) -> None:
             return
 
         async def action() -> str:
-            channel_id = bot.current_voice_channel_id()
-            await bot.tracker.resume(
-                actor_id=interaction.user.id,
-                voice_channel_id=channel_id,
-                companions=bot.current_voice_companions(),
+            snapshot = bot.voice_snapshot()
+            await bot.tracker.resume(interaction.user.id, snapshot)
+            tracked = getattr(bot.tracker, "tracked_ids", frozenset())
+            watching = sum(1 for member_id in snapshot if member_id in tracked)
+            if not watching:
+                return (
+                    "Collection resumed. Voice tracking will start when a tracked person "
+                    "joins a tracked voice channel."
+                )
+            return (
+                f"Collection resumed. {_plural(watching, 'tracked person')} currently in voice "
+                f"{'is' if watching == 1 else 'are'} being observed from now."
             )
-            if channel_id is None:
-                return "Collection resumed. Voice tracking will start if Leland joins a tracked voice channel."
-            return "Collection resumed. Leland's current voice connection is being observed from now."
 
-        await _execute_after_scope(interaction, bot, "leland resume", action, ephemeral=True)
+        await _execute_after_scope(interaction, bot, "flock resume", action, ephemeral=True)
 
-    @leland.command(name="evil-mode", description="Toggle upside-down reposts of Leland's messages")
+    @flock.command(name="evil-mode", description="Toggle upside-down reposts of Leland's messages")
     @app_commands.describe(mode="Turn upside-down reposts on or off")
     @app_commands.choices(mode=[
         app_commands.Choice(name="On", value="on"),
@@ -1802,14 +2188,17 @@ def register_commands(bot: Any) -> None:
             return
         if not await _control_permission_ok(interaction, bot):
             return
+        if _leland_id(bot) is None:
+            await _send(interaction, "Leland mode isn't configured.", ephemeral=True)
+            return
 
         async def action() -> str:
             await bot.store.set_evil_mode(mode == "on")
             return f"Evil Leland mode is now **{mode}**."
 
-        await _execute_after_scope(interaction, bot, "leland evil-mode", action, ephemeral=True)
+        await _execute_after_scope(interaction, bot, "flock evil-mode", action, ephemeral=True)
 
-    @leland.command(name="reaction-mode", description="Toggle occasional reactions to Leland's messages")
+    @flock.command(name="reaction-mode", description="Toggle occasional reactions to Leland's messages")
     @app_commands.describe(mode="Turn occasional emoji reactions on or off")
     @app_commands.choices(mode=[
         app_commands.Choice(name="On", value="on"),
@@ -1820,22 +2209,46 @@ def register_commands(bot: Any) -> None:
             return
         if not await _control_permission_ok(interaction, bot):
             return
+        if _leland_id(bot) is None:
+            await _send(interaction, "Leland mode isn't configured.", ephemeral=True)
+            return
 
         async def action() -> str:
             await bot.store.set_reaction_mode(mode == "on")
             return f"Reaction mode is now **{mode}**."
 
-        await _execute_after_scope(interaction, bot, "leland reaction-mode", action, ephemeral=True)
+        await _execute_after_scope(interaction, bot, "flock reaction-mode", action, ephemeral=True)
 
-    @leland.command(name="delete-data", description="Erase tracked statistics and pause collection")
-    async def delete_data_command(interaction: discord.Interaction) -> None:
+    @flock.command(name="delete-data", description="Erase one person's statistics, or everyone's and pause collection")
+    @app_commands.describe(user="Erase only this person's data (everyone's if omitted)")
+    async def delete_data_command(
+        interaction: discord.Interaction, user: discord.User | None = None
+    ) -> None:
         if not await _scope_ok(interaction, bot):
             return
         if not await _control_permission_ok(interaction, bot):
             return
-        view = DeleteDataConfirmation(bot, interaction.user.id)
+        if user is not None and user.bot:
+            await _send(interaction, "Bots aren't tracked.", ephemeral=True)
+            return
+        if user is None:
+            view = DeleteDataConfirmation(bot, interaction.user.id)
+            prompt = (
+                "This permanently erases the tracked statistics of **everyone** and all managed "
+                "local backups, then pauses collection. The tracked list is kept. Continue?"
+            )
+        else:
+            name = _safe_name(_person_name(user, user.id))
+            view = DeleteDataConfirmation(
+                bot, interaction.user.id, target_id=user.id, target_name=name
+            )
+            prompt = (
+                f"This permanently erases only **{name}**'s recorded statistics, removes them from "
+                "the tracked list, and deletes all managed local backups (they contain that data). "
+                "Collection for everyone else continues. Continue?"
+            )
         await interaction.response.send_message(
-            "This permanently erases tracked statistics and managed local backups, then pauses collection. Continue?",
+            content=prompt,
             ephemeral=True,
             view=view,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -1847,7 +2260,7 @@ def register_commands(bot: Any) -> None:
             # not expose the original response message.
             pass
 
-    bot.tree.add_command(leland, guild=guild)
+    bot.tree.add_command(flock, guild=guild)
 
     async def on_tree_error(
         interaction: discord.Interaction,

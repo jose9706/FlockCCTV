@@ -1,8 +1,9 @@
 import asyncio
 from io import BytesIO
 import inspect
+import re
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 from types import SimpleNamespace
 
 import flock_cctv
@@ -84,9 +85,28 @@ class FakeInteraction:
         self.edited.append(kwargs)
 
 
+def _row(user_id, *, active=True, since=1_690_000_000.0, updated=1_700_000_000.0):
+    return {
+        "user_id": user_id, "active": active, "tracking_since": since,
+        "added_by": 31, "updated_at": updated,
+    }
+
+
+def _rank(user_id, messages=0, voice=0.0, visits=0, days=0, tracked=True):
+    return {
+        "user_id": user_id, "messages": messages, "voice_seconds": voice,
+        "voice_visits": visits, "active_days": days, "tracked": tracked,
+    }
+
+
 class FakeStore:
     def __init__(self):
         self.deleted = []
+        # Every per-person read records the user ID it was asked about.
+        self.user_ids = []
+        self.tracked = [_row(30), _row(41), _row(42, active=False)]
+        self.ranking_rows = []
+        self.ranking_calls = []
         self.last_voice_result = None
         self.company_rows = []
         self.trend_rows = []
@@ -95,6 +115,18 @@ class FakeStore:
         self.voice_hours_result = {"hours": [0.0] * 24, "since": 0.0, "period_start": 0.0}
         self.comparison = {"current": {}, "previous": None, "reason": "all"}
         self.admin_decisions = {}
+        self.paused = False
+
+    async def tracked_users(self):
+        return [dict(row) for row in self.tracked]
+
+    async def coverage_gap_seconds(self, now):
+        return 125.0
+
+    async def ranking(self, period, now, *, include_live=True):
+        self.include_live = include_live
+        self.ranking_calls.append(period)
+        return list(self.ranking_rows)
 
     async def admin_override(self, user_id):
         return self.admin_decisions.get(user_id)
@@ -105,32 +137,40 @@ class FakeStore:
     async def set_admin_override(self, user_id, enabled):
         self.admin_decisions[user_id] = enabled
 
-    async def company_totals(self, period, now, *, include_live=True):
+    async def company_totals(self, user_id, period, now, *, include_live=True):
+        self.user_ids.append(user_id)
         self.include_live = include_live
         return self.company_rows
 
-    async def daily_trend(self, period, now, *, include_live=True):
+    async def daily_trend(self, user_id, period, now, *, include_live=True):
+        self.user_ids.append(user_id)
         self.include_live = include_live
         self.trend_period = period
         return self.trend_rows
 
-    async def message_times(self, period, now):
+    async def message_times(self, user_id, period, now):
+        self.user_ids.append(user_id)
         return self.message_times_result
 
-    async def voice_hours(self, period, now, *, include_live=True):
+    async def voice_hours(self, user_id, period, now, *, include_live=True):
+        self.user_ids.append(user_id)
         return self.voice_hours_result
 
-    async def period_comparison(self, period, now, *, include_live=True):
+    async def period_comparison(self, user_id, period, now, *, include_live=True):
+        self.user_ids.append(user_id)
         return self.comparison
 
-    async def company_daily(self, period, now, *, include_live=True):
+    async def company_daily(self, user_id, period, now, *, include_live=True):
+        self.user_ids.append(user_id)
         return self.company_rows_daily
 
-    async def last_voice(self, now, *, include_live=True):
+    async def last_voice(self, user_id, now, *, include_live=True):
+        self.user_ids.append(user_id)
         self.include_live = include_live
         return self.last_voice_result
 
-    async def stats(self, period, now, *, include_live=True):
+    async def stats(self, user_id, period, now, *, include_live=True):
+        self.user_ids.append(user_id)
         self.include_live = include_live
         return {
             "messages": 4,
@@ -143,12 +183,38 @@ class FakeStore:
             "secret_channel_name": "private-channel-marker",
         }
 
-    async def records(self, now, *, include_live=True):
+    async def records(self, user_id, now, *, include_live=True):
+        self.user_ids.append(user_id)
         self.include_live = include_live
         return {}
 
     async def state(self):
-        return {"paused": False, "evil_mode": False, "paused_by": None, "tracking_since": 1_700_000_000, "last_checkpoint": 1_700_000_000}
+        return {
+            "paused": self.paused, "evil_mode": False, "reaction_mode": False, "paused_by": None,
+            "tracking_since": 1_700_000_000, "last_checkpoint": 1_700_000_000,
+        }
+
+
+# Leland (the requester in most tests) is tracked and has been since before the database began.
+PERSON = commands_module._Person(30, "Leland", True, 1_690_000_000.0)
+
+
+def _user(user_id, name, *, bot=False, username=None):
+    return SimpleNamespace(id=user_id, display_name=name, name=username or name.lower(), bot=bot)
+
+
+def _fake_guild(bot, members=None):
+    """Install a guild whose members come from ``members``; nobody else can be fetched."""
+    members = dict(members or {})
+    guild = SimpleNamespace(
+        default_role=object(),
+        get_member=members.get,
+        fetch_member=AsyncMock(side_effect=TimeoutError),
+    )
+    bot.get_guild = lambda guild_id: guild
+    bot.get_user = lambda user_id: None
+    bot.fetch_user = AsyncMock(side_effect=TimeoutError)
+    return guild
 
 
 class CommandsTests(unittest.IsolatedAsyncioTestCase):
@@ -157,7 +223,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             guild_id=10,
             output_channel_id=None,
             public_report_channel_ids=frozenset(),
-            target_user_id=30,
+            leland_user_id=30,
             owner_user_id=31,
             admin_user_ids=frozenset({33}),
             timezone="America/Costa_Rica",
@@ -165,35 +231,75 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.bot = SimpleNamespace(config=self.config, tree=FakeTree(), store=FakeStore())
         self.bot.tracker = SimpleNamespace(connected=True, guild_is_available=True, last_error=None)
         self.bot.get_channel = lambda channel_id: None
+        self.bot.voice_snapshot = lambda: {}
+
+    def group(self):
+        register_commands(self.bot)
+        return next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+
+    def command(self, name, subgroup=None):
+        group = self.group()
+        if subgroup is not None:
+            group = next(command for command in group.commands if command.name == subgroup)
+        return next(command for command in group.commands if command.name == name)
 
     def test_registers_single_guild_scoped_group_and_default_week(self):
         register_commands(self.bot)
         commands = {group.name: (group, guild) for group, guild in self.bot.tree.commands}
-        self.assertEqual(set(commands), {"leland"})
+        self.assertEqual(set(commands), {"flock"})
         for group, guild in commands.values():
             self.assertEqual(guild.id, self.config.guild_id)
-        leland = commands["leland"][0]
+        flock = commands["flock"][0]
         self.assertEqual(
-            {command.name for command in leland.commands},
+            {command.name for command in flock.commands},
             {
-                "stats", "records", "roast", "help", "where", "company", "leaderboard", "online",
-                "trends", "about", "version", "update", "pause", "resume", "delete-data", "evil-mode", "reaction-mode", "admin",
+                "stats", "records", "where", "company", "leaderboard", "trends", "online", "roast",
+                "top", "help", "about", "version", "update", "pause", "resume", "delete-data",
+                "evil-mode", "reaction-mode", "admin", "track",
             },
         )
-        admin = next(command for command in leland.commands if command.name == "admin")
+        admin = next(command for command in flock.commands if command.name == "admin")
         self.assertEqual({command.name for command in admin.commands}, {"add", "remove", "list"})
-        stats = next(command for command in leland.commands if command.name == "stats")
-        roast = next(command for command in leland.commands if command.name == "roast")
+        track = next(command for command in flock.commands if command.name == "track")
+        self.assertEqual({command.name for command in track.commands}, {"add", "remove", "list"})
+        stats = next(command for command in flock.commands if command.name == "stats")
+        roast = next(command for command in flock.commands if command.name == "roast")
         self.assertEqual(inspect.signature(stats.callback).parameters["period"].default, "week")
         self.assertEqual(inspect.signature(roast.callback).parameters["period"].default, "week")
-        trends = next(command for command in leland.commands if command.name == "trends")
+        trends = next(command for command in flock.commands if command.name == "trends")
         self.assertEqual(inspect.signature(trends.callback).parameters["period"].default, "last7")
         self.assertEqual(inspect.signature(trends.callback).parameters["kind"].default, "daily")
-        leaderboard = next(command for command in leland.commands if command.name == "leaderboard")
+        leaderboard = next(command for command in flock.commands if command.name == "leaderboard")
         self.assertEqual(inspect.signature(leaderboard.callback).parameters["period"].default, "all")
+        top = next(command for command in flock.commands if command.name == "top")
+        self.assertEqual(inspect.signature(top.callback).parameters["period"].default, "week")
+        self.assertEqual(inspect.signature(top.callback).parameters["metric"].default, "messages")
+        metric = next(item for item in top.parameters if item.name == "metric")
+        self.assertEqual([choice.value for choice in metric.choices], ["messages", "voice", "active_days"])
+
+    def test_per_person_commands_take_an_optional_user_defaulting_to_the_requester(self):
+        flock = self.group()
+        for name in ("stats", "records", "where", "company", "leaderboard", "trends", "online", "roast"):
+            with self.subTest(command=name):
+                command = next(command for command in flock.commands if command.name == name)
+                parameter = next(item for item in command.parameters if item.name == "user")
+                self.assertFalse(parameter.required)
+                self.assertEqual(parameter.type, discord.AppCommandOptionType.user)
+                self.assertEqual(parameter.description, "Whose activity to show (defaults to you)")
+                self.assertIsNone(inspect.signature(command.callback).parameters["user"].default)
+        for name in ("top", "help", "about", "version", "update", "pause", "resume"):
+            with self.subTest(command=name):
+                command = next(command for command in flock.commands if command.name == name)
+                self.assertNotIn("user", [item.name for item in command.parameters])
+        delete = next(command for command in flock.commands if command.name == "delete-data")
+        self.assertFalse(next(item for item in delete.parameters if item.name == "user").required)
+        add = self.command("add", "track")
+        self.assertTrue(next(item for item in add.parameters if item.name == "user").required)
+        remove = self.command("remove", "track")
+        self.assertTrue(next(item for item in remove.parameters if item.name == "user_id").required)
 
     async def test_records_text_formats_dates_and_shows_live_visit(self):
-        async def records(now, *, include_live=True):
+        async def records(user_id, now, *, include_live=True):
             return {
                 "busiest_day": "2026-09-29",
                 "busiest_day_messages": 7,
@@ -221,7 +327,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         interaction = FakeInteraction(channel_id=20)
         interaction.guild = guild
         self.bot.store.records = records
-        content = await _records_text(self.bot, interaction)
+        content = await _records_text(self.bot, interaction, PERSON)
         self.assertIn("Most messages in one day: **7** on Tue Sep 29, 2026.", content)
         self.assertIn("Longest fully observed voice visit: **1h 30m**, started ", content)
         self.assertIn(
@@ -236,18 +342,18 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_records_text_without_data(self):
-        content = await _records_text(self.bot, FakeInteraction())
+        content = await _records_text(self.bot, FakeInteraction(), PERSON)
         self.assertIn("No personal records have been recorded yet.", content)
         self.assertNotIn("Top voice companion", content)
         self.assertTrue(self.bot.store.include_live)
 
     async def test_records_text_live_visit_alone_and_unreliable_collection(self):
-        async def records(now, *, include_live=True):
+        async def records(user_id, now, *, include_live=True):
             self.bot.store.include_live = include_live
             return {"current_visit_seconds": 300.0, "current_visit_complete_start": True}
 
         self.bot.store.records = records
-        content = await _records_text(self.bot, FakeInteraction())
+        content = await _records_text(self.bot, FakeInteraction(), PERSON)
         lines = content.splitlines()
         self.assertEqual(lines[-2], "No personal records have been recorded yet.")
         self.assertEqual(
@@ -255,11 +361,11 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             "Current voice visit so far: **5m** (it can set the record once it ends).",
         )
         self.bot.tracker.connected = False
-        await _records_text(self.bot, FakeInteraction())
+        await _records_text(self.bot, FakeInteraction(), PERSON)
         self.assertFalse(self.bot.store.include_live)
 
     def test_company_pie_contains_large_visible_legend_text(self):
-        png = _pie_png([("Alice 🎮", 90), ("Alone", 30)])
+        png = _pie_png([("Alice 🎮", 90), ("Alone", 30)], "Leland")
         with Image.open(BytesIO(png)) as chart:
             self.assertEqual(chart.size, (1100, 640))
             label_region = chart.crop((660, 89, 1058, 125))
@@ -301,7 +407,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             {"day": "2025-03-04", "messages": 9, "voice_seconds": 0.0, "voice_visits": 0, "watched": True},
             {"day": "2025-03-05", "messages": 0, "voice_seconds": 0.0, "voice_visits": 0, "watched": False},
         ]
-        content, png = await _trend_report(self.bot, FakeInteraction(), "week", "daily")
+        content, png = await _trend_report(self.bot, FakeInteraction(), PERSON, "week", "daily")
         self.assertIn("Busiest day: **Tue Mar 4** — 9 messages", content)
         self.assertIn("Active days: **2** of 3 observed", content)
         self.assertIn("Longest active streak: **2 days**", content)
@@ -350,7 +456,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             {"day": f"2025-{month:02d}-{day:02d}", "messages": day % 3, "voice_seconds": 0.0, "voice_visits": 0}
             for month in (1, 2, 3) for day in range(1, 29)
         ]
-        content, png = await _trend_report(self.bot, FakeInteraction(), "all", "daily")
+        content, png = await _trend_report(self.bot, FakeInteraction(), PERSON, "all", "daily")
         self.assertIn("groups days by week", content)
         self.assertIsNotNone(png)
 
@@ -361,7 +467,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             # An unwatched quiet Monday is unknown and must not dilute the average.
             {"day": "2025-03-17", "messages": 0, "voice_seconds": 0.0, "voice_visits": 0, "watched": False},
         ]
-        content, png = await _trend_report(self.bot, FakeInteraction(), "month", "weekdays")
+        content, png = await _trend_report(self.bot, FakeInteraction(), PERSON, "month", "weekdays")
         self.assertIn("Chattiest day: **Monday** — 4.0 messages on average", content)
         self.assertIn("Most voice time: **Friday** — 2h 0m on average", content)
         self.assertIsNotNone(png)
@@ -373,7 +479,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             ("bursts", "No messages"),
             ("company", "No companion time"),
         ):
-            content, png = await _trend_report(self.bot, FakeInteraction(), "week", kind)
+            content, png = await _trend_report(self.bot, FakeInteraction(), PERSON, "week", kind)
             self.assertIn(expected, content)
             self.assertIsNone(png)
 
@@ -384,7 +490,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
                          "voice_visits": 0, "watched_seconds": 50.0},
             "reason": None,
         }
-        content, _ = await _trend_report(self.bot, FakeInteraction(), "last7", "compare")
+        content, _ = await _trend_report(self.bot, FakeInteraction(), PERSON, "last7", "compare")
         self.assertIn("**Leland vs the previous 7 days — the last 7 days so far**", content)
         self.assertIn("watched 50% of the previous 7 days' window", content)
 
@@ -399,7 +505,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         voice[22] = 5400.0
         voice[1] = 1800.0
         self.bot.store.voice_hours_result = {"hours": voice, "since": base + 86_400, "period_start": base}
-        content, png = await _trend_report(self.bot, FakeInteraction(), "all", "hours")
+        content, png = await _trend_report(self.bot, FakeInteraction(), PERSON, "all", "hours")
         self.assertIn("Peak message hour: **02:00–03:00** with 3 of 4 messages", content)
         self.assertIn("Peak voice hour: **22:00–23:00** with 1h 30m of 2h 0m", content)
         self.assertIn("**75%** of messages and **25%** of voice time", content)
@@ -414,7 +520,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
                          "voice_visits": 0, "watched_seconds": 50.0},
             "reason": None,
         }
-        content, png = await _trend_report(self.bot, FakeInteraction(), "week", "compare")
+        content, png = await _trend_report(self.bot, FakeInteraction(), PERSON, "week", "compare")
         self.assertIn("**Leland vs last week — this week so far**", content)
         self.assertIn("Messages: **30** vs 20 (up 50%)", content)
         self.assertIn("(no change)", content)
@@ -428,7 +534,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             ("pruned", "Last week is older than the retained detail"),
         ):
             self.bot.store.comparison = {"current": {}, "previous": None, "reason": reason}
-            content, png = await _trend_report(self.bot, FakeInteraction(), "week", "compare")
+            content, png = await _trend_report(self.bot, FakeInteraction(), PERSON, "week", "compare")
             self.assertIn(expected, content)
             self.assertIsNone(png)
 
@@ -436,7 +542,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         base = 1_700_000_000.0
         times = [base + offset * 10 for offset in range(6)] + [base + 1000, base + 5000]
         self.bot.store.message_times_result = {"times": times, "since": base, "period_start": base}
-        content, png = await _trend_report(self.bot, FakeInteraction(), "month", "bursts")
+        content, png = await _trend_report(self.bot, FakeInteraction(), PERSON, "month", "bursts")
         self.assertIn("Biggest burst: **6 messages** in 50s", content)
         self.assertIn("Average burst: **2.7 messages** across 3 bursts", content)
         self.assertIn("Rapid fire: **75%**", content)
@@ -462,7 +568,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         interaction = FakeInteraction(channel_id=20)
         interaction.guild = guild
         with patch.object(commands_module.time, "time", return_value=1_741_176_000.0):  # 2025-03-05 06:00 in Costa Rica
-            content, png = await _trend_report(self.bot, interaction, "week", "company")
+            content, png = await _trend_report(self.bot, interaction, PERSON, "week", "company")
         self.assertIn("Mon 3: **Alice** — 10m", content)
         self.assertIn("Tue 4: alone — 5m", content)
         self.assertIn("Wed 5: no company time", content)
@@ -487,7 +593,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.bot.store.company_rows_daily = rows
         with patch.object(commands_module.time, "time", return_value=1_741_132_800.0):
-            content, _ = await _trend_report(self.bot, FakeInteraction(), "week", "company")
+            content, _ = await _trend_report(self.bot, FakeInteraction(), PERSON, "week", "company")
         self.assertIn("Tue 4: **Peer 49** — 20m", content)
 
     async def test_trends_command_attaches_chart_with_report_visibility(self):
@@ -496,14 +602,14 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             {"day": "2025-03-03", "messages": 4, "voice_seconds": 60.0, "voice_visits": 1},
         ]
         register_commands(self.bot)
-        leland = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
-        trends = next(command for command in leland.commands if command.name == "trends")
+        flock = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+        trends = next(command for command in flock.commands if command.name == "trends")
         public = FakeInteraction(channel_id=20)
         await trends.callback(public)
         self.assertEqual(self.bot.store.trend_period, "last7")
         sent = public.followup.sent[0]
         self.assertFalse(sent["ephemeral"])
-        self.assertEqual(sent["file"].filename, "leland-trends-daily.png")
+        self.assertEqual(sent["file"].filename, "flock-trends-daily.png")
         private = FakeInteraction(channel_id=21)
         await trends.callback(private, period="week", kind="weekdays")
         self.assertTrue(private.followup.sent[0]["ephemeral"])
@@ -524,9 +630,9 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(_report_is_ephemeral(self.bot, FakeInteraction(channel_id=20)))
         self.assertTrue(_report_is_ephemeral(self.bot, FakeInteraction(channel_id=21)))
         register_commands(self.bot)
-        leland = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
-        stats = next(command for command in leland.commands if command.name == "stats")
-        where = next(command for command in leland.commands if command.name == "where")
+        flock = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+        stats = next(command for command in flock.commands if command.name == "stats")
+        where = next(command for command in flock.commands if command.name == "where")
         public = FakeInteraction(channel_id=20)
         await stats.callback(public)
         self.assertEqual(public.followup.sent[0]["ephemeral"], False)
@@ -559,7 +665,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         )
         public = FakeInteraction(channel_id=20)
         public.guild = SimpleNamespace(default_role=role)
-        content, png = await _company_report(self.bot, public, "week")
+        content, png = await _company_report(self.bot, public, PERSON, "week")
         self.assertIn("Public friend", content)
         self.assertNotIn("Private friend", content)
         self.assertIn("1m", content)
@@ -567,7 +673,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
 
         private = FakeInteraction(channel_id=21)
         private.guild = SimpleNamespace(default_role=role)
-        content, _ = await _company_report(self.bot, private, "week")
+        content, _ = await _company_report(self.bot, private, PERSON, "week")
         self.assertIn("Private friend", content)
         self.assertIn("3m", content)
 
@@ -575,7 +681,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             {"channel_id": 40, "member_id": member_id, "seconds": 10}
             for member_id in range(50, 59)
         ] + [{"channel_id": 40, "member_id": 0, "seconds": 5}]
-        content, _ = await _company_report(self.bot, public, "week")
+        content, _ = await _company_report(self.bot, public, PERSON, "week")
         self.assertIn("Alone", content)
         self.assertIn("Other people", content)
 
@@ -603,7 +709,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         public = FakeInteraction(channel_id=20)
         public.guild = SimpleNamespace(default_role=role)
 
-        content = await _leaderboard_text(self.bot, public, "all")
+        content = await _leaderboard_text(self.bot, public, PERSON, "all")
 
         lines = content.splitlines()
         self.assertEqual(lines[0], "**Leland's voice leaderboard — all time**")
@@ -630,7 +736,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         interaction = FakeInteraction()
         interaction.guild = SimpleNamespace(default_role=SimpleNamespace(id=0))
 
-        content = await _leaderboard_text(self.bot, interaction, "week")
+        content = await _leaderboard_text(self.bot, interaction, PERSON, "week")
 
         self.assertIn("**Leland's voice leaderboard — this week**", content)
         self.assertIn("🥇 **Friend 12** — 12m", content)
@@ -648,8 +754,8 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         ]
         interaction = FakeInteraction()
         interaction.guild = SimpleNamespace(default_role=SimpleNamespace(id=0))
-        content = await _leaderboard_text(self.bot, interaction, "today")
-        self.assertIn("No time with other people has been observed for today", content)
+        content = await _leaderboard_text(self.bot, interaction, PERSON, "today")
+        self.assertIn("No time with other people has been observed for Leland today in voice", content)
 
     async def test_company_chart_fetches_uncached_names_after_voice_departure(self):
         self.config.public_report_channel_ids = frozenset({20})
@@ -680,7 +786,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         public = FakeInteraction(channel_id=20)
         public.guild = SimpleNamespace(default_role=role)
 
-        content, png = await _company_report(self.bot, public, "week")
+        content, png = await _company_report(self.bot, public, PERSON, "week")
 
         self.assertIn("Server nickname", content)
         self.assertIn("Global name", content)
@@ -717,8 +823,8 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_only_owner_can_grant_and_revoke_admins(self):
         register_commands(self.bot)
-        leland = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
-        admin = next(command for command in leland.commands if command.name == "admin")
+        flock = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+        admin = next(command for command in flock.commands if command.name == "admin")
         commands = {command.name: command for command in admin.commands}
         owner = FakeInteraction(user=SimpleNamespace(id=31))
         member = SimpleNamespace(id=35, bot=False)
@@ -748,8 +854,8 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_version_command_replies_privately_with_version(self):
         register_commands(self.bot)
-        leland = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
-        version = next(command for command in leland.commands if command.name == "version")
+        flock = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+        version = next(command for command in flock.commands if command.name == "version")
         interaction = FakeInteraction(user=SimpleNamespace(id=31))
         await version.callback(interaction)
         sent = interaction.followup.sent[0]
@@ -758,20 +864,20 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_about_command_replies_privately_with_status(self):
         register_commands(self.bot)
-        leland = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
-        about = next(command for command in leland.commands if command.name == "about")
+        flock = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+        about = next(command for command in flock.commands if command.name == "about")
         interaction = FakeInteraction(user=SimpleNamespace(id=31))
         await about.callback(interaction)
         sent = interaction.followup.sent[0]
-        self.assertIn("**About Leland Tracker**", sent["content"])
+        self.assertIn("**About Flock**", sent["content"])
         self.assertIn(f"Version: **{flock_cctv.version_string()}**", sent["content"])
         self.assertIn("Collection: **running**", sent["content"])
         self.assertTrue(sent["ephemeral"])
 
     async def test_admin_add_and_remove_replies_name_the_user(self):
         register_commands(self.bot)
-        leland = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
-        admin = next(command for command in leland.commands if command.name == "admin")
+        flock = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+        admin = next(command for command in flock.commands if command.name == "admin")
         commands = {command.name: command for command in admin.commands}
         guild = SimpleNamespace(
             get_member=lambda user_id: None,
@@ -810,8 +916,8 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_list_shows_display_names_and_usernames(self):
         register_commands(self.bot)
-        leland = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
-        admin = next(command for command in leland.commands if command.name == "admin")
+        flock = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+        admin = next(command for command in flock.commands if command.name == "admin")
         list_command = next(command for command in admin.commands if command.name == "list")
         self.bot.store.admin_decisions = {34: True, 35: True, 36: True}
         cached = {
@@ -858,8 +964,8 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_revocation_overrides_environment_and_delete_confirmation(self):
         register_commands(self.bot)
-        leland = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
-        admin = next(command for command in leland.commands if command.name == "admin")
+        flock = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+        admin = next(command for command in flock.commands if command.name == "admin")
         remove = next(command for command in admin.commands if command.name == "remove")
         await remove.callback(FakeInteraction(user=SimpleNamespace(id=31)), "33")
         self.assertFalse(await _can_control(FakeInteraction(user=SimpleNamespace(id=33)), self.bot))
@@ -870,8 +976,8 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_commands_reject_invalid_targets_and_wrong_scope(self):
         register_commands(self.bot)
-        leland = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
-        admin = next(command for command in leland.commands if command.name == "admin")
+        flock = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
+        admin = next(command for command in flock.commands if command.name == "admin")
         commands = {command.name: command for command in admin.commands}
         owner = SimpleNamespace(id=31)
         for user in (SimpleNamespace(id=30, bot=False), SimpleNamespace(id=31, bot=False), SimpleNamespace(id=35, bot=True)):
@@ -891,10 +997,11 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_control_commands_reject_server_manager_and_target(self):
         register_commands(self.bot)
-        group = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
+        group = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
         self.bot.tracker.pause = AsyncMock()
         self.bot.tracker.resume = AsyncMock()
         self.bot.tracker.delete_data = AsyncMock()
+        self.bot.tracker.delete_user_data = AsyncMock()
         for user_id, manage_guild in ((30, False), (34, True)):
             for name in ("pause", "resume", "delete-data", "update"):
                 with self.subTest(user_id=user_id, command=name):
@@ -905,24 +1012,46 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
                     command = next(command for command in group.commands if command.name == name)
                     await command.callback(interaction)
                     self.assertIn("Only configured tracker admins", interaction.response.sent[0]["content"])
+            with self.subTest(user_id=user_id, command="delete-data user"):
+                interaction = FakeInteraction(user=SimpleNamespace(id=user_id))
+                command = next(command for command in group.commands if command.name == "delete-data")
+                await command.callback(interaction, user=_user(41, "Ana"))
+                self.assertIn("Only configured tracker admins", interaction.response.sent[0]["content"])
+                self.assertNotIn("view", interaction.response.sent[0])
         self.bot.tracker.pause.assert_not_awaited()
         self.bot.tracker.resume.assert_not_awaited()
         self.bot.tracker.delete_data.assert_not_awaited()
+        self.bot.tracker.delete_user_data.assert_not_awaited()
 
     async def test_owner_and_extra_admin_can_pause_and_resume(self):
         register_commands(self.bot)
-        group = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
+        group = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
         self.bot.tracker.pause = AsyncMock()
         self.bot.tracker.resume = AsyncMock()
-        self.bot.current_voice_channel_id = lambda: None
-        self.bot.current_voice_companions = lambda: frozenset()
+        snapshot = {41: 7, 99: 7}
+        self.bot.voice_snapshot = lambda: snapshot
+        self.bot.tracker.tracked_ids = frozenset({41})
+        replies = {}
         for name, user_id in (("pause", 31), ("resume", 33)):
             interaction = FakeInteraction(user=SimpleNamespace(id=user_id))
             command = next(command for command in group.commands if command.name == name)
             await command.callback(interaction)
             self.assertTrue(interaction.response.deferred)
+            self.assertTrue(interaction.followup.sent[0]["ephemeral"])
+            replies[name] = interaction.followup.sent[0]["content"]
         self.bot.tracker.pause.assert_awaited_once_with(actor_id=31)
-        self.bot.tracker.resume.assert_awaited_once_with(actor_id=33, voice_channel_id=None, companions=frozenset())
+        self.bot.tracker.resume.assert_awaited_once_with(33, snapshot)
+        # Only tracked people in voice are mentioned; the untracked member 99 is not counted.
+        self.assertIn("1 tracked person currently in voice is being observed", replies["resume"])
+
+    async def test_resume_reply_when_nobody_tracked_is_in_voice(self):
+        self.bot.tracker.resume = AsyncMock()
+        self.bot.voice_snapshot = lambda: {99: 7}
+        self.bot.tracker.tracked_ids = frozenset({41})
+        interaction = FakeInteraction(user=SimpleNamespace(id=31))
+        await self.command("resume").callback(interaction)
+        self.assertIn("will start when a tracked person joins", interaction.followup.sent[0]["content"])
+        self.bot.tracker.resume.assert_awaited_once_with(31, {99: 7})
 
     async def test_update_command_requests_a_check_privately_unless_held(self):
         import json
@@ -930,7 +1059,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         from pathlib import Path
 
         register_commands(self.bot)
-        group = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
+        group = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
         command = next(command for command in group.commands if command.name == "update")
         with tempfile.TemporaryDirectory() as name:
             self.config.database_path = Path(name) / "tracker.sqlite3"
@@ -958,7 +1087,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_evil_mode_toggle_is_admin_only(self):
         register_commands(self.bot)
-        group = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
+        group = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
         command = next(command for command in group.commands if command.name == "evil-mode")
         self.bot.store.set_evil_mode = AsyncMock()
         denied = FakeInteraction(user=SimpleNamespace(id=30))
@@ -972,7 +1101,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reaction_mode_toggle_is_admin_only_and_private(self):
         register_commands(self.bot)
-        group = next(group for group, _ in self.bot.tree.commands if group.name == "leland")
+        group = next(group for group, _ in self.bot.tree.commands if group.name == "flock")
         command = next(command for command in group.commands if command.name == "reaction-mode")
         self.bot.store.set_reaction_mode = AsyncMock()
         denied = FakeInteraction(user=SimpleNamespace(id=30))
@@ -986,7 +1115,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("**on**", allowed.followup.sent[0]["content"])
 
     async def test_stats_are_aggregated_and_show_gaps(self):
-        report = await _stats_text(self.bot, "week")
+        report = await _stats_text(self.bot, PERSON, "week")
         self.assertIn("4**", report)
         self.assertIn("Observed voice time", report)
         self.assertIn("Missing coverage during this period", report)
@@ -1015,7 +1144,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"Version: **{flock_cctv.version_string()}**", report)
         self.assertIn("Collection: **unavailable**", report)
         self.assertIn("Message collector: **unavailable**", report)
-        self.assertIn("Recorded coverage gaps", report)
+        self.assertIn("Tracked people: **2**", report)
 
     async def test_seen_reports_last_channel_and_date_to_allowed_viewer(self):
         self.bot.store.last_voice_result = {
@@ -1027,7 +1156,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             permissions_for=lambda user: SimpleNamespace(view_channel=True),
         )
         with patch("flock_cctv.commands.time.time", return_value=1_700_003_600):
-            report = await _seen_text(self.bot, FakeInteraction())
+            report = await _seen_text(self.bot, FakeInteraction(), PERSON)
         self.assertIn("#general-voice", report)
         self.assertIn("1h", report)
         self.assertIn("Nov 14, 2023", report)
@@ -1049,9 +1178,9 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         with patch("flock_cctv.commands.time.time", return_value=1_700_003_600):
-            hidden = await _seen_text(self.bot, interaction)
+            hidden = await _seen_text(self.bot, interaction, PERSON)
             everyone_can_view = True
-            visible = await _seen_text(self.bot, interaction)
+            visible = await _seen_text(self.bot, interaction, PERSON)
         self.assertIn("a voice channel", hidden)
         self.assertNotIn("private-voice", hidden)
         self.assertIn("#private-voice", visible)
@@ -1067,13 +1196,13 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             permissions_for=lambda user: SimpleNamespace(view_channel=False),
         )
         with patch("flock_cctv.commands.time.time", return_value=1_700_003_600):
-            report = await _seen_text(self.bot, FakeInteraction())
+            report = await _seen_text(self.bot, FakeInteraction(), PERSON)
         self.assertIn("a voice channel", report)
         self.assertNotIn("private-voice", report)
         self.assertFalse(self.bot.store.include_live)
 
     async def test_seen_handles_current_and_empty_observation(self):
-        self.assertIn("haven't observed", await _seen_text(self.bot, FakeInteraction()))
+        self.assertIn("haven't observed", await _seen_text(self.bot, FakeInteraction(), PERSON))
         self.bot.store.last_voice_result = {
             "channel_id": 40, "seen_at": 1_700_003_600,
             "current": True, "observed_since": 1_700_000_000,
@@ -1081,7 +1210,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.bot.get_channel = lambda channel_id: SimpleNamespace(
             name="voice", permissions_for=lambda user: SimpleNamespace(view_channel=True),
         )
-        self.assertIn("currently in **#voice**", await _seen_text(self.bot, FakeInteraction()))
+        self.assertIn("currently in **#voice**", await _seen_text(self.bot, FakeInteraction(), PERSON))
 
     async def test_online_counts_away_and_dnd_as_online(self):
         guild = SimpleNamespace(query_members=AsyncMock())
@@ -1089,24 +1218,24 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         for status in (discord.Status.online, discord.Status.idle, discord.Status.dnd):
             with self.subTest(status=status):
                 guild.query_members.return_value = [SimpleNamespace(id=30, status=status)]
-                self.assertIn("online", await _online_text(self.bot))
+                self.assertIn("online", await _online_text(self.bot, PERSON))
         guild.query_members.assert_awaited_with(user_ids=[30], presences=True, cache=False)
 
     async def test_online_reports_offline_and_unknown_without_guessing(self):
         guild = SimpleNamespace(query_members=AsyncMock())
         self.bot.get_guild = lambda guild_id: guild
         guild.query_members.return_value = [SimpleNamespace(id=30, status=discord.Status.offline)]
-        self.assertIn("offline or invisible", await _online_text(self.bot))
+        self.assertIn("offline or invisible", await _online_text(self.bot, PERSON))
         guild.query_members.return_value = []
-        self.assertIn("couldn't find", await _online_text(self.bot))
+        self.assertIn("couldn't find", await _online_text(self.bot, PERSON))
         guild.query_members.side_effect = TimeoutError()
-        self.assertIn("couldn't check", await _online_text(self.bot))
+        self.assertIn("couldn't check", await _online_text(self.bot, PERSON))
         self.bot.get_guild = lambda guild_id: None
-        self.assertIn("server is unavailable", await _online_text(self.bot))
+        self.assertIn("server is unavailable", await _online_text(self.bot, PERSON))
 
     async def test_failed_recovery_disables_live_totals_and_is_visible_in_reports(self):
         self.bot.tracker.collection_ready = False
-        report = await _stats_text(self.bot, "week")
+        report = await _stats_text(self.bot, PERSON, "week")
         self.assertFalse(self.bot.store.include_live)
         self.assertIn("Collection is recovering", report)
         self.assertIn("Collection: **unavailable**", await _status_text(self.bot))
@@ -1133,7 +1262,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         async def action():
             raise PermissionError("opaque detail")
 
-        await _execute_after_scope(interaction, self.bot, "leland resume", action, ephemeral=True)
+        await _execute_after_scope(interaction, self.bot, "flock resume", action, ephemeral=True)
         self.assertEqual(len(interaction.followup.sent), 1)
         self.assertIn("You do not have permission", interaction.followup.sent[0]["content"])
         self.assertNotIn("opaque detail", interaction.followup.sent[0]["content"])
@@ -1165,89 +1294,815 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.tracker.calls, 1)
         self.assertEqual(first.edited[0]["view"], None)
 
+    # -- Per-person reports: the ``user`` option -------------------------------
 
-VALID_SUMMARY = (
-    '{"topics": ["synthetic topic"], "mood": "Calm synthetic vibe", '
-    '"roast": "A gentle synthetic verdict.", "quote": "alpha text"}'
-)
+    _PERSON_COMMANDS = ("stats", "records", "where", "company", "leaderboard", "trends", "roast")
 
+    def _no_cooldown(self):
+        return patch.object(
+            commands_module, "_ROAST_COOLDOWN", SimpleNamespace(consume=AsyncMock(return_value=0))
+        )
 
-class FakeTldrClient:
-    def __init__(self, result=VALID_SUMMARY, error=None):
-        self.result = result
-        self.error = error
-        self.bodies = []
+    async def test_user_option_defaults_to_requester_and_reports_use_that_user_id(self):
+        self.config.public_report_channel_ids = frozenset({20})
+        flock = self.group()
+        with self._no_cooldown():
+            for name in self._PERSON_COMMANDS:
+                command = next(command for command in flock.commands if command.name == name)
+                for target, expected in ((None, 30), (_user(41, "Ana"), 41)):
+                    with self.subTest(command=name, user=expected):
+                        self.bot.store.user_ids.clear()
+                        interaction = FakeInteraction(channel_id=20, user=_user(30, "Leland"))
+                        if target is None:
+                            await command.callback(interaction)
+                        else:
+                            await command.callback(interaction, user=target)
+                        self.assertTrue(interaction.response.deferred)
+                        self.assertEqual(len(interaction.followup.sent), 1)
+                        self.assertNotIn("isn't tracked", interaction.followup.sent[0]["content"])
+                        self.assertTrue(self.bot.store.user_ids)
+                        self.assertEqual(set(self.bot.store.user_ids), {expected})
 
-    async def complete(self, body):
-        self.bodies.append(body)
-        if self.error is not None:
-            raise self.error
-        return self.result
+    async def test_stats_title_uses_the_chosen_persons_name(self):
+        stats = self.command("stats")
+        own = FakeInteraction(user=_user(30, "Leland"))
+        await stats.callback(own)
+        self.assertTrue(own.followup.sent[0]["content"].startswith("**The Leland Report — this week**"))
+        other = FakeInteraction(user=_user(30, "Leland"))
+        await stats.callback(other, period="month", user=_user(41, "Ana"))
+        content = other.followup.sent[0]["content"]
+        self.assertTrue(content.startswith("**The Ana Report — this month**"))
+        self.assertNotIn("Leland", content)
+        self.assertNotIn("no longer tracked", content)
 
-    def texts(self):
-        user = self.bodies[0]["messages"][1]["content"]
-        return [line[2:] for line in user.splitlines() if line.startswith("- ")]
+    async def test_requester_without_a_display_name_falls_back_to_the_user_id(self):
+        interaction = FakeInteraction()  # default requester has only an ID
+        await self.command("stats").callback(interaction)
+        self.assertTrue(interaction.followup.sent[0]["content"].startswith("**The User 30 Report"))
 
+    async def test_bots_and_untracked_people_get_private_replies_before_any_report(self):
+        self.config.public_report_channel_ids = frozenset({20})
+        flock = self.group()
+        cases = [
+            (_user(900, "Robo", bot=True), "Bots aren't tracked."),
+            (
+                _user(77, "Zed *x*"),
+                "Zed \\*x\\* isn't tracked. An admin can add them with `/flock track add`.",
+            ),
+        ]
+        guild = _fake_guild(self.bot)
+        guild.query_members = AsyncMock()
+        cooldown = SimpleNamespace(consume=AsyncMock(return_value=0))
+        with patch.object(commands_module, "_ROAST_COOLDOWN", cooldown):
+            for name in (*self._PERSON_COMMANDS, "online"):
+                command = next(command for command in flock.commands if command.name == name)
+                for target, expected in cases:
+                    with self.subTest(command=name, user=target.id):
+                        interaction = FakeInteraction(channel_id=20)
+                        await command.callback(interaction, user=target)
+                        sent = interaction.response.sent[0]
+                        self.assertEqual(sent["content"], expected)
+                        self.assertTrue(sent["ephemeral"])
+                        self.assertFalse(interaction.response.deferred)
+                        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(self.bot.store.user_ids, [])
+        cooldown.consume.assert_not_awaited()
+        guild.query_members.assert_not_awaited()
 
-class FakeHistoryChannel:
-    def __init__(self, channel_id, messages=(), *, viewer_can_view=None, bot_perms=None, error=None):
-        self.id = channel_id
-        self.messages = list(messages)
-        self.me = object()
-        self.guild = SimpleNamespace(me=self.me)
-        self.viewer_can_view = viewer_can_view or (lambda viewer: True)
-        self.bot_perms = bot_perms or SimpleNamespace(view_channel=True, read_message_history=True)
-        self.error = error
-        self.history_calls = []
+    async def test_formerly_tracked_people_get_a_report_with_a_note(self):
+        self.config.public_report_channel_ids = frozenset({20})
+        flock = self.group()
+        note = "Bob is no longer tracked; showing recorded history."
+        with self._no_cooldown():
+            for name in self._PERSON_COMMANDS:
+                command = next(command for command in flock.commands if command.name == name)
+                with self.subTest(command=name):
+                    self.bot.store.user_ids.clear()
+                    interaction = FakeInteraction(channel_id=20)
+                    await command.callback(interaction, user=_user(42, "Bob"))
+                    sent = interaction.followup.sent[0]
+                    self.assertTrue(sent["content"].endswith("\n" + note))
+                    self.assertFalse(sent["ephemeral"])
+                    self.assertEqual(set(self.bot.store.user_ids), {42})
 
-    def permissions_for(self, who):
-        if who is self.me:
-            return self.bot_perms
-        return SimpleNamespace(view_channel=self.viewer_can_view(who))
+    async def test_online_checks_only_active_tracked_people(self):
+        self.config.public_report_channel_ids = frozenset({20})
+        guild = _fake_guild(self.bot)
 
-    def history(self, **kwargs):
-        self.history_calls.append(kwargs)
-        channel = self
+        async def query(user_ids, presences, cache):
+            return [SimpleNamespace(id=user_ids[0], status=discord.Status.idle)]
 
-        async def generator():
-            if channel.error is not None:
-                raise channel.error
-            for message in sorted(channel.messages, key=lambda item: item.id, reverse=True):
-                yield message
+        guild.query_members = AsyncMock(side_effect=query)
+        online = self.command("online")
+        own = FakeInteraction(channel_id=20, user=_user(30, "Leland"))
+        await online.callback(own)
+        self.assertEqual(guild.query_members.await_args.kwargs["user_ids"], [30])
+        self.assertEqual(own.followup.sent[0]["content"], "Leland is online (away) right now.")
+        other = FakeInteraction(channel_id=20, user=_user(30, "Leland"))
+        await online.callback(other, user=_user(41, "Ana"))
+        self.assertEqual(guild.query_members.await_args.kwargs["user_ids"], [41])
+        self.assertEqual(other.followup.sent[0]["content"], "Ana is online (away) right now.")
+        # Presence is private even where reports are public.
+        self.assertTrue(own.followup.sent[0]["ephemeral"])
+        self.assertTrue(other.followup.sent[0]["ephemeral"])
 
-        return generator()
+        checked = guild.query_members.await_count
+        for target, expected in (
+            (_user(77, "Zed"), "Zed isn't tracked. An admin can add them with `/flock track add`."),
+            (
+                _user(42, "Bob"),
+                "Bob is no longer tracked. An admin can add them again with `/flock track add`.",
+            ),
+            (_user(900, "Robo", bot=True), "Bots aren't tracked."),
+        ):
+            refused = FakeInteraction(channel_id=20)
+            await online.callback(refused, user=target)
+            self.assertEqual(refused.response.sent[0]["content"], expected)
+            self.assertTrue(refused.response.sent[0]["ephemeral"])
+        self.assertEqual(guild.query_members.await_count, checked)
 
+    async def test_names_are_escaped_and_never_mention(self):
+        tricky = "**Ana** @everyone <@123456789012345678>\n_x_"
+        self.bot.store.tracked.append(_row(50))
+        interaction = FakeInteraction()
+        await self.command("stats").callback(interaction, user=_user(50, tricky))
+        sent = interaction.followup.sent[0]
+        title = sent["content"].splitlines()[0]
+        self.assertTrue(title.startswith("**The \\*\\*Ana\\*\\* "), title)
+        self.assertIn("\\_x\\_ Report — this week**", title)
+        self.assertNotIn("@everyone", sent["content"])
+        self.assertIsNone(re.search(r"<@[!&]?\d+>", sent["content"]))
+        mentions = sent["allowed_mentions"]
+        self.assertFalse(mentions.everyone or mentions.users or mentions.roles)
 
-class FakePrivateThread(FakeHistoryChannel, discord.Thread):
-    def is_private(self):
-        return True
+        refused = FakeInteraction()
+        await self.command("stats").callback(refused, user=_user(51, tricky))
+        self.assertNotIn("@everyone", refused.response.sent[0]["content"])
+        self.assertIsNone(re.search(r"<@[!&]?\d+>", refused.response.sent[0]["content"]))
 
+        person = commands_module._Person(50, commands_module._clean_name(tricky), True, 0.0)
+        self.bot.store.trend_rows = [
+            {"day": "2025-03-03", "messages": 4, "voice_seconds": 60.0, "voice_visits": 1},
+        ]
+        content, png = await _trend_report(self.bot, FakeInteraction(), person, "week", "daily")
+        self.assertNotIn("@everyone", content)
+        self.assertIsNone(re.search(r"<@[!&]?\d+>", content))
+        self.assertTrue(content.startswith("**\\*\\*Ana\\*\\* "))
+        self.assertTrue(png.startswith(b"\x89PNG"))
 
-def _message(message_id, content, author_id=30):
-    return SimpleNamespace(id=message_id, content=content, author=SimpleNamespace(id=author_id))
+    async def test_names_are_collapsed_to_one_short_line(self):
+        self.bot.store.tracked.append(_row(50))
+        interaction = FakeInteraction()
+        await self.command("stats").callback(interaction, user=_user(50, "Line one\n@here\r\n" + "x" * 80))
+        title = interaction.followup.sent[0]["content"].splitlines()[0]
+        cleaned = commands_module._clean_name("Line one\n@here\r\n" + "x" * 80)
+        self.assertEqual(len(cleaned), 48)
+        self.assertNotIn("\n", cleaned)
+        self.assertEqual(title, f"**The {commands_module._safe_name(cleaned)} Report — this week**")
 
+    async def test_pie_title_with_a_long_name_stays_inside_the_canvas(self):
+        png = _pie_png([("Alice", 90), ("Alone", 30)], "W" * 48)
+        with Image.open(BytesIO(png)) as chart:
+            title_band = chart.convert("L").crop((0, 0, chart.width, 90))
+            right_edge = title_band.crop((chart.width - 40, 0, chart.width, 90))
+            self.assertEqual(min(right_edge.getdata()), 255)
+            self.assertLess(min(title_band.crop((44, 20, 400, 80)).getdata()), 100)
 
-class TldrStore(FakeStore):
-    def __init__(self):
-        super().__init__()
-        self.paused = False
-        self.counts = {}
-        self.rows = []
-        self.latest_calls = []
+    async def test_wrong_scope_stops_person_commands_before_any_lookup(self):
+        flock = self.group()
+        for name in (*self._PERSON_COMMANDS, "online", "top"):
+            command = next(command for command in flock.commands if command.name == name)
+            wrong_guild = FakeInteraction(guild_id=99)
+            await command.callback(wrong_guild)
+            self.assertIn("configured server", wrong_guild.response.sent[0]["content"])
+            self.assertTrue(wrong_guild.response.sent[0]["ephemeral"])
+        self.config.output_channel_id = 22
+        wrong_channel = FakeInteraction(channel_id=20)
+        await self.command("stats").callback(wrong_channel, user=_user(41, "Ana"))
+        self.assertIn("configured tracker channel", wrong_channel.response.sent[0]["content"])
+        self.assertEqual(self.bot.store.user_ids, [])
 
-    async def state(self):
-        state = await super().state()
-        state["paused"] = self.paused
-        return state
+    async def test_failed_report_logs_the_command_and_replies_safely(self):
+        async def broken(*args, **kwargs):
+            raise RuntimeError("boom secret")
 
-    async def message_channel_counts(self, period, now):
-        return dict(self.counts)
+        self.bot.store.stats = broken
+        interaction = FakeInteraction()
+        with self.assertLogs("flock_cctv.commands", level="ERROR") as logs:
+            await self.command("stats").callback(interaction, user=_user(41, "Ana"))
+        self.assertIn("Slash command flock stats failed", logs.output[0])
+        sent = interaction.followup.sent[0]
+        self.assertEqual(sent["content"], commands_module._FAILURE_TEXT)
+        self.assertNotIn("boom", sent["content"])
 
-    async def latest_messages(self, period, now, channel_ids, limit):
-        self.latest_calls.append((sorted(channel_ids), limit))
-        rows = [row for row in self.rows if row["channel_id"] in set(channel_ids)]
-        rows.sort(key=lambda row: (row["created_at"], row["message_id"]), reverse=True)
-        return rows[:limit]
+        self.bot.store.tracked_users = broken
+        failed_lookup = FakeInteraction(channel_id=20)
+        self.config.public_report_channel_ids = frozenset({20})
+        with self.assertLogs("flock_cctv.commands", level="ERROR") as logs:
+            await self.command("where").callback(failed_lookup)
+        self.assertIn("Slash command flock where failed", logs.output[0])
+        self.assertEqual(failed_lookup.response.sent[0]["content"], commands_module._FAILURE_TEXT)
+        self.assertTrue(failed_lookup.response.sent[0]["ephemeral"])
+
+    async def test_records_measurement_period_starts_when_the_person_was_tracked(self):
+        later = commands_module._Person(41, "Ana", True, 1_760_000_000.0)  # Oct 9, 2025
+        earlier = commands_module._Person(41, "Ana", True, 1_600_000_000.0)  # before the database
+        content = await _records_text(self.bot, FakeInteraction(), later)
+        self.assertIn("**Ana's personal records**", content)
+        self.assertIn("Measurement period: since Oct 9, 2025", content)
+        content = await _records_text(self.bot, FakeInteraction(), earlier)
+        self.assertIn("Measurement period: since Nov 14, 2023", content)
+        self.assertEqual(set(self.bot.store.user_ids), {41})
+
+    async def test_roast_addresses_the_person_and_shares_one_cooldown(self):
+        roast = self.command("roast")
+        with patch.object(commands_module, "_ROAST_COOLDOWN", SharedRoastCooldown(seconds=30)):
+            refused = FakeInteraction()
+            await roast.callback(refused, user=_user(77, "Zed"))
+            self.assertIn("isn't tracked", refused.response.sent[0]["content"])
+            # A refused request must not use up the shared cooldown.
+            first = FakeInteraction(channel_id=20)
+            await roast.callback(first, user=_user(41, "Ana"))
+            self.assertTrue(first.followup.sent[0]["content"].startswith("Ana, "))
+            second = FakeInteraction(channel_id=20)
+            await roast.callback(second, user=_user(41, "Ana"))
+            self.assertIn("shared roast cooldown", second.response.sent[0]["content"])
+            self.assertTrue(second.response.sent[0]["ephemeral"])
+
+    async def test_leaderboard_and_company_for_a_person_apply_channel_visibility(self):
+        self.config.public_report_channel_ids = frozenset({20})
+        role = SimpleNamespace(id=0)
+        _fake_guild(self.bot, {51: _user(51, "Public friend"), 52: _user(52, "Hidden friend")})
+        self.bot.get_channel = lambda channel_id: SimpleNamespace(
+            permissions_for=lambda viewer: SimpleNamespace(
+                view_channel=channel_id == 40 or viewer is not role
+            )
+        )
+        self.bot.store.company_rows = [
+            {"channel_id": 40, "member_id": 51, "seconds": 60.0, "full_seconds": 60.0},
+            {"channel_id": 41, "member_id": 52, "seconds": 600.0, "full_seconds": 600.0},
+        ]
+        ana = _user(41, "Ana")
+        for name in ("leaderboard", "company", "records"):
+            command = self.command(name)
+            public = FakeInteraction(channel_id=20)
+            public.guild = SimpleNamespace(default_role=role)
+            await command.callback(public, user=ana)
+            content = public.followup.sent[0]["content"]
+            with self.subTest(command=name, audience="public"):
+                self.assertIn("Ana's", content)
+                self.assertIn("Public friend", content)
+                self.assertNotIn("Hidden friend", content)
+                self.assertFalse(public.followup.sent[0]["ephemeral"])
+            private = FakeInteraction(channel_id=21)
+            private.guild = SimpleNamespace(default_role=role)
+            await command.callback(private, user=ana)
+            private_content = private.followup.sent[0]["content"]
+            with self.subTest(command=name, audience="private"):
+                self.assertTrue(private.followup.sent[0]["ephemeral"])
+                self.assertIn("Hidden friend", private_content)
+                if name != "records":  # records show only the top companion
+                    self.assertIn("Public friend", private_content)
+        self.assertEqual(set(self.bot.store.user_ids), {41})
+
+    async def test_company_for_a_person_attaches_a_named_chart(self):
+        self.config.public_report_channel_ids = frozenset({20})
+        _fake_guild(self.bot, {51: _user(51, "Friend")})
+        self.bot.get_channel = lambda channel_id: SimpleNamespace(
+            permissions_for=lambda viewer: SimpleNamespace(view_channel=True)
+        )
+        self.bot.store.company_rows = [{"channel_id": 40, "member_id": 51, "seconds": 60.0}]
+        interaction = FakeInteraction(channel_id=20)
+        interaction.guild = SimpleNamespace(default_role=object())
+        await self.command("company").callback(interaction, user=_user(41, "Ana"))
+        sent = interaction.followup.sent[0]
+        self.assertTrue(sent["content"].startswith("**Ana's voice company — this week**"))
+        self.assertEqual(sent["file"].filename, "flock-voice-company.png")
+
+    # -- /flock top -------------------------------------------------------------
+
+    async def test_top_ranks_ties_by_user_id_omits_zero_and_counts_the_rest(self):
+        _fake_guild(self.bot, {number: _user(number, f"P{number}") for number in range(1, 15)})
+        self.bot.store.ranking_rows = [
+            _rank(14, messages=1), _rank(1, messages=5), _rank(2, messages=9), _rank(3, messages=5),
+            _rank(4, messages=0, voice=100.0), _rank(5, messages=7, tracked=False),
+        ] + [_rank(number, messages=1) for number in range(6, 14)]
+        content = await commands_module._top_text(self.bot, "week", "messages")
+        self.assertEqual(
+            content.splitlines(),
+            [
+                "**Top messages — this week**",
+                "🥇 **P2** — 9 messages",
+                "🥈 **P5** — 7 messages (no longer tracked)",
+                "🥉 **P1** — 5 messages",
+                "4. **P3** — 5 messages",
+                "5. **P6** — 1 message",
+                "6. **P7** — 1 message",
+                "7. **P8** — 1 message",
+                "8. **P9** — 1 message",
+                "9. **P10** — 1 message",
+                "10. **P11** — 1 message",
+                "…and 3 more.",
+                "Only activity observed while each person was tracked is counted.",
+            ],
+        )
+        self.assertNotIn("P4", content)
+
+    async def test_top_metrics_and_alias_for_active_days(self):
+        _fake_guild(self.bot, {number: _user(number, f"P{number}") for number in range(1, 5)})
+        self.bot.store.ranking_rows = [
+            _rank(1, messages=50, voice=90.0, days=1),
+            _rank(2, messages=0, voice=3600.0, days=3),
+            _rank(3, messages=5, voice=0.0, days=3),
+            _rank(4),
+        ]
+        voice = await commands_module._top_text(self.bot, "all", "voice")
+        self.assertEqual(voice.splitlines()[0], "**Top observed voice time — all time**")
+        self.assertEqual(voice.splitlines()[1], "🥇 **P2** — 1h 0m")
+        self.assertEqual(voice.splitlines()[2], "🥈 **P1** — 1m")
+        self.assertEqual(len(voice.splitlines()), 4)
+        for metric in ("active_days", "active days"):
+            days = await commands_module._top_text(self.bot, "month", metric)
+            self.assertEqual(
+                days.splitlines()[:3],
+                ["**Top active days — this month**", "🥇 **P2** — 3 days", "🥈 **P3** — 3 days"],
+            )
+            self.assertIn("🥉 **P1** — 1 day", days)
+        self.bot.store.ranking_rows = [_rank(1), _rank(2)]
+        self.assertEqual(
+            await commands_module._top_text(self.bot, "today", "messages"),
+            "No messages to rank for today.",
+        )
+
+    async def test_top_command_defaults_period_and_visibility_and_live_data(self):
+        _fake_guild(self.bot, {1: _user(1, "Ana"), 2: _user(2, "Bob")})
+        self.bot.store.ranking_rows = [_rank(1, messages=3), _rank(2, messages=2)]
+        self.config.public_report_channel_ids = frozenset({20})
+        top = self.command("top")
+        public = FakeInteraction(channel_id=20)
+        await top.callback(public)
+        self.assertEqual(self.bot.store.ranking_calls, ["week"])
+        self.assertFalse(public.followup.sent[0]["ephemeral"])
+        self.assertIn("🥇 **Ana** — 3 messages", public.followup.sent[0]["content"])
+        self.assertTrue(self.bot.store.include_live)
+        private = FakeInteraction(channel_id=21)
+        self.bot.tracker.collection_ready = False
+        await top.callback(private, period="all", metric="voice")
+        self.assertTrue(private.followup.sent[0]["ephemeral"])
+        self.assertEqual(self.bot.store.ranking_calls, ["week", "all"])
+        self.assertFalse(self.bot.store.include_live)
+
+    async def test_top_escapes_names_and_survives_failures(self):
+        _fake_guild(self.bot, {1: _user(1, "**Ana** @everyone")})
+        self.bot.store.ranking_rows = [_rank(1, messages=3)]
+        interaction = FakeInteraction()
+        await self.command("top").callback(interaction)
+        content = interaction.followup.sent[0]["content"]
+        self.assertIn("\\*\\*Ana\\*\\*", content)
+        self.assertNotIn("@everyone", content)
+
+        async def broken(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        self.bot.store.ranking = broken
+        failed = FakeInteraction()
+        with self.assertLogs("flock_cctv.commands", level="ERROR") as logs:
+            await self.command("top").callback(failed)
+        self.assertIn("Slash command flock top failed", logs.output[0])
+        self.assertEqual(failed.followup.sent[0]["content"], commands_module._FAILURE_TEXT)
+
+    # -- /flock track -----------------------------------------------------------
+
+    async def test_track_add_is_for_owner_and_effective_admins_and_private(self):
+        self.config.public_report_channel_ids = frozenset({20})
+        snapshot = {41: 7}
+        self.bot.voice_snapshot = lambda: snapshot
+        self.bot.tracker.track_user = AsyncMock(return_value=True)
+        add = self.command("add", "track")
+        member = _user(35, "Nick", username="joined")
+        for actor in (31, 33):
+            interaction = FakeInteraction(channel_id=20, user=SimpleNamespace(id=actor))
+            await add.callback(interaction, member)
+            sent = interaction.followup.sent[0]
+            self.assertTrue(sent["ephemeral"])
+            self.assertEqual(
+                sent["content"],
+                "Nick (@joined) — 35 is now tracked. Their messages and voice time are counted from now.",
+            )
+        self.assertEqual(
+            self.bot.tracker.track_user.await_args_list,
+            [call(35, 31, snapshot), call(35, 33, snapshot)],
+        )
+
+        # Admins and the owner may be tracked themselves.
+        own = FakeInteraction(user=SimpleNamespace(id=31))
+        await add.callback(own, _user(31, "Owner"))
+        self.bot.tracker.track_user.assert_awaited_with(31, 31, snapshot)
+
+        self.bot.tracker.track_user.reset_mock()
+        for actor, manage in ((32, False), (30, False), (34, True)):
+            denied = FakeInteraction(
+                channel_id=20,
+                user=SimpleNamespace(id=actor, guild_permissions=SimpleNamespace(manage_guild=manage)),
+            )
+            await add.callback(denied, member)
+            self.assertIn("Only configured tracker admins", denied.response.sent[0]["content"])
+            self.assertTrue(denied.response.sent[0]["ephemeral"])
+        self.bot.store.admin_decisions[33] = False  # revoked admin
+        revoked = FakeInteraction(user=SimpleNamespace(id=33))
+        await add.callback(revoked, member)
+        self.assertIn("Only configured tracker admins", revoked.response.sent[0]["content"])
+        self.bot.tracker.track_user.assert_not_awaited()
+
+    async def test_track_add_rejects_bots_reports_duplicates_and_pause(self):
+        self.bot.tracker.track_user = AsyncMock(return_value=True)
+        add = self.command("add", "track")
+        bot_member = _user(36, "Robo", bot=True)
+        rejected = FakeInteraction(user=SimpleNamespace(id=31))
+        await add.callback(rejected, bot_member)
+        self.assertEqual(rejected.response.sent[0]["content"], "Bots can't be tracked.")
+        self.assertTrue(rejected.response.sent[0]["ephemeral"])
+        self.bot.tracker.track_user.assert_not_awaited()
+
+        self.bot.tracker.track_user.return_value = False
+        duplicate = FakeInteraction(user=SimpleNamespace(id=31))
+        await add.callback(duplicate, _user(35, "Nick", username="joined"))
+        self.assertEqual(duplicate.followup.sent[0]["content"], "Nick (@joined) — 35 is already tracked.")
+
+        self.bot.tracker.track_user.return_value = True
+        self.bot.store.paused = True
+        paused = FakeInteraction(user=SimpleNamespace(id=31))
+        await add.callback(paused, _user(35, "Nick", username="joined"))
+        self.assertIn("counting starts when it resumes", paused.followup.sent[0]["content"])
+
+        wrong = FakeInteraction(guild_id=99, user=SimpleNamespace(id=31))
+        await add.callback(wrong, _user(35, "Nick"))
+        self.assertIn("configured server", wrong.response.sent[0]["content"])
+        self.assertEqual(self.bot.tracker.track_user.await_count, 2)
+
+    async def test_track_add_failure_is_logged_and_private(self):
+        self.bot.tracker.track_user = AsyncMock(side_effect=RuntimeError("boom"))
+        interaction = FakeInteraction(user=SimpleNamespace(id=31), channel_id=20)
+        self.config.public_report_channel_ids = frozenset({20})
+        with self.assertLogs("flock_cctv.commands", level="ERROR") as logs:
+            await self.command("add", "track").callback(interaction, _user(35, "Nick"))
+        self.assertIn("Slash command flock track add failed", logs.output[0])
+        self.assertEqual(interaction.followup.sent[0]["content"], commands_module._FAILURE_TEXT)
+        self.assertTrue(interaction.followup.sent[0]["ephemeral"])
+
+    async def test_track_remove_accepts_ids_mentions_and_departed_members(self):
+        self.config.public_report_channel_ids = frozenset({20})
+        _fake_guild(self.bot)
+        self.bot.fetch_user = AsyncMock(
+            return_value=SimpleNamespace(display_name="Former", name="left_server")
+        )
+        self.bot.tracker.untrack_user = AsyncMock(return_value=True)
+        remove = self.command("remove", "track")
+        for actor, raw in ((31, "35"), (33, "<@!35>")):
+            interaction = FakeInteraction(channel_id=20, user=SimpleNamespace(id=actor))
+            await remove.callback(interaction, raw)
+            sent = interaction.followup.sent[0]
+            self.assertTrue(sent["ephemeral"])
+            self.assertEqual(
+                sent["content"],
+                "Former (@left\\_server) — 35 is no longer tracked. Their recorded history is kept.",
+            )
+        self.assertEqual(
+            self.bot.tracker.untrack_user.await_args_list,
+            [call(35, 31), call(35, 33)],
+        )
+
+        self.bot.fetch_user.side_effect = TimeoutError
+        unknown = FakeInteraction(user=SimpleNamespace(id=31))
+        await remove.callback(unknown, "36")
+        self.assertEqual(
+            unknown.followup.sent[0]["content"],
+            "Unknown user — 36 is no longer tracked. Their recorded history is kept.",
+        )
+
+        self.bot.tracker.untrack_user.return_value = False
+        not_tracked = FakeInteraction(user=SimpleNamespace(id=31))
+        await remove.callback(not_tracked, "37")
+        self.assertEqual(
+            not_tracked.followup.sent[0]["content"], "Unknown user — 37 isn't currently tracked."
+        )
+
+    async def test_track_remove_rejects_bad_ids_and_non_admins(self):
+        self.bot.tracker.untrack_user = AsyncMock(return_value=True)
+        remove = self.command("remove", "track")
+        invalid = FakeInteraction(user=SimpleNamespace(id=31))
+        await remove.callback(invalid, "not an id")
+        self.assertIn("positive Discord user ID", invalid.response.sent[0]["content"])
+        zero = FakeInteraction(user=SimpleNamespace(id=31))
+        await remove.callback(zero, "0")
+        self.assertIn("positive Discord user ID", zero.response.sent[0]["content"])
+        for actor, manage in ((32, False), (30, False), (34, True)):
+            denied = FakeInteraction(
+                user=SimpleNamespace(id=actor, guild_permissions=SimpleNamespace(manage_guild=manage))
+            )
+            await remove.callback(denied, "35")
+            self.assertIn("Only configured tracker admins", denied.response.sent[0]["content"])
+            self.assertTrue(denied.response.sent[0]["ephemeral"])
+        wrong = FakeInteraction(guild_id=99, user=SimpleNamespace(id=31))
+        await remove.callback(wrong, "35")
+        self.assertIn("configured server", wrong.response.sent[0]["content"])
+        self.bot.tracker.untrack_user.assert_not_awaited()
+
+    async def test_track_list_is_private_for_anyone_and_shows_current_then_former_with_history(self):
+        self.config.public_report_channel_ids = frozenset({20})
+        self.bot.store.tracked = [
+            _row(30), _row(41), _row(42, active=False, updated=1_700_086_400.0),
+            _row(43, active=False), _row(44, active=False),
+        ]
+        # Only the people with recorded activity count as having history.
+        self.bot.store.ranking_rows = [
+            _rank(30), _rank(41, messages=3), _rank(42, voice=60.0, tracked=False),
+            _rank(44, days=0, tracked=False),
+        ]
+        _fake_guild(self.bot, {
+            30: _user(30, "Leland"), 41: _user(41, "Ana *x*", username="ana"),
+            42: _user(42, "Bob"), 43: _user(43, "Never"), 44: _user(44, "Empty"),
+        })
+        interaction = FakeInteraction(channel_id=20, user=SimpleNamespace(id=32))
+        await self.command("list", "track").callback(interaction)
+        sent = interaction.followup.sent[0]
+        self.assertTrue(sent["ephemeral"])
+        self.assertEqual(
+            sent["content"].splitlines(),
+            [
+                "**Tracked people (2)**",
+                "Leland (@leland) — 30 (since Nov 14, 2023)",
+                "Ana \\*x\\* (@ana) — 41 (since Nov 14, 2023)",
+                "Formerly tracked (history kept):",
+                "Bob (@bob) — 42 (stopped Nov 15, 2023)",
+            ],
+        )
+        self.assertEqual(self.bot.store.ranking_calls, ["all"])
+
+    async def test_track_list_when_empty_and_when_too_long(self):
+        self.bot.store.tracked = []
+        _fake_guild(self.bot)
+        interaction = FakeInteraction()
+        await self.command("list", "track").callback(interaction)
+        self.assertEqual(
+            interaction.followup.sent[0]["content"].splitlines(),
+            ["**Tracked people (0)**", "Nobody is tracked yet. An admin can add people with `/flock track add`."],
+        )
+
+        count = 120
+        self.bot.store.tracked = [_row(1000 + number) for number in range(count)]
+        _fake_guild(
+            self.bot,
+            {1000 + number: _user(1000 + number, f"Person number {number}") for number in range(count)},
+        )
+        long = FakeInteraction()
+        await self.command("list", "track").callback(long)
+        content = long.followup.sent[0]["content"]
+        self.assertLess(len(content), 2000)
+        shown = content.count("(since ")
+        self.assertEqual(content.splitlines()[-1], f"…and {count - shown:,} more people")
+        self.assertGreater(shown, 10)
+
+    async def test_track_list_failure_is_safe(self):
+        async def broken():
+            raise RuntimeError("boom")
+
+        self.bot.store.tracked_users = broken
+        interaction = FakeInteraction()
+        with self.assertLogs("flock_cctv.commands", level="ERROR") as logs:
+            await self.command("list", "track").callback(interaction)
+        self.assertIn("Slash command flock track list failed", logs.output[0])
+        self.assertEqual(interaction.followup.sent[0]["content"], commands_module._FAILURE_TEXT)
+
+    # -- /flock delete-data [user] ----------------------------------------------
+
+    async def test_per_person_delete_confirms_by_name_and_deletes_only_that_person(self):
+        self.bot.tracker.delete_user_data = AsyncMock(return_value=True)
+        self.bot.tracker.delete_data = AsyncMock()
+        command = self.command("delete-data")
+        interaction = FakeInteraction(user=SimpleNamespace(id=31))
+        await command.callback(interaction, user=_user(41, "Ana *x*"))
+        sent = interaction.response.sent[0]
+        self.assertTrue(sent["ephemeral"])
+        self.assertIn("**Ana \\*x\\***", sent["content"])
+        self.assertIn("only", sent["content"])
+        self.assertIn("Collection for everyone else continues", sent["content"])
+        self.assertNotIn("pauses collection", sent["content"])
+        view = sent["view"]
+        self.assertEqual(view.target_id, 41)
+        self.bot.tracker.delete_user_data.assert_not_awaited()
+
+        confirmation = FakeInteraction(user=SimpleNamespace(id=31))
+        await view.children[0].callback(confirmation)
+        self.bot.tracker.delete_user_data.assert_awaited_once_with(41, 31)
+        self.bot.tracker.delete_data.assert_not_awaited()
+        edited = confirmation.edited[0]
+        self.assertIsNone(edited["view"])
+        self.assertIn("Ana \\*x\\*'s statistics and managed local backups were deleted", edited["content"])
+        self.assertIn("Collection for everyone else continues", edited["content"])
+
+        # Pressing the confirmation again does nothing more.
+        again = FakeInteraction(user=SimpleNamespace(id=31))
+        await view.children[0].callback(again)
+        self.assertIn("expired or finished", again.response.sent[0]["content"])
+        self.bot.tracker.delete_user_data.assert_awaited_once()
+
+    async def test_global_delete_still_confirms_for_everyone_and_calls_delete_data(self):
+        self.bot.tracker.delete_user_data = AsyncMock()
+        self.bot.tracker.delete_data = AsyncMock()
+        interaction = FakeInteraction(user=SimpleNamespace(id=31))
+        await self.command("delete-data").callback(interaction)
+        sent = interaction.response.sent[0]
+        self.assertTrue(sent["ephemeral"])
+        self.assertIn("everyone", sent["content"])
+        self.assertIn("pauses collection", sent["content"])
+        view = sent["view"]
+        self.assertIsNone(view.target_id)
+        confirmation = FakeInteraction(user=SimpleNamespace(id=31))
+        await view.children[0].callback(confirmation)
+        self.bot.tracker.delete_data.assert_awaited_once_with(actor_id=31)
+        self.bot.tracker.delete_user_data.assert_not_awaited()
+        self.assertIn("Collection remains paused", confirmation.edited[0]["content"])
+        self.assertIsNone(confirmation.edited[0]["view"])
+
+    async def test_per_person_delete_with_nothing_recorded_and_failures(self):
+        self.bot.tracker.delete_user_data = AsyncMock(return_value=False)
+        view = DeleteDataConfirmation(self.bot, invoker_id=31, target_id=41, target_name="Ana")
+        nothing = FakeInteraction(user=SimpleNamespace(id=31))
+        await view.children[0].callback(nothing)
+        self.assertEqual(nothing.edited[0]["content"], "No statistics were recorded for Ana.")
+
+        self.bot.tracker.delete_user_data = AsyncMock(side_effect=RuntimeError("boom"))
+        retry = DeleteDataConfirmation(self.bot, invoker_id=31, target_id=41, target_name="Ana")
+        failed = FakeInteraction(user=SimpleNamespace(id=31))
+        with self.assertLogs("flock_cctv.commands", level="ERROR"):
+            await retry.children[0].callback(failed)
+        self.assertIn("could not delete the data", failed.edited[0]["content"])
+        self.assertIs(failed.edited[0]["view"], retry)
+        self.bot.tracker.delete_user_data = AsyncMock(return_value=True)
+        retried = FakeInteraction(user=SimpleNamespace(id=31))
+        await retry.children[0].callback(retried)
+        self.bot.tracker.delete_user_data.assert_awaited_once_with(41, 31)
+
+    async def test_per_person_delete_confirmation_is_restricted_rechecked_and_expires(self):
+        self.bot.tracker.delete_user_data = AsyncMock(return_value=True)
+        view = DeleteDataConfirmation(self.bot, invoker_id=33, target_id=41, target_name="Ana")
+        stranger = FakeInteraction(user=SimpleNamespace(id=31))
+        await view.children[0].callback(stranger)
+        self.assertIn("Only the person", stranger.response.sent[0]["content"])
+
+        self.bot.store.admin_decisions[33] = False  # access revoked while the prompt was open
+        revoked = FakeInteraction(user=SimpleNamespace(id=33))
+        await view.children[0].callback(revoked)
+        self.assertIn("Only configured tracker admins", revoked.response.sent[0]["content"])
+
+        self.bot.store.admin_decisions[33] = True
+        wrong_guild = FakeInteraction(guild_id=99, user=SimpleNamespace(id=33))
+        await view.children[0].callback(wrong_guild)
+        self.assertIn("configured server", wrong_guild.response.sent[0]["content"])
+
+        await view.on_timeout()
+        self.assertTrue(all(item.disabled for item in view.children))
+        expired = FakeInteraction(user=SimpleNamespace(id=33))
+        await view.children[0].callback(expired)
+        self.assertIn("expired or finished", expired.response.sent[0]["content"])
+        self.bot.tracker.delete_user_data.assert_not_awaited()
+
+    async def test_delete_confirmation_cancel_is_restricted_and_deletes_nothing(self):
+        self.bot.tracker.delete_user_data = AsyncMock()
+        self.bot.tracker.delete_data = AsyncMock()
+        view = DeleteDataConfirmation(self.bot, invoker_id=31, target_id=41, target_name="Ana")
+        stranger = FakeInteraction(user=SimpleNamespace(id=33))
+        await view.children[1].callback(stranger)
+        self.assertIn("Only the person", stranger.response.sent[0]["content"])
+        cancel = FakeInteraction(user=SimpleNamespace(id=31))
+        await view.children[1].callback(cancel)
+        self.assertEqual(cancel.response.sent[0]["content"], "Data deletion cancelled.")
+        self.assertTrue(view.is_finished())
+        self.bot.tracker.delete_user_data.assert_not_awaited()
+        self.bot.tracker.delete_data.assert_not_awaited()
+
+    async def test_delete_data_for_a_bot_is_refused_privately(self):
+        self.bot.tracker.delete_user_data = AsyncMock()
+        interaction = FakeInteraction(user=SimpleNamespace(id=31))
+        await self.command("delete-data").callback(interaction, user=_user(900, "Robo", bot=True))
+        self.assertEqual(interaction.response.sent[0]["content"], "Bots aren't tracked.")
+        self.assertTrue(interaction.response.sent[0]["ephemeral"])
+        self.assertNotIn("view", interaction.response.sent[0])
+
+    # -- Admins and Leland legacy ----------------------------------------------
+
+    async def test_admin_add_rejects_leland_only_when_configured(self):
+        add = self.command("add", "admin")
+        leland = _user(30, "Leland")
+        denied = FakeInteraction(user=SimpleNamespace(id=31))
+        await add.callback(denied, leland)
+        self.assertIn("Choose a human member", denied.response.sent[0]["content"])
+        self.assertNotIn(30, self.bot.store.admin_decisions)
+
+        self.config.leland_user_id = None
+        allowed = FakeInteraction(user=SimpleNamespace(id=31))
+        await add.callback(allowed, leland)
+        self.assertTrue(self.bot.store.admin_decisions[30])
+
+    async def test_leland_cannot_control_only_when_configured(self):
+        self.config.admin_user_ids = frozenset({30, 33})
+        self.assertFalse(await _can_control(FakeInteraction(user=SimpleNamespace(id=30)), self.bot))
+        self.config.leland_user_id = None
+        self.assertTrue(await _can_control(FakeInteraction(user=SimpleNamespace(id=30)), self.bot))
+        self.assertFalse(await _can_control(FakeInteraction(user=SimpleNamespace(id=32)), self.bot))
+
+    async def test_leland_toggles_reply_privately_when_not_configured(self):
+        self.config.leland_user_id = None
+        self.config.public_report_channel_ids = frozenset({20})
+        self.bot.store.set_evil_mode = AsyncMock()
+        self.bot.store.set_reaction_mode = AsyncMock()
+        for name in ("evil-mode", "reaction-mode"):
+            command = self.command(name)
+            with self.subTest(command=name):
+                owner = FakeInteraction(channel_id=20, user=SimpleNamespace(id=31))
+                await command.callback(owner, "on")
+                sent = owner.response.sent[0]
+                self.assertEqual(sent["content"], "Leland mode isn't configured.")
+                self.assertTrue(sent["ephemeral"])
+                self.assertFalse(owner.response.deferred)
+                # Permission is still checked first.
+                member = FakeInteraction(channel_id=20, user=SimpleNamespace(id=32))
+                await command.callback(member, "on")
+                self.assertIn("Only configured tracker admins", member.response.sent[0]["content"])
+        self.bot.store.set_evil_mode.assert_not_awaited()
+        self.bot.store.set_reaction_mode.assert_not_awaited()
+
+    # -- help and about ---------------------------------------------------------
+
+    async def test_help_lists_every_command_and_leland_ones_only_when_configured(self):
+        text = commands_module._help_text(self.bot)
+        for expected in (
+            "/flock stats", "/flock records", "/flock where", "/flock company", "/flock leaderboard",
+            "/flock trends", "/flock online", "/flock roast", "/flock top", "/flock track list",
+            "/flock track add", "/flock help", "/flock about", "/flock version", "/flock update",
+            "/flock pause", "/flock resume", "/flock delete-data", "/flock admin add",
+            "optional `user`", "/flock evil-mode", "/flock reaction-mode", "America/Costa_Rica",
+            "**Flock commands**",
+        ):
+            self.assertIn(expected, text)
+        for banned in ("/leland", "tldr", "TL;DR", "Leland Tracker"):
+            self.assertNotIn(banned, text)
+        self.config.leland_user_id = None
+        text = commands_module._help_text(self.bot)
+        self.assertNotIn("evil-mode", text)
+        self.assertNotIn("reaction-mode", text)
+        self.assertNotIn("Leland", text)
+        self.assertIn("/flock top", text)
+        # A reply must fit Discord's 2000 character limit, even with a long timezone name.
+        for leland_id in (30, None):
+            self.config.leland_user_id = leland_id
+            self.config.timezone = "America/Argentina/ComodRivadavia"
+            self.assertLessEqual(len(commands_module._help_text(self.bot)), 2000)
+
+    async def test_help_command_follows_report_visibility(self):
+        self.config.public_report_channel_ids = frozenset({20})
+        command = self.command("help")
+        public = FakeInteraction(channel_id=20)
+        await command.callback(public)
+        self.assertFalse(public.followup.sent[0]["ephemeral"])
+        private = FakeInteraction(channel_id=21)
+        await command.callback(private)
+        self.assertTrue(private.followup.sent[0]["ephemeral"])
+
+    async def test_about_shows_tracked_people_and_leland_modes_only_when_configured(self):
+        report = await _status_text(self.bot)
+        self.assertIn("Tracked people: **2**", report)  # 30 and 41; 42 is no longer tracked
+        self.assertIn("Evil Leland mode: **off**", report)
+        self.assertIn("Reaction mode: **off**", report)
+        self.config.leland_user_id = None
+        report = await _status_text(self.bot)
+        self.assertIn("Tracked people: **2**", report)
+        self.assertNotIn("Leland", report)
+        self.assertNotIn("Reaction mode", report)
+        self.assertIn("Message collector: **enabled**; voice collector: **enabled**", report)
+        self.assertIn("Last checkpoint:", report)
+        self.assertIn("Recorded coverage gaps: **2m**", report)
+
+    async def test_about_survives_unreadable_coverage_totals(self):
+        async def broken(now):
+            raise RuntimeError("boom")
+
+        self.bot.store.coverage_gap_seconds = broken
+        with self.assertLogs("flock_cctv.commands", level="ERROR"):
+            report = await _status_text(self.bot)
+        self.assertIn("Coverage totals are temporarily unavailable", report)
+        self.assertIn("Tracked people: **2**", report)
+
+    async def test_about_survives_an_unreadable_tracked_list(self):
+        async def broken():
+            raise RuntimeError("boom")
+
+        self.bot.store.tracked_users = broken
+        with self.assertLogs("flock_cctv.commands", level="ERROR"):
+            report = await _status_text(self.bot)
+        self.assertIn("tracked people count is temporarily unavailable", report)
+        self.assertIn("Collection: **running**", report)
 
 
 if __name__ == "__main__":

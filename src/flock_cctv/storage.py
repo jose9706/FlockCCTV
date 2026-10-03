@@ -1585,6 +1585,35 @@ class Store:
 
         return await self._run(operation)
 
+    async def coverage_gap_seconds(self, now: float) -> float:
+        """Return the collector's recorded coverage gaps since the database clock began.
+
+        This is the global outage total shown by ``/flock about``; an open gap
+        counts through ``now``. Per-person gaps come from ``stats``.
+        """
+        now = self._timestamp(now)
+
+        def operation() -> float:
+            conn = self._conn()
+            settings = self._settings(conn)
+            start = float(settings["tracking_since"])
+            end = max(now, start)
+            return sum(
+                interval_overlap(
+                    float(row["started_at"]),
+                    end if row["ended_at"] is None else float(row["ended_at"]),
+                    start,
+                    end,
+                )
+                for row in conn.execute(
+                    "SELECT started_at, ended_at FROM coverage_gaps WHERE started_at < ? "
+                    "AND COALESCE(ended_at, ?) > ?",
+                    (end, end, start),
+                )
+            )
+
+        return await self._run(operation)
+
     async def period_comparison(
         self, user_id: int, period: str, now: float, *, include_live: bool = True
     ) -> dict[str, Any]:

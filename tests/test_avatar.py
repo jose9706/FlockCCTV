@@ -34,10 +34,10 @@ class AvatarSyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_sync_edits_once_for_each_source_avatar(self):
         with TemporaryDirectory() as directory:
             config = Config(
-                token="test-token", guild_id=10, target_user_id=20, owner_user_id=99,
+                token="test-token", guild_id=10, owner_user_id=99,
                 output_channel_id=None, text_channel_ids=None, voice_channel_ids=None,
                 timezone="UTC", database_path=Path(directory) / "tracker.sqlite3",
-                backup_dir=Path(directory) / "backups",
+                backup_dir=Path(directory) / "backups", leland_user_id=20,
             )
             bot = create_bot(config)
             class FakeAsset:
@@ -61,6 +61,8 @@ class AvatarSyncTests(unittest.IsolatedAsyncioTestCase):
             bot._connection.user = user
 
             await bot._sync_avatar()
+            # The avatar mirrors the configured Leland user's server avatar.
+            guild.fetch_member.assert_awaited_once_with(20)
             user.edit.assert_awaited_once()
             self.assertTrue(user.edit.await_args.kwargs["avatar"].startswith(b"\x89PNG"))
             self.assertTrue(config.database_path.with_name("avatar-source.json").exists())
