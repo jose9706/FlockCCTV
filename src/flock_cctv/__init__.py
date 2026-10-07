@@ -10,7 +10,7 @@ from pathlib import Path
 # Single source of truth for the release number (pyproject.toml reads it).
 # Bump it in the pull request that changes behavior: MAJOR for incompatible
 # storage or configuration changes, MINOR for features, PATCH for fixes.
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 _REVISION_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 

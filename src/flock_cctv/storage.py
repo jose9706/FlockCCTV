@@ -37,6 +37,26 @@ from .stats import (
 )
 
 _T = TypeVar("_T")
+
+
+def _subtract_intervals(
+    pieces: list[tuple[float, float]], removed: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Return the parts of merged ``pieces`` not covered by merged ``removed``."""
+    result: list[tuple[float, float]] = []
+    for piece_start, piece_end in pieces:
+        cursor = piece_start
+        for cut_start, cut_end in removed:
+            if cut_end <= cursor or cut_start >= piece_end:
+                continue
+            if cut_start > cursor:
+                result.append((cursor, cut_start))
+            cursor = max(cursor, cut_end)
+        if cursor < piece_end:
+            result.append((cursor, piece_end))
+    return result
+
+
 logger = logging.getLogger(__name__)
 _BACKUP_RE = re.compile(r"^flock-cctv-(\d{4}-\d{2}-\d{2})\.sqlite3$")
 _BACKUP_TEMP_RE = re.compile(
@@ -1402,25 +1422,40 @@ class Store:
         include_live: bool,
     ) -> dict[str, Any]:
         """Return exact detail-based totals for one person in ``[start, end)``."""
-        messages = int(conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE user_id = ? AND created_at >= ? AND created_at < ?",
-            (user_text, start, end),
-        ).fetchone()[0])
+        message_times = sorted(
+            float(row[0])
+            for row in conn.execute(
+                "SELECT created_at FROM messages "
+                "WHERE user_id = ? AND created_at >= ? AND created_at < ?",
+                (user_text, start, end),
+            )
+        )
+        messages = len(message_times)
         visits = int(conn.execute(
             "SELECT COUNT(*) FROM voice_visits WHERE user_id = ? AND complete_start = 1 "
             "AND started_at >= ? AND started_at < ?",
             (user_text, start, end),
         ).fetchone()[0])
         voice = 0.0
+        voice_pieces: list[tuple[float, float]] = []
+
+        def add_voice(piece_start: float, piece_end: float) -> None:
+            nonlocal voice
+            seconds = interval_overlap(piece_start, piece_end, start, end)
+            voice += seconds
+            if seconds > 0:
+                voice_pieces.append((max(piece_start, start), min(piece_end, end)))
+
         for row in conn.execute(
             "SELECT started_at, COALESCE(ended_at, checkpoint) AS ended_at FROM voice_segments "
             "WHERE user_id = ? AND started_at < ? AND COALESCE(ended_at, checkpoint) > ?",
             (user_text, end, start),
         ):
-            voice += interval_overlap(float(row["started_at"]), float(row["ended_at"]), start, end)
+            add_voice(float(row["started_at"]), float(row["ended_at"]))
         segment = self._live_segment(conn, settings, user_text, include_live)
         if segment is not None:
-            voice += interval_overlap(float(segment["checkpoint"]), max(now, float(segment["checkpoint"])), start, end)
+            add_voice(float(segment["checkpoint"]), max(now, float(segment["checkpoint"])))
+        voice_pieces.sort()
         live_until = now if self._is_live(settings, include_live) else None
         watched = sum(self._watched_by_day(conn, user_text, start, end, live_until).values())
         return {
@@ -1430,6 +1465,8 @@ class Store:
             "voice_seconds": voice,
             "voice_visits": visits,
             "watched_seconds": watched,
+            "message_times": message_times,
+            "voice_pieces": voice_pieces,
         }
 
     async def stats(
@@ -1952,10 +1989,33 @@ class Store:
                 # Whatever was neither observed nor an outage was idle.
                 totals["idle"] = max(0.0, totals["idle"] - totals["observed"] - totals["outage"])
             series = [{"day": day, **days[day]} for day in sorted(days)]
+            # Tile [start, end] with observed first, then outage outside
+            # observed, then idle; neighbours of the same kind are merged.
+            outage_only = _subtract_intervals(gap_pieces, observed)
+            spans: list[dict[str, Any]] = []
+            cursor = start
+            marks = sorted(
+                [(a, b, "observed") for a, b in observed] + [(a, b, "outage") for a, b in outage_only]
+            )
+
+            def push(span_start: float, span_end: float, kind: str) -> None:
+                if span_end <= span_start:
+                    return
+                if spans and spans[-1]["kind"] == kind and spans[-1]["end"] == span_start:
+                    spans[-1]["end"] = span_end
+                else:
+                    spans.append({"start": span_start, "end": span_end, "kind": kind})
+
+            for mark_start, mark_end, kind in marks:
+                push(cursor, mark_start, "idle")
+                push(mark_start, mark_end, kind)
+                cursor = max(cursor, mark_end)
+            push(cursor, end, "idle")
             return {
                 "start": start,
                 "end": end,
                 "days": series,
+                "spans": spans,
                 "observed": sum(entry["observed"] for entry in series),
                 "outage": sum(entry["outage"] for entry in series),
                 "idle": sum(entry["idle"] for entry in series),
