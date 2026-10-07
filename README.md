@@ -83,7 +83,7 @@ channel IDs to narrow collection. Stats and records omit per-channel totals and
 names; `/flock where` follows the visibility rules described below.
 `/flock company` charts observed time a tracked person shared with human
 companions in those voice channels. Each minute is divided evenly among everyone
-else present, tracked or not; time alone is a separate slice. A person's company
+else present, tracked or not; time alone is a separate bar. A person's company
 is recorded only while they are tracked, so earlier companion time cannot be
 reconstructed.
 

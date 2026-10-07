@@ -488,7 +488,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             key = "avatar-key-2"
 
             async def read(self):
-                raise discord.DiscordException("gone")
+                raise OSError("connection reset")  # aiohttp errors aren't DiscordException
 
         commands_module._AVATAR_CACHE.clear()
         found = SimpleNamespace(display_avatar=Asset())

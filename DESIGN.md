@@ -79,7 +79,7 @@ segments. Mute/deafen changes do not count as joins. Track mute time only if wan
 Each person has at most one open voice segment at a time. Voice company is
 recorded only while a person is tracked; earlier company cannot be
 reconstructed. Bots are excluded. Each observed minute is split evenly among
-the people present, so slices plus time alone sum to the observed, attributable
+the people present, so companion bars plus time alone sum to the observed, attributable
 voice time. Each person's whole shared time is also stored, without the split,
 for the leaderboard, the records' top companion, and for company reports run with `count:full`.
 When someone joins or leaves a channel, every tracked person in it gets the
@@ -178,7 +178,7 @@ history from the deletion moment. With `user` it erases only that person's
 messages, daily totals, visits, company rows where they are the subject, last
 voice observation, records, and tracking history, and removes them from the
 tracked list, without pausing collection for anyone else. Time the erased person
-shared with someone else stays in that person's company history, so its slices
+shared with someone else stays in that person's company history, so its bars
 still sum to their voice time, but it is credited to a "Deleted person" member
 (`-2`) instead of the erased ID; leaderboards and top-companion records never rank
 it. A live roster is current state and keeps counting anyone still present.

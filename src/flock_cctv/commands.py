@@ -392,7 +392,8 @@ async def _avatar_bytes(found: Any) -> bytes | None:
         return _AVATAR_CACHE[key]
     try:
         data = await asyncio.wait_for(asset.replace(size=64, static_format="png").read(), timeout=_AVATAR_TIMEOUT)
-    except (discord.DiscordException, TimeoutError, ValueError, TypeError, AttributeError):
+    except Exception:  # noqa: BLE001 - CDN errors come from aiohttp too; the chart shows an initial.
+        logger.debug("Could not download an avatar for a chart", exc_info=True)
         return None
     if key:
         if len(_AVATAR_CACHE) >= _AVATAR_CACHE_SIZE:
@@ -1699,7 +1700,7 @@ def _help_text(bot: Any) -> str:
         "`/flock stats` — messages, observed voice time, active days, visits, and coverage gaps (week by default).",
         "`/flock records` — busiest day, longest observed voice visit, and top companion.",
         "`/flock where` — last observed voice channel and time.",
-        "`/flock company` — pie chart of who shared observed voice time; `count:full` credits whole group calls.",
+        "`/flock company` — bar chart of who shared observed voice time; `count:full` credits whole group calls.",
         "`/flock leaderboard` — who spent the most voice time with someone, counting whole group calls (all time by default).",
         "`/flock trends` — day by day, versus last period, time of day, day of week, company, or message bursts (last 7 days by default).",
         "`/flock online` — Discord status of a tracked person; away counts as online.",
@@ -1983,8 +1984,13 @@ async def _uptime_report(bot: Any, period: str) -> tuple[str, bytes | None]:
             for start, end, kind in spans
             if start < day_end and end > day_start
         ]
-        covered = float(entry["observed"]) + float(entry["outage"]) + float(entry["idle"])
-        percent = 100.0 * float(entry["observed"]) / covered if covered > 0 else 100.0
+        # Use the drawn spans so the percentage always matches the row's bar.
+        covered = sum(end - start for start, end, _ in pieces)
+        watched = sum(end - start for start, end, kind in pieces if kind == "observed")
+        if not pieces:
+            covered = float(entry["observed"]) + float(entry["outage"]) + float(entry["idle"])
+            watched = float(entry["observed"])
+        percent = 100.0 * watched / covered if covered > 0 else 100.0
         timeline.append(charts.UptimeDay(day.strftime("%a %-d"), pieces, percent))
     stats = [(_percent(observed, elapsed), "watching")]
     notes = []
