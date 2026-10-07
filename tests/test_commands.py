@@ -2407,11 +2407,31 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("reaction-mode", text)
         self.assertNotIn("Leland", text)
         self.assertIn("/flock top", text)
-        # A reply must fit Discord's 2000 character limit, even with a long timezone name.
-        for leland_id in (30, None):
-            self.config.leland_user_id = leland_id
-            self.config.timezone = "America/Argentina/ComodRivadavia"
-            self.assertLessEqual(len(commands_module._help_text(self.bot)), 2000)
+
+    def test_long_replies_split_between_lines_under_discords_limit(self):
+        split = commands_module._split_message
+        self.assertEqual(split("short"), ["short"])
+        self.assertEqual(split(""), [""])
+        lines = [f"**line {index}** " + "x" * 90 for index in range(50)]
+        chunks = split("\n".join(lines))
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 2000 for chunk in chunks))
+        self.assertEqual("\n".join(chunks), "\n".join(lines))  # nothing lost, breaks between lines
+        self.assertTrue(all(chunk.startswith("**line") for chunk in chunks))
+        long_line = "y" * 4500
+        self.assertEqual(split("a\n" + long_line), ["a", "y" * 2000, "y" * 2000, "y" * 500])
+
+    async def test_long_help_is_sent_as_several_messages_with_nothing_lost(self):
+        self.config.timezone = "America/Argentina/ComodRivadavia"
+        long_help = commands_module._help_text(self.bot) + "\n" + "\n".join(f"Extra line {index}" for index in range(150))
+        interaction = FakeInteraction()
+        with patch.object(commands_module, "_help_text", return_value=long_help):
+            await self.command("help").callback(interaction)
+        sent = interaction.followup.sent
+        self.assertGreater(len(sent), 1)
+        self.assertTrue(all(len(message["content"]) <= 2000 for message in sent))
+        self.assertEqual("\n".join(message["content"] for message in sent), long_help)
+        self.assertEqual({message["ephemeral"] for message in sent}, {sent[0]["ephemeral"]})
 
     async def test_help_command_follows_report_visibility(self):
         self.config.public_report_channel_ids = frozenset({20})
