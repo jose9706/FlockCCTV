@@ -95,6 +95,36 @@ def _report_is_ephemeral(bot: Any, interaction: discord.Interaction) -> bool:
     return public_channels is not None and interaction.channel_id not in public_channels
 
 
+# Discord rejects a message longer than this.
+_MESSAGE_LIMIT = 2000
+
+
+def _split_message(content: str, limit: int = _MESSAGE_LIMIT) -> list[str]:
+    """Split ``content`` into messages of at most ``limit`` characters.
+
+    Breaks fall between lines, so Markdown on a line stays intact; only a
+    single line longer than ``limit`` is cut mid-line.
+    """
+    chunks: list[str] = []
+    current = ""
+    for line in content.split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if current and len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current or not chunks:
+        chunks.append(current)
+    return chunks
+
+
 async def _send(
     interaction: discord.Interaction,
     content: str,
@@ -103,19 +133,26 @@ async def _send(
     view: discord.ui.View | None = None,
     file: discord.File | None = None,
 ) -> None:
-    kwargs: dict[str, Any] = {
-        "content": content,
-        "ephemeral": ephemeral,
-        "allowed_mentions": discord.AllowedMentions.none(),
-    }
-    if view is not None:
-        kwargs["view"] = view
-    if file is not None:
-        kwargs["file"] = file
-    if interaction.response.is_done():
-        await interaction.followup.send(**kwargs)
-    else:
-        await interaction.response.send_message(**kwargs)
+    """Reply with ``content``, split over several messages when it is too long.
+
+    The view and file go on the last message, after all of the text.
+    """
+    chunks = _split_message(content)
+    for index, chunk in enumerate(chunks):
+        kwargs: dict[str, Any] = {
+            "content": chunk,
+            "ephemeral": ephemeral,
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        if index == len(chunks) - 1:
+            if view is not None:
+                kwargs["view"] = view
+            if file is not None:
+                kwargs["file"] = file
+        if interaction.response.is_done():
+            await interaction.followup.send(**kwargs)
+        else:
+            await interaction.response.send_message(**kwargs)
 
 
 async def _scope_ok(interaction: discord.Interaction, bot: Any) -> bool:
@@ -1700,7 +1737,7 @@ def _help_text(bot: Any) -> str:
         "`/flock stats` — messages, observed voice time, active days, visits, and coverage gaps (week by default).",
         "`/flock records` — busiest day, longest observed voice visit, and top companion.",
         "`/flock where` — last observed voice channel and time.",
-        "`/flock company` — bar chart of who shared observed voice time; `count:full` credits whole group calls.",
+        "`/flock company` — ranked bar chart of who shared observed voice time; `count:full` credits whole group calls.",
         "`/flock leaderboard` — who spent the most voice time with someone, counting whole group calls (all time by default).",
         "`/flock trends` — day by day, versus last period, time of day, day of week, company, or message bursts (last 7 days by default).",
         "`/flock online` — Discord status of a tracked person; away counts as online.",

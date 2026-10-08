@@ -448,7 +448,7 @@ access when confirmed, expires, and says exactly whether it erases everyone's da
 or one named person's. Without `user` it calls `tracker.delete_data` and the tracked
 list is kept; with `user` it calls `tracker.delete_user_data` and that person is
 untracked while collection for others continues. Roast uses a shared 30-second
-cooldown. Defer slow interactions and use followups; errors get a safe response and
+cooldown. Defer slow interactions and use followups; a reply longer than Discord's 2,000-character limit is split between lines into several messages, with any chart or buttons on the last; errors get a safe response and
 logged traceback. Every command checks the guild and output channel first, then
 admin or owner access, then its arguments. Charts are drawn on a worker thread,
 one at a time, after the store reads finish. `charts.py` draws every chart as a
