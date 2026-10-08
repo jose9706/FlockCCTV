@@ -397,17 +397,23 @@ class Tracker:
             with self._operation(OP_CHECKPOINT):
                 await self.store.checkpoint(time.time())
 
-    async def pause(self, actor_id: int) -> None:
+    async def pause(self, actor_id: int) -> bool:
+        """Pause collection; return False when it was already paused."""
         async with self._lock:
             current = time.time()
             with self._operation(OP_PAUSE):
+                if (await self.store.state())["paused"]:
+                    # Keep who paused it first and when.
+                    return False
                 if not self.collection_ready:
                     await self.store.disconnect(current)
                 await self.store.set_paused(True, actor_id, current)
                 self._collection_since = current
                 self.collection_ready = True
+                return True
 
-    async def resume(self, actor_id: int, snapshot: VoiceSnapshot) -> None:
+    async def resume(self, actor_id: int, snapshot: VoiceSnapshot) -> bool:
+        """Resume collection; return False when it was not paused."""
         async with self._lock:
             current = time.time()
             # Finding collection already running is not a recovery, so an
@@ -415,13 +421,14 @@ class Tracker:
             with self._operation(OP_RESUME, recover=False):
                 state = await self.store.state()
                 if not state["paused"]:
-                    return
+                    return False
                 await self.store.set_paused(False, actor_id, current)
                 self._collection_since = current
                 self.collection_ready = False
                 if self.connected and self.guild_is_available:
                     await self._start_guild_collection(snapshot, current)
                 self.report_recovered(OP_RESUME)
+                return True
 
     async def delete_data(self, actor_id: int) -> None:
         async with self._lock:

@@ -5,7 +5,7 @@ an admin-managed list of people and measures their observed time in configured
 voice channels. It stores statistics in SQLite and is designed to run as a
 systemd service on the Raspberry Pi. It requires Python 3.11 or newer; the
 pinned dependencies were checked on Debian 13, aarch64, with Python 3.13.
-This is release 1.1.0. It replaces the single-person Leland Tracker and starts
+This is release 1.1.1. It replaces the single-person Leland Tracker and starts
 with fresh data: the old database is archived, not imported. See
 [Replacing Leland Tracker](#replacing-leland-tracker).
 
@@ -543,7 +543,7 @@ and the updater rolls back to the current code.
 The release number lives in `src/flock_cctv/__init__.py` (`__version__`,
 semantic versioning) and is bumped by hand in the pull request that changes
 behavior. The updater also stamps the deployed commit into the installed package,
-so the running version is `release (short commit)`, for example `1.1.0 (1a2b3c4)`:
+so the running version is `release (short commit)`, for example `1.1.1 (1a2b3c4)`:
 
 - `/flock version` replies privately with it; `/flock about` also shows it on its second line.
 - The service journal logs `Starting flock-cctv <version>` at every start.
@@ -683,7 +683,8 @@ today, this week, this month, or all time unless stated otherwise.
     tracking began during the previous period, or when that period is older
     than `RETENTION_DAYS`, and notes when either window was not fully watched.
   - `hours`: messages by local weekday and hour as a heatmap, and observed voice
-    time by local hour, with peak hours and the 00:00–05:00 share.
+    time by local hour, with peak hours and the 00:00–05:00 share. Quiet hours
+    the bot watched less than half of are hatched, never shown as quiet.
   - `weekdays`: average messages and voice time per weekday, over days with
     activity or fully watched by the tracker; unwatched quiet days are left out.
     The top day is highlighted and each weekday shows how many days it averages.
@@ -754,7 +755,8 @@ today, this week, this month, or all time unless stated otherwise.
     announced.
 - `/flock pause`, `/flock resume`, and `/flock delete-data` control
   collection. Only the configured owner and extra admins can use these controls.
-  Pausing and resuming apply to everyone.
+  Pausing and resuming apply to everyone. Pausing when already paused keeps
+  the original pause and says so; resuming when nothing is paused says so too.
 - `/flock delete-data user:` (or `user_id:` with an ID or mention, which also
   works after someone leaves the server) requires an ephemeral confirmation and
   checks access again. Cancel works until deletion starts; once it is processing,

@@ -615,6 +615,32 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Most voice time: **Friday** — 2h 0m on average", content)
         self.assertIsNotNone(png)
 
+    def test_weekday_caveat_only_when_each_weekday_appears_at_most_twice(self):
+        def day(name):
+            return {"day": name, "messages": 1, "voice_seconds": 0.0, "watched": True}
+
+        # Three Mondays, but fewer than 14 days in all.
+        three_mondays = [day("2025-03-03"), day("2025-03-10"), day("2025-03-17")]
+        content, _ = commands_module._weekday_trend(three_mondays, "this month", PERSON)
+        self.assertNotIn("at most twice", content)
+        content, _ = commands_module._weekday_trend(three_mondays[:2], "this month", PERSON)
+        self.assertIn("at most twice", content)
+
+    def test_hours_the_tracker_mostly_missed_are_marked_unwatched(self):
+        # 2025-03-03 is a Monday; UTC keeps hours simple.
+        monday = 1_740_960_000.0
+        spans = [
+            {"start": monday, "end": monday + 3 * 3600, "kind": "observed"},
+            {"start": monday + 3 * 3600, "end": monday + 5 * 3600, "kind": "outage"},
+            {"start": monday + 5 * 3600, "end": monday + 5.25 * 3600, "kind": "observed"},
+            {"start": monday + 5.25 * 3600, "end": monday + 6 * 3600, "kind": "idle"},
+        ]
+        cells, hours = commands_module._unwatched_hours(spans, monday, monday + 6 * 3600, "UTC")
+        self.assertEqual(cells[0][:6], [False, False, False, True, True, True])
+        self.assertEqual(hours[:6], [False, False, False, True, True, True])
+        self.assertFalse(any(cells[1]))  # Tuesday wasn't in the window at all
+        self.assertIsNone(commands_module._unwatched_hours([], monday, monday + 3600, "UTC"))
+
     async def test_trends_without_activity_send_text_only(self):
         for kind, expected in (
             ("daily", "No activity has been recorded for this week"),
@@ -1322,6 +1348,16 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("will start when a tracked person joins", interaction.followup.sent[0]["content"])
         self.bot.tracker.resume.assert_awaited_once_with(31, self.bot.voice_snapshot)
 
+    async def test_pause_and_resume_say_when_nothing_changed(self):
+        self.bot.tracker.pause = AsyncMock(return_value=False)
+        self.bot.tracker.resume = AsyncMock(return_value=False)
+        paused = FakeInteraction(user=SimpleNamespace(id=31))
+        await self.command("pause").callback(paused)
+        self.assertIn("already paused", paused.followup.sent[0]["content"])
+        resumed = FakeInteraction(user=SimpleNamespace(id=31))
+        await self.command("resume").callback(resumed)
+        self.assertEqual(resumed.followup.sent[0]["content"], "Collection is already running; nothing was paused.")
+
     async def test_update_command_requests_a_check_privately_unless_held(self):
         import json
         import tempfile
@@ -1778,6 +1814,17 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
             await roast.callback(second, user=_user(41, "Ana"))
             self.assertIn("shared roast cooldown", second.response.sent[0]["content"])
             self.assertTrue(second.response.sent[0]["ephemeral"])
+
+    async def test_roast_without_a_joke_gives_the_cooldown_back(self):
+        roast = self.command("roast")
+        with patch.object(commands_module, "_ROAST_COOLDOWN", SharedRoastCooldown(seconds=30)):
+            with patch.object(commands_module, "make_roast", return_value=None):
+                empty = FakeInteraction(channel_id=20)
+                await roast.callback(empty, user=_user(41, "Ana"))
+                self.assertIn("no recorded activity", empty.followup.sent[0]["content"])
+            joke = FakeInteraction(channel_id=20)
+            await roast.callback(joke, user=_user(41, "Ana"))
+            self.assertTrue(joke.followup.sent[0]["content"].startswith("Ana, "))
 
     async def test_cooldown_reply_rounds_the_wait_up(self):
         for remaining, seconds in ((29.001, 30), (0.2, 1), (5.0, 5)):
@@ -2336,6 +2383,39 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Top voice companion: **P41**", records)
         content, _ = await _company_report(self.bot, private, PERSON, "all")
         self.assertIn("**Deleted person** — 15m", content)
+
+    async def test_deleted_person_never_headlines_company_charts(self):
+        self.bot.get_guild = lambda guild_id: SimpleNamespace(
+            get_member=lambda member_id: SimpleNamespace(display_name=f"P{member_id}")
+        )
+        self.bot.get_channel = lambda channel_id: SimpleNamespace(
+            permissions_for=lambda viewer: SimpleNamespace(view_channel=True)
+        )
+        self.bot.store.company_rows = [
+            {"channel_id": 40, "member_id": -2, "seconds": 900.0, "full_seconds": 900.0},
+            {"channel_id": 40, "member_id": 41, "seconds": 300.0, "full_seconds": 300.0},
+        ]
+        drawn = {}
+
+        def capture(*args):
+            drawn["stats"], drawn["rows"] = args[2], args[3]
+            return b"png"
+
+        with patch.object(commands_module.charts, "company_chart", capture):
+            await _company_report(self.bot, FakeInteraction(channel_id=21), PERSON, "all")
+        self.assertEqual(drawn["stats"][1][0], "P41")  # not "Deleted person"
+        deleted = next(row for row in drawn["rows"] if row.name == "Deleted person")
+        self.assertTrue(deleted.group)
+
+        self.bot.store.company_rows_daily = [
+            {"day": "2025-03-03", "channel_id": 40, "member_id": -2, "seconds": 900.0},
+            {"day": "2025-03-03", "channel_id": 40, "member_id": 41, "seconds": 300.0},
+            {"day": "2025-03-04", "channel_id": 40, "member_id": -2, "seconds": 600.0},
+        ]
+        with patch.object(commands_module.time, "time", return_value=1_741_132_800.0):
+            content, _ = await _trend_report(self.bot, FakeInteraction(), PERSON, "week", "company")
+        self.assertIn("Mon 3: **P41** — 5m", content)
+        self.assertIn("Tue 4: only a deleted person — 10m", content)
 
     async def test_global_delete_still_confirms_for_everyone_and_calls_delete_data(self):
         self.bot.tracker.delete_user_data = AsyncMock()

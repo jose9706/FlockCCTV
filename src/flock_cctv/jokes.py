@@ -78,3 +78,8 @@ class SharedRoastCooldown:
                 return remaining
             self._available_at = current + self.seconds
             return 0.0
+
+    async def refund(self) -> None:
+        """Give back the slot just taken, for a request that produced nothing."""
+        async with self._lock:
+            self._available_at = 0.0
