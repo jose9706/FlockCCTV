@@ -10,6 +10,7 @@ import flock_cctv
 import discord
 from PIL import Image
 
+from flock_cctv import charts
 from flock_cctv import commands as commands_module
 from flock_cctv.jokes import SharedRoastCooldown
 from flock_cctv.commands import (
@@ -18,7 +19,6 @@ from flock_cctv.commands import (
     _company_report,
     _leaderboard_text,
     _online_text,
-    _pie_png,
     _records_text,
     _report_is_ephemeral,
     _scope_ok,
@@ -412,15 +412,97 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         await _records_text(self.bot, FakeInteraction(), PERSON)
         self.assertFalse(self.bot.store.include_live)
 
-    def test_company_pie_contains_large_visible_legend_text(self):
-        png = _pie_png([("Alice 🎮", 90), ("Alone", 30)], "Leland")
+    def test_company_chart_draws_names_without_emoji_boxes(self):
+        self.assertEqual(charts.drawable("dani 🎮 ✨"), "dani ✨")
+        self.assertEqual(charts.drawable("👨‍👩‍👧"), "")
+        png = charts.company_chart(
+            "Voice company", "Who Leland hangs out with", [("2m", "observed")],
+            [charts.CompanyRow("Alice 🎮", 90, charts.SERIES[0], "75%"),
+             charts.CompanyRow("Alone", 30, charts.ALONE, "25%", group=True)],
+            [],
+        )
         with Image.open(BytesIO(png)) as chart:
-            self.assertEqual(chart.size, (1100, 640))
-            label_region = chart.crop((660, 89, 1058, 125))
-            dark_pixels = sum(
-                max(pixel) < 100 for pixel in label_region.getdata()
-            )
-            self.assertGreater(dark_pixels, 100)
+            self.assertEqual(chart.width, charts.WIDTH * charts.OUTPUT_SCALE)
+            self.assertEqual(chart.mode, "RGBA")
+            self.assertEqual(chart.getpixel((0, 0))[3], 0)  # rounded, transparent corner
+            # The name column holds bright text on the dark card.
+            bright = sum(max(pixel[:3]) > 200 for pixel in chart.crop((100, 300, 330, 500)).getdata())
+            self.assertGreater(bright, 100)
+
+    def test_daily_buckets_mark_unwatched_ghost_and_today(self):
+        def day(name, messages, watched):
+            return {"day": name, "messages": messages, "voice_seconds": 0.0, "watched": watched}
+
+        series = [
+            day("2025-03-03", 4, True), day("2025-03-04", 0, True),
+            day("2025-03-05", 0, False), day("2025-03-06", 2, False), day("2025-03-07", 0, False),
+        ]
+        keys, states = commands_module._bucket_states(series, "day", "2025-03-07")
+        self.assertEqual(len(keys), 5)
+        # Activity counts even on a day the tracker did not watch in full.
+        self.assertEqual(states, [None, "ghost", "unwatched", None, "partial"])
+        _, weekly = commands_module._bucket_states(series, "week", "2025-03-07")
+        self.assertEqual(weekly, ["partial"])
+
+    def test_running_totals_follow_send_times_and_voice_pieces(self):
+        window = {
+            "start": 0.0, "end": 100.0,
+            "message_times": [10.0, 10.0, 60.0], "voice_pieces": [(20.0, 40.0), (90.0, 100.0)],
+        }
+        messages = dict(commands_module._running(window, "count"))
+        self.assertEqual((messages[0.0], messages[0.5], messages[1.0]), (0.0, 2.0, 3.0))
+        voice = dict(commands_module._running(window, "duration"))
+        self.assertEqual((voice[0.0], voice[0.5], voice[1.0]), (0.0, 20.0, 30.0))
+        self.assertEqual(commands_module._running({"start": 5.0, "end": 5.0}, "count"), [])
+
+    async def test_companion_colours_follow_all_time_rank_not_this_period(self):
+        self.bot.get_channel = lambda channel_id: SimpleNamespace(
+            permissions_for=lambda viewer: SimpleNamespace(view_channel=True)
+        )
+        self.bot.store.company_rows = [
+            {"channel_id": 1, "member_id": member_id, "seconds": seconds, "full_seconds": seconds}
+            for member_id, seconds in ((0, 9000.0), (41, 50.0), (42, 500.0), (43, 100.0))
+        ]
+        colours = await commands_module._companion_colours(
+            self.bot, FakeInteraction(), PERSON, lambda channel_id: True
+        )
+        self.assertEqual(colours, {42: charts.SERIES[0], 43: charts.SERIES[1], 41: charts.SERIES[2]})
+        self.assertEqual(commands_module._companion_colour(colours, 0), charts.ALONE)
+        self.assertEqual(commands_module._companion_colour(colours, -1), charts.OTHERS)
+        self.assertEqual(commands_module._companion_colour(colours, 99), charts.UNRANKED)
+
+    async def test_avatars_are_cached_and_failures_fall_back_to_initials(self):
+        reads = []
+
+        class Asset:
+            key = "avatar-key-1"
+
+            def replace(self, **options):
+                reads.append(options)
+                return self
+
+            async def read(self):
+                return b"png-bytes"
+
+        class BrokenAsset(Asset):
+            key = "avatar-key-2"
+
+            async def read(self):
+                raise OSError("connection reset")  # aiohttp errors aren't DiscordException
+
+        commands_module._AVATAR_CACHE.clear()
+        found = SimpleNamespace(display_avatar=Asset())
+        self.assertEqual(await commands_module._avatar_bytes(found), b"png-bytes")
+        self.assertEqual(await commands_module._avatar_bytes(found), b"png-bytes")
+        self.assertEqual(reads, [{"size": 64, "static_format": "png"}])
+        self.assertIsNone(await commands_module._avatar_bytes(SimpleNamespace(display_avatar=BrokenAsset())))
+        self.assertIsNone(await commands_module._avatar_bytes(SimpleNamespace(display_name="No avatar")))
+        # A broken image still draws: the initial on the person's colour.
+        png = charts.company_chart(
+            "Voice company", "Who Leland hangs out with", [],
+            [charts.CompanyRow("Alice", 60, charts.SERIES[0], "100%", avatar=b"not an image")], [],
+        )
+        self.assertTrue(png.startswith(b"\x89PNG"))
 
     def test_streaks_keep_current_run_alive_until_today_ends(self):
         def day(messages, voice=0.0):
@@ -463,24 +545,25 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Ghost days: **1**; longest ghost streak **1 day** (Sun Mar 2)", content)
         self.assertTrue(self.bot.store.include_live)
         with Image.open(BytesIO(png)) as chart:
-            self.assertEqual(chart.size[0], commands_module._CHART_WIDTH)
+            self.assertEqual(chart.size[0], charts.WIDTH * charts.OUTPUT_SCALE)
 
     def test_axis_ticks_are_round_start_at_zero_and_cover_the_peak(self):
-        ticks = commands_module._axis_ticks
-        self.assertEqual(ticks(110, "count"), [0, 50, 100, 150])
+        ticks = charts.axis_ticks
+        self.assertEqual(ticks(110, "count"), [0, 25, 50, 75, 100, 125])
         self.assertEqual(ticks(3, "count"), [0, 1, 2, 3])
         self.assertEqual(ticks(0, "count"), [0.0, 1.0])
-        self.assertEqual(ticks(4.3, "average"), [0, 2, 4, 6])
-        self.assertEqual(ticks(15000, "duration"), [0, 7200, 14400, 21600])
+        self.assertEqual(ticks(4.3, "average"), [0, 2.5, 5])
+        # A 4h10m peak gets a 5h axis, not 6h.
+        self.assertEqual(ticks(15000, "duration"), [0, 3600, 7200, 10800, 14400, 18000])
         self.assertEqual(ticks(2400, "duration"), [0, 600, 1200, 1800, 2400])
         self.assertEqual(ticks(0, "duration"), [0.0, 3600.0])
         for peak, kind in ((7, "count"), (0.37, "average"), (95_000, "duration"), (2_000_000, "duration")):
             values = ticks(peak, kind)
             self.assertEqual(values[0], 0)
             self.assertGreaterEqual(values[-1], peak)
-            self.assertLessEqual(len(values), 5)
+            self.assertLessEqual(len(values), 6)
 
-        label = commands_module._axis_label
+        label = charts.axis_label
         self.assertEqual(
             [label(value, "duration") for value in (0, 900, 3600, 5400)], ["0", "15m", "1h", "1h30"]
         )
@@ -489,15 +572,27 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
 
     def test_trend_chart_text_stays_legible_when_discord_shrinks_it(self):
         # Discord previews attachments around 400px wide; axis text must stay
-        # at least ~12px there, so it has to be about 3% of the canvas width.
-        _, axis_font = commands_module._chart_fonts()
-        self.assertGreaterEqual(axis_font.size / commands_module._CHART_WIDTH, 0.03)
-        long_title = "Leland's average day of the week — this month and then some more"
-        png = commands_module._bar_panels_png(long_title, ["Mon"], [("Messages", [1.0], "#000000", "count")])
-        with Image.open(BytesIO(png)) as chart:
-            title_band = chart.convert("L").crop((0, 0, chart.width, 90))
-            right_edge = title_band.crop((chart.width - 30, 0, chart.width, 90))
-            self.assertEqual(min(right_edge.getdata()), 255)  # title fits inside the margin
+        # at least ~12px there, so it has to be about 3% of the card width.
+        self.assertGreaterEqual(charts.AXIS_SIZE / charts.WIDTH, 0.03)
+
+    def test_long_titles_and_names_stay_inside_the_card(self):
+        def right_margin_is_empty(png):
+            with Image.open(BytesIO(png)) as chart:
+                scale = charts.OUTPUT_SCALE
+                band = chart.convert("RGB").crop(
+                    (chart.width - (charts.MARGIN - 4) * scale, 40 * scale, chart.width - 4 * scale, 160 * scale)
+                )
+                return set(band.getdata()) == {(0x1a, 0x1a, 0x19)}
+
+        weekdays = charts.Panel("Messages", [1.0] * 7, charts.SERIES[0], "average")
+        self.assertTrue(right_margin_is_empty(charts.weekday_chart(
+            "Day of week · the last 7 days", "W" * 48 + " comes alive on Wednesdays",
+            [("W" * 48, "W" * 48)], weekdays, weekdays, ["Mon"] * 7, ["1 day"] * 7, [],
+        )))
+        self.assertTrue(right_margin_is_empty(charts.company_chart(
+            "Voice company", "Who " + "W" * 48 + " hangs out with", [("1h", "observed"), ("W" * 48, "top")],
+            [charts.CompanyRow("W" * 48, 90, charts.SERIES[0], "100%")], [],
+        )))
 
     async def test_daily_trend_groups_long_periods_and_weekday_trend_averages(self):
         self.bot.store.trend_rows = [
@@ -761,7 +856,7 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("**Alice** — 1h 0m (66.7% of observed time)", content)
         self.assertIn("**Bob** — 1h 0m (66.7% of observed time)", content)
         self.assertIn("**Alone** — 30m (33.3% of observed time)", content)
-        self.assertIn("slices overlap", content)
+        self.assertIn("bars overlap", content)
         self.assertNotIn("split share", content)
         self.assertTrue(png.startswith(b"\x89PNG"))
 
@@ -1623,14 +1718,6 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("\n", cleaned)
         self.assertEqual(title, f"**The {commands_module._safe_name(cleaned)} Report — this week**")
 
-    async def test_pie_title_with_a_long_name_stays_inside_the_canvas(self):
-        png = _pie_png([("Alice", 90), ("Alone", 30)], "W" * 48)
-        with Image.open(BytesIO(png)) as chart:
-            title_band = chart.convert("L").crop((0, 0, chart.width, 90))
-            right_edge = title_band.crop((chart.width - 40, 0, chart.width, 90))
-            self.assertEqual(min(right_edge.getdata()), 255)
-            self.assertLess(min(title_band.crop((44, 20, 400, 80)).getdata()), 100)
-
     async def test_wrong_scope_stops_person_commands_before_any_lookup(self):
         flock = self.group()
         for name in (*self._PERSON_COMMANDS, "online", "top"):
@@ -2230,16 +2317,6 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cancellation.response.sent[0]["content"], "Data deletion cancelled.")
         self.bot.tracker.delete_data.assert_not_awaited()
 
-    def test_trend_title_with_maximum_width_name_stays_inside_canvas(self):
-        png = commands_module._bar_panels_png(
-            "W" * 48 + "'s average day of the week — the last 7 days",
-            ["Mon"], [("Messages", [1.0], "#000000", "count")],
-        )
-        with Image.open(BytesIO(png)) as chart:
-            title_band = chart.convert("L").crop((0, 0, chart.width, 90))
-            self.assertEqual(min(title_band.crop((chart.width - 30, 0, chart.width, 90)).getdata()), 255)
-            self.assertLess(min(title_band.crop((36, 20, 400, 80)).getdata()), 100)
-
     async def test_deleted_companions_are_named_but_never_ranked(self):
         self.bot.get_guild = lambda guild_id: SimpleNamespace(
             get_member=lambda member_id: SimpleNamespace(display_name=f"P{member_id}")
@@ -2549,6 +2626,11 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
                  "reason": "disconnect", "seconds": 600.0},
             ],
             "paused": False,
+            "spans": [
+                {"start": 1_699_920_000.0, "end": 1_699_950_000.0, "kind": "observed"},
+                {"start": 1_699_950_000.0, "end": 1_699_952_400.0, "kind": "outage"},
+                {"start": 1_699_952_400.0, "end": 1_700_092_800.0, "kind": "observed"},
+            ],
         }
         sent = await self.run_debug("uptime", "week")
         content = sent["content"]
@@ -2559,7 +2641,11 @@ class CommandsTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(content.index("Discord connection lost"), content.index("— 40m, bot stopped"))
         self.assertEqual(sent["file"].filename, "flock-uptime.png")
         image = Image.open(BytesIO(sent["file"].fp.read()))
-        self.assertEqual(image.width, 900)
+        self.assertEqual(image.width, charts.WIDTH * charts.OUTPUT_SCALE)
+        # The outage is drawn on its day's timeline at the time it happened.
+        colours = {pixel[:3] for pixel in image.convert("RGBA").getdata()}
+        self.assertIn((0xd0, 0x3b, 0x3b), colours)
+        self.assertIn((0x0c, 0xa3, 0x0c), colours)
 
     async def test_debug_uptime_with_nothing_recorded_yet(self):
         self.bot.store.uptime_result["end"] = self.bot.store.uptime_result["start"]

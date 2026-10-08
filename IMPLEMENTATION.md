@@ -94,7 +94,11 @@ Admin debugging (all read-only except the error log and alert setting):
   `outage`, `idle` seconds per local day), the same three totals, `outages`
   (recorded gaps overlapping the period: `gap_id`, `started_at`, `ended_at`
   (`None` while open), `reason`, `seconds`), and `paused`. Idle is time neither
-  observed nor in a recorded gap, such as a pause.
+  observed nor in a recorded gap, such as a pause. `spans` is a list of
+  `{start, end, kind}` (`observed`, `outage`, or `idle`) sorted, non-overlapping,
+  exactly tiling `[start, end]`, adjacent same-kind spans merged and never split
+  by day (callers split). Observed wins where it overlaps an outage; otherwise
+  per-kind span sums equal the totals.
 - `record_errors(entries: list[tuple[float, str, str, str]])` appends
   `(at, level, source, summary)` rows and keeps the newest `ERROR_LOG_LIMIT`
   (500). `error_log(now: float, limit: int = 15) -> dict` returns `recent`
@@ -197,7 +201,10 @@ moment after their start that falls outside all their tracking intervals.
   rounding tolerance is allowed.
 - `period_comparison(user_id: int, period: str, now: float, *, include_live: bool = True) -> dict`
   returns `current` and `previous` window totals (`start`, `end`, `messages`,
-  `voice_seconds`, `voice_visits` with a complete start, `watched_seconds`) from
+  `voice_seconds`, `voice_visits` with a complete start, `watched_seconds`,
+  `message_times` (sorted `created_at` of each counted message), `voice_pieces`
+  (sorted `(start, end)` voice segments clipped to the window, including the
+  live piece, summing to `voice_seconds`)) from
   retained detail, using `stats.previous_period_bounds` (same local day offset
   and clock time). `previous` is `None` with `reason` `all`, `untracked` (the
   window starts before the person's start), or `pruned` when no fair comparison
@@ -444,7 +451,11 @@ untracked while collection for others continues. Roast uses a shared 30-second
 cooldown. Defer slow interactions and use followups; a reply longer than Discord's 2,000-character limit is split between lines into several messages, with any chart or buttons on the last; errors get a safe response and
 logged traceback. Every command checks the guild and output channel first, then
 admin or owner access, then its arguments. Charts are drawn on a worker thread,
-one at a time, after the store reads finish.
+one at a time, after the store reads finish. `charts.py` draws every chart as a
+dark PNG card from plain values: a 600-unit layout drawn at 4× and downscaled to
+2× for antialiasing, axis text at least 3% of the width, colours from a fixed
+categorical palette stepped for the dark surface, and emoji the bundled DejaVu
+font lacks dropped from names.
 Controls and deletion confirmation permission reads have the same two-second
 pre-acknowledgement timeout as report lookups, returning private busy/error
 replies without applying the control. Confirmation and cancellation serialize
@@ -469,16 +480,21 @@ more people” line.
 value then user ID, top 10 with an “and N more” line, marking former people as no
 longer tracked.
 
-The company pie report filters attribution by source voice channel visibility:
+The company report filters attribution by source voice channel visibility:
 requester's View Channel for private replies, `@everyone` View Channel for public
 replies. Missing/deleted channels are omitted. It attaches a PNG generated in
 memory; no image or message body is stored. Resolve visible companion names from
 the member/user cache, then Discord's member/user API if needed. Use the user ID
-only when name lookup fails, and do not persist display names.
-`count:split` (default) reads `seconds`, so slices and percentages add up to the
-observed time. `count:full` reads `full_seconds` for the slices but keeps the
-observed total and percentages on `seconds`; the “Other people” slice then
-shows combined time without a percentage, and the pie shows relative shares.
+only when name lookup fails, and do not persist display names. Avatars are
+downloaded at 64px with a three-second timeout and cached in memory by asset key
+(at most 128); a failed download shows the name's initial. Companion colours
+come from the all-time visible company ranking (top eight take the palette
+slots, the rest a neutral grey), so a person keeps one colour across company
+reports; the visibility check is shared by both reads.
+`count:split` (default) reads `seconds`, so bars and percentages add up to the
+observed time. `count:full` reads `full_seconds` for the bars but keeps the
+observed total and percentages on `seconds`; the “Other people” bar then
+shows combined time without a percentage.
 `/flock leaderboard period:` (default `all`) uses the company report's
 visibility filter and name lookup on `full_seconds`, as text only: top 10
 people ranked, ties by user ID, the remainder counted, and alone time listed but not ranked.
@@ -493,8 +509,12 @@ and `Store.voice_hours`, `bursts` from `Store.message_times` (two-minute gap),
 and `company` from `Store.company_daily` filtered and named like the company
 report, reading `seconds` or, with `count:full`, `full_seconds`. All of them take the resolved person's ID. No activity yields a text-only
 reply.
-Trend chart titles shrink to fit and use an ellipsis if the minimum font size
-still exceeds the canvas width.
+Chart titles shrink to fit and use an ellipsis if the minimum font size
+still exceeds the card width. `daily` marks each bucket as unwatched (no
+activity and not watched), ghost (a watched quiet day), or partial (holds
+today), and averages only observed days before today. `compare` draws running
+totals from `message_times` and `voice_pieces` against elapsed time in each
+window. `debug uptime` splits `Store.uptime` `spans` by local day.
 
 `evil-mode` and `reaction-mode` check admin access, then reply privately that Leland
 mode isn't configured when `leland_user_id` is unset.

@@ -79,7 +79,7 @@ segments. Mute/deafen changes do not count as joins. Track mute time only if wan
 Each person has at most one open voice segment at a time. Voice company is
 recorded only while a person is tracked; earlier company cannot be
 reconstructed. Bots are excluded. Each observed minute is split evenly among
-the people present, so slices plus time alone sum to the observed, attributable
+the people present, so companion bars plus time alone sum to the observed, attributable
 voice time. Each person's whole shared time is also stored, without the split,
 for the leaderboard, the records' top companion, and for company reports run with `count:full`.
 When someone joins or leaves a channel, every tracked person in it gets the
@@ -125,7 +125,7 @@ activity to show (defaults to you)”; omitted, it is the requester.
 | `/flock stats period:week user:` | Messages, voice time, active days, observation start and gaps for the person |
 | `/flock records user:` | Personal records, dates, and measurement period |
 | `/flock where user:` | Latest observed voice channel and time, including current voice presence |
-| `/flock company period:week count:split user:` | Pie chart of the person's observed voice time attributed to companions or time alone, limited to voice channels visible to the report audience; `count:full` credits each companion with whole shared time instead of an even split |
+| `/flock company period:week count:split user:` | Ranked bar chart of the person's observed voice time attributed to companions or time alone, limited to voice channels visible to the report audience; `count:full` credits each companion with whole shared time instead of an even split |
 | `/flock leaderboard period:all user:` | Ranked top 10 people by whole observed voice time shared with the person (not split), with time alone listed but unranked; same channel visibility as company |
 | `/flock trends period:last7 kind:daily count:split user:` | Charts: per-day activity with streaks and ghost days, comparison with the previous period so far, time of day, day of week, company over time, or message bursts |
 | `/flock online user:` | Current Discord status of a currently tracked person; idle and Do Not Disturb count as online |
@@ -139,7 +139,7 @@ activity to show (defaults to you)”; omitted, it is the requester.
 | `/flock pause` | Stop collection for everyone; configured tracker admins only |
 | `/flock resume` | Resume after a pause; configured tracker admins only |
 | `/flock debug health` | Admin-only: process uptime, how long collection has run, checkpoint age, current error, logged problem counts, database and disk size, newest backup, retention, outage alert setting, last update result |
-| `/flock debug uptime period:last7` | Admin-only: share of time the bot was watching, each outage with its start, length and cause, and a stacked chart of watching, outage, and paused time per day |
+| `/flock debug uptime period:last7` | Admin-only: share of time the bot was watching, each outage with its start, length and cause, and a 24-hour timeline per day of watching, outage, and paused time |
 | `/flock debug errors` | Admin-only: recent warnings and errors the bot logged, with counts for the last day and week |
 | `/flock debug person user:` | Admin-only: one person's tracking history, watched share, missing coverage by cause, outages that hit them, and counts of what is stored about them |
 | `/flock debug alerts minutes:` | Admin-only: show or set how long an outage must last before the owner gets a DM once the bot is back (15 minutes by default, 0 turns it off) |
@@ -178,7 +178,7 @@ history from the deletion moment. With `user` it erases only that person's
 messages, daily totals, visits, company rows where they are the subject, last
 voice observation, records, and tracking history, and removes them from the
 tracked list, without pausing collection for anyone else. Time the erased person
-shared with someone else stays in that person's company history, so its slices
+shared with someone else stays in that person's company history, so its bars
 still sum to their voice time, but it is credited to a "Deleted person" member
 (`-2`) instead of the erased ID; leaderboards and top-companion records never rank
 it. A live roster is current state and keeps counting anyone still present.

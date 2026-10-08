@@ -5,7 +5,7 @@ an admin-managed list of people and measures their observed time in configured
 voice channels. It stores statistics in SQLite and is designed to run as a
 systemd service on the Raspberry Pi. It requires Python 3.11 or newer; the
 pinned dependencies were checked on Debian 13, aarch64, with Python 3.13.
-This is release 1.0.2. It replaces the single-person Leland Tracker and starts
+This is release 1.1.0. It replaces the single-person Leland Tracker and starts
 with fresh data: the old database is archived, not imported. See
 [Replacing Leland Tracker](#replacing-leland-tracker).
 
@@ -83,7 +83,7 @@ channel IDs to narrow collection. Stats and records omit per-channel totals and
 names; `/flock where` follows the visibility rules described below.
 `/flock company` charts observed time a tracked person shared with human
 companions in those voice channels. Each minute is divided evenly among everyone
-else present, tracked or not; time alone is a separate slice. A person's company
+else present, tracked or not; time alone is a separate bar. A person's company
 is recorded only while they are tracked, so earlier companion time cannot be
 reconstructed.
 
@@ -543,7 +543,7 @@ and the updater rolls back to the current code.
 The release number lives in `src/flock_cctv/__init__.py` (`__version__`,
 semantic versioning) and is bumped by hand in the pull request that changes
 behavior. The updater also stamps the deployed commit into the installed package,
-so the running version is `release (short commit)`, for example `1.0.2 (1a2b3c4)`:
+so the running version is `release (short commit)`, for example `1.1.0 (1a2b3c4)`:
 
 - `/flock version` replies privately with it; `/flock about` also shows it on its second line.
 - The service journal logs `Starting flock-cctv <version>` at every start.
@@ -643,16 +643,19 @@ today, this week, this month, or all time unless stated otherwise.
   private elsewhere. A public reply names the voice channel only if the
   `@everyone` role can view it;
   a private reply names it only if the requester can view it.
-- `/flock company period: count: user:` attaches a pie chart of the person's observed
-  voice time with each companion or alone. The default is this week. Companions
-  are all humans in the same voice channel, tracked or not. Its image legend and
-  text list show names, percentages, and durations. `count` sets how time shared
-  with several people is counted: `split` (default) splits each shared minute
-  evenly so the slices add up to the observed time; `full` credits each person
-  with the whole minute, as `/flock leaderboard` does, so slices overlap,
-  percentages are of observed time, and the chart shows relative shares.
-  Names are looked up from Discord when absent from the bot's cache; if Discord
-  cannot provide a name, the report shows the user ID. Names are not stored.
+- `/flock company period: count: user:` attaches a ranked bar chart of the person's
+  observed voice time with each companion, with time alone and everyone else in
+  grey below. The default is this week. Companions are all humans in the same
+  voice channel, tracked or not. Each bar shows the companion's avatar, name,
+  duration, and percentage. `count` sets how time shared with several people is
+  counted: `split` (default) splits each shared minute evenly so the bars add up
+  to the observed time; `full` credits each person with the whole minute, as
+  `/flock leaderboard` does, so bars overlap and percentages are of observed time.
+  Each companion keeps one colour in every company chart, set by their all-time
+  rank. Names and avatars are looked up from Discord when the report runs; if
+  Discord cannot provide a name, the report shows the user ID, and without an
+  avatar it shows the name's initial. Names are not stored, and avatars are
+  kept only in memory.
   The chart includes only source voice channels visible to the requester
   for private replies or to `@everyone` for public replies. Time lost during
   outages is never estimated. Companion member IDs and daily attributed totals
@@ -663,30 +666,36 @@ today, this week, this month, or all time unless stated otherwise.
   as an hour for each of them. It uses the same channel visibility rules and name
   lookup as `/flock company`. Time alone is shown but not ranked, and anyone past
   the top 10 is counted on one line. The default period is all time.
-- `/flock trends period: kind: count: user:` attaches a chart of how activity changes. The
+- `/flock trends period: kind: count: user:` attaches a chart of how activity changes.
+  Charts are dark cards with the headline numbers on top. The
   default period is the last 7 days (today and the six days before it); pick
   `This week` to start on Monday instead. Kinds:
   - `daily` (default): messages and observed voice time per day (grouped by
     week or month for long periods), busiest day, active-day streaks, and ghost
-    days. A ghost day is a finished day the tracker watched in full, while the
+    days. The chart hatches days the tracker was not watching, rings ghost days,
+    shades today lighter because it isn't over, and draws the daily average. A ghost day is a finished day the tracker watched in full, while the
     person was tracked, with no messages or voice; days it was disconnected or
     paused, or the person was not tracked, are never ghost days, even when the
     interruption lasts less than a second.
   - `compare`: this period so far against the previous day, week, 7 days, or month up
-    to the same point, from retained detail. It declines for all time, when
+    to the same point, from retained detail, as stat tiles and running-total
+    lines for both windows. It declines for all time, when
     tracking began during the previous period, or when that period is older
     than `RETENTION_DAYS`, and notes when either window was not fully watched.
-  - `hours`: messages and observed voice time by local hour, with peak hours
-    and the 00:00–05:00 share.
+  - `hours`: messages by local weekday and hour as a heatmap, and observed voice
+    time by local hour, with peak hours and the 00:00–05:00 share.
   - `weekdays`: average messages and voice time per weekday, over days with
     activity or fully watched by the tracker; unwatched quiet days are left out.
-  - `company`: stacked bars of companion time per day, week, or month with the
-    top companion for recent buckets, under the same channel visibility rules
-    and name lookup as `/flock company`. `count` works as in `/flock company`;
-    with `full`, stacked bars can add up to more than the observed time. Other
-    kinds ignore `count`.
+    The top day is highlighted and each weekday shows how many days it averages.
+  - `company`: one row of bars per top companion (plus time alone and everyone
+    else) per day, week, or month, all on one scale, with the top companion for
+    recent buckets, under the same channel visibility rules, name and avatar
+    lookup, and colours as `/flock company`. `count` works as in
+    `/flock company`; with `full`, rows can add up to more than the observed
+    time. Other kinds ignore `count`.
   - `bursts`: runs of messages sent within two minutes of each other, with the
     biggest burst, the average size, and the share in bursts of five or more.
+    The chart counts bursts by size and shows the share of messages in each size.
   `hours`, `bursts`, and `compare` need message send times or voice sessions,
   which exist only within `RETENTION_DAYS`; replies say when a period reaches
   past that. Other kinds use daily totals, which match `/flock stats` and do
@@ -728,7 +737,8 @@ today, this week, this month, or all time unless stated otherwise.
   - `/flock debug uptime period:` (last 7 days by default) shows the share of
     time the bot was watching, every outage with its start, length and cause
     ("Discord connection lost" or "bot stopped or restarted"), time paused, and
-    a stacked chart of watching, outage, and paused time per day.
+    a 24-hour timeline per day (the last 31 at most) showing when the bot was
+    watching, down, or paused.
   - `/flock debug errors` lists the newest warnings and errors the bot logged.
     Only the bot's own log line and the error type are kept (never message text
     or error details), for the retention period and at most 500 entries; the

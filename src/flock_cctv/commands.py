@@ -16,9 +16,8 @@ from typing import Any, Awaitable, Callable, TypeVar
 
 import discord
 from discord import app_commands
-from PIL import Image, ImageDraw, ImageFont
 
-from . import update_status, version_string
+from . import charts, update_status, version_string
 from .jokes import SharedRoastCooldown, make_roast
 from .stats import get_timezone, local_date
 from .storage import DELETED_COMPANION_ID
@@ -68,8 +67,6 @@ _BUSY_TEXT = "The tracker is busy right now. Try again in a moment."
 _LIST_LIMIT = 1850
 _USER_OPTION = "Whose activity to show (defaults to you)"
 _COMPANY_COUNT_OPTION = "How to count time shared with several people (split by default)"
-# Categorical palette in fixed slot order, validated for colour-vision deficiency.
-_PIE_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948")
 
 
 def _config(bot: Any) -> Any:
@@ -381,41 +378,6 @@ async def _seen_text(bot: Any, interaction: discord.Interaction, person: _Person
     return f"{person.safe} was last seen in {channel_label} **{elapsed} ago** ({date})."
 
 
-def _pie_png(
-    slices: list[tuple[str, float]], owner: str, details: list[str] | None = None
-) -> bytes:
-    """Draw a pie with a legend; ``details`` replaces each slice's share and duration line."""
-    image = Image.new("RGB", (1100, 640), "#ffffff")
-    draw = ImageDraw.Draw(image)
-    title_font, label_font, detail_font = _font(38), _font(32), _font(24)
-    title = f"{owner}'s voice company"
-    while len(title) > 1 and title_font.getlength(title) > 1100 - 2 * 44:
-        title = title[:-2] + "…"
-    draw.text((44, 28), title, font=title_font, fill="#17212f")
-    total = sum(seconds for _, seconds in slices)
-    angle = -90.0
-    for index, (name, seconds) in enumerate(slices):
-        next_angle = angle + 360.0 * seconds / total
-        draw.pieslice(
-            (44, 108, 560, 624), start=angle, end=next_angle,
-            fill=_PIE_COLORS[index], outline="#ffffff", width=3,
-        )
-        legend_y = 89 + index * 68
-        draw.rectangle((610, legend_y + 5, 644, legend_y + 39), fill=_PIE_COLORS[index])
-        visible_name = name
-        while visible_name and label_font.getlength(visible_name) > 398:
-            visible_name = visible_name[:-1]
-        if visible_name != name:
-            while visible_name and label_font.getlength(visible_name + "…") > 398:
-                visible_name = visible_name[:-1]
-            visible_name += "…"
-        draw.text((660, legend_y), visible_name, font=label_font, fill="#17212f")
-        detail = details[index] if details else f"{seconds / total:.1%}  ·  {_duration(seconds)}"
-        draw.text((660, legend_y + 36), detail, font=detail_font, fill="#48576b")
-        angle = next_angle
-    return _png_bytes(image)
-
-
 async def _lookup_user(bot: Any, guild: Any, user_id: int) -> Any:
     """Find a member or user from cache first, then from Discord, or ``None``."""
     member = guild.get_member(user_id) if guild is not None else None
@@ -449,6 +411,62 @@ async def _company_name(bot: Any, guild: Any, member_id: int) -> str:
         return "Deleted person"
     found = await _lookup_user(bot, guild, member_id)
     return _clean_name(getattr(found, "display_name", None)) or f"User {member_id}"
+
+
+# Avatar images by Discord asset key, so repeated reports skip the download.
+_AVATAR_CACHE: dict[str, bytes] = {}
+_AVATAR_CACHE_SIZE = 128
+_AVATAR_TIMEOUT = 3.0
+
+
+async def _avatar_bytes(found: Any) -> bytes | None:
+    """Download a small copy of someone's avatar, or ``None`` if it isn't available."""
+    asset = getattr(found, "display_avatar", None)
+    if asset is None:
+        return None
+    key = str(getattr(asset, "key", "") or getattr(asset, "url", ""))
+    if key and key in _AVATAR_CACHE:
+        return _AVATAR_CACHE[key]
+    try:
+        data = await asyncio.wait_for(asset.replace(size=64, static_format="png").read(), timeout=_AVATAR_TIMEOUT)
+    except Exception:  # noqa: BLE001 - CDN errors come from aiohttp too; the chart shows an initial.
+        logger.debug("Could not download an avatar for a chart", exc_info=True)
+        return None
+    if key:
+        if len(_AVATAR_CACHE) >= _AVATAR_CACHE_SIZE:
+            _AVATAR_CACHE.pop(next(iter(_AVATAR_CACHE)))
+        _AVATAR_CACHE[key] = data
+    return data
+
+
+async def _company_identity(bot: Any, guild: Any, member_id: int) -> tuple[str, bytes | None]:
+    """Return a companion's chart name and avatar; groups and deleted people have no avatar."""
+    if member_id in (0, -1, _DELETED_COMPANION):
+        return await _company_name(bot, guild, member_id), None
+    found = await _lookup_user(bot, guild, member_id)
+    name = _clean_name(getattr(found, "display_name", None)) or f"User {member_id}"
+    return name, await _avatar_bytes(found) if found is not None else None
+
+
+async def _companion_colours(
+    bot: Any, interaction: discord.Interaction, person: _Person, can_view: Callable[[int], bool],
+) -> dict[int, str]:
+    """Give each companion a fixed colour by all-time rank, so it matches across reports."""
+    rows = await _visible_company_totals(bot, interaction, person, "all", can_view)
+    totals = _seconds_by_member(rows, "seconds")
+    ranked = sorted(
+        (member_id for member_id in totals if member_id not in (0, -1, _DELETED_COMPANION)),
+        key=lambda member_id: (-totals[member_id], member_id),
+    )
+    return {member_id: charts.SERIES[index] for index, member_id in enumerate(ranked[:len(charts.SERIES)])}
+
+
+def _companion_colour(colours: dict[int, str], member_id: int) -> str:
+    if member_id == 0:
+        return charts.ALONE
+    if member_id == -1:
+        return charts.OTHERS
+    return colours.get(member_id, charts.UNRANKED)
 
 
 def _user_label(found: Any, user_id: int) -> str:
@@ -574,10 +592,14 @@ def _audience_can_view(bot: Any, interaction: discord.Interaction) -> Callable[[
 
 
 def _visible_company_rows(
-    bot: Any, interaction: discord.Interaction, rows: list[dict[str, Any]]
+    bot: Any, interaction: discord.Interaction, rows: list[dict[str, Any]],
+    can_view: Callable[[int], bool] | None = None,
 ) -> list[dict[str, Any]]:
-    """Keep positive company rows from voice channels the report audience can view."""
-    can_view = _audience_can_view(bot, interaction)
+    """Keep positive company rows from voice channels the report audience can view.
+
+    Pass one ``can_view`` check to share it between reads in the same report.
+    """
+    can_view = can_view or _audience_can_view(bot, interaction)
     return [
         row for row in rows
         if float(row["seconds"]) > 0 and can_view(int(row["channel_id"]))
@@ -585,13 +607,14 @@ def _visible_company_rows(
 
 
 async def _visible_company_totals(
-    bot: Any, interaction: discord.Interaction, person: _Person, period: str
+    bot: Any, interaction: discord.Interaction, person: _Person, period: str,
+    can_view: Callable[[int], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Return company totals by channel and peer from channels the audience can view."""
     rows = await bot.store.company_totals(
         person.user_id, period, time.time(), include_live=_collection_reliable(bot)
     )
-    return _visible_company_rows(bot, interaction, rows)
+    return _visible_company_rows(bot, interaction, rows, can_view)
 
 
 def _seconds_by_member(rows: list[dict[str, Any]], field: str) -> dict[int, float]:
@@ -624,7 +647,8 @@ def _company_field(count: str) -> str:
 async def _company_report(
     bot: Any, interaction: discord.Interaction, person: _Person, period: str, count: str = "split"
 ) -> tuple[str, bytes | None]:
-    rows = await _visible_company_totals(bot, interaction, person, period)
+    can_view = _audience_can_view(bot, interaction)
+    rows = await _visible_company_totals(bot, interaction, person, period, can_view)
     # Split shares sum to the observed time; full time overlaps and cannot.
     observed_by_member = _seconds_by_member(rows, "seconds")
     full = count == "full"
@@ -649,9 +673,11 @@ async def _company_report(
     if rest > 0:
         top.append((-1, sum(seconds for _, seconds in ranked_peers[limit:])))
     guild = _guild(bot)
-    names = await asyncio.gather(*(
-        _company_name(bot, guild, member_id) for member_id, _ in top
-    ))
+    identities, colours = await asyncio.gather(
+        asyncio.gather(*(_company_identity(bot, guild, member_id) for member_id, _ in top)),
+        _companion_colours(bot, interaction, person, can_view),
+    )
+    names = [name for name, _ in identities]
     slices = [(name, seconds) for name, (_, seconds) in zip(names, top)]
     total = sum(observed_by_member.values())
     title = f"**{person.safe}'s voice company — {label}**"
@@ -659,17 +685,13 @@ async def _company_report(
         f"{title} (full time with each person)" if full else title,
         f"Observed time in visible channels: **{_duration(total)}**.",
     ]
-    details = []
     for index, ((member_id, _), (name, seconds)) in enumerate(zip(top, slices)):
         safe_name = _safe_name(name)
         if full and member_id == -1:
-            # Overlapping time with several people has no meaningful share of the whole.
-            details.append(f"{_duration(seconds)} combined")
             lines.append(
                 f"{index + 1}. **{safe_name}** — {_duration(seconds)} combined across {rest} people"
             )
         elif full:
-            details.append(f"{seconds / total:.1%} of time  ·  {_duration(seconds)}")
             lines.append(
                 f"{index + 1}. **{safe_name}** — {_duration(seconds)} ({seconds / total:.1%} of observed time)"
             )
@@ -679,16 +701,49 @@ async def _company_report(
             )
     if full:
         lines.append(
-            "Each person is credited with every minute they shared, so slices overlap: percentages are "
-            "of observed time and the chart shows relative shares. Time alone has its own slice. "
+            "Each person is credited with every minute they shared, so bars overlap: percentages are "
+            "of observed time and bars can add up to more than it. Time alone has its own bar. "
             "Only observed time since companion tracking began is included."
         )
     else:
         lines.append(
-            "Each shared minute is split evenly among the people present; time alone has its own slice. "
+            "Each shared minute is split evenly among the people present; time alone has its own bar. "
             "Only observed time since companion tracking began is included."
         )
-    png = await _render(_pie_png, slices, person.name, details if full else None)
+    rows = []
+    for (member_id, seconds), (name, avatar) in zip(top, identities):
+        if full and member_id == -1:
+            # Overlapping time with several people has no meaningful share of the whole.
+            detail = "combined"
+        else:
+            detail = f"{seconds / total:.0%}"
+        rows.append(charts.CompanyRow(
+            name, seconds, _companion_colour(colours, member_id), detail, avatar,
+            group=member_id in (0, -1),
+        ))
+    # People first, then time alone and everyone else under a divider.
+    rows.sort(key=lambda row: row.group)
+    stats = [(_duration(total), "observed in voice")]
+    peers = [row for row in rows if not row.group]
+    if peers:
+        stats.append((peers[0].name, f"top companion · {peers[0].seconds / total:.0%}"))
+    alone = observed_by_member.get(0, 0.0)
+    if alone > 0:
+        stats.append((f"{alone / total:.0%}", "of the time alone"))
+    title = (
+        f"{person.name} is mostly alone in voice" if alone > total / 2
+        else f"Who {person.name} hangs out with"
+    )
+    png = await _render(
+        charts.company_chart,
+        f"Voice company · {label} · {'full' if full else 'split'} time",
+        title,
+        stats,
+        rows,
+        [charts.Key("swatch", "alone and everyone else", charts.ALONE)],
+        ["Each person counts every minute they shared, so bars overlap; percentages are of observed time."]
+        if full else [],
+    )
     return "\n".join(lines), png
 
 
@@ -734,148 +789,6 @@ async def _leaderboard_text(
     return "\n".join(lines)
 
 
-# Discord shrinks attachments to the chat width (often 400px or less), so the
-# canvas stays narrow and text stays large enough to read after that shrink.
-_CHART_WIDTH = 900
-_CHART_MARGIN = 36
-_TEXT_PRIMARY = "#0b0b0b"
-_TEXT_SECONDARY = "#52514e"
-_GRID = "#e6e5e1"
-_BASELINE = "#b9b8b2"
-_BAR_MAX_WIDTH = 56
-_BAR_RADIUS = 8
-_SEGMENT_GAP = 3
-# Round duration steps for a time axis, in seconds.
-_DURATION_STEPS = (60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800)
-
-
-@lru_cache(maxsize=None)
-def _font(size: int) -> Any:
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size)
-    except OSError:
-        return ImageFont.load_default(size=size)
-
-
-def _chart_fonts() -> tuple[Any, Any]:
-    """Return the heading and axis/legend fonts."""
-    return _font(34), _font(30)
-
-
-def _draw_title(draw: ImageDraw.ImageDraw, title: str) -> None:
-    """Draw the title at the largest size up to 46px that fits the canvas."""
-    size = 46
-    font = _font(size)
-    while size > 24 and font.getlength(title) > _CHART_WIDTH - 2 * _CHART_MARGIN:
-        size -= 2
-        font = _font(size)
-    while len(title) > 1 and font.getlength(title) > _CHART_WIDTH - 2 * _CHART_MARGIN:
-        title = title[:-2] + "…"
-    draw.text((_CHART_MARGIN, 24), title, font=font, fill=_TEXT_PRIMARY)
-
-
-def _axis_ticks(peak: float, kind: str) -> list[float]:
-    """Return two to five evenly spaced round ticks from zero that cover ``peak``.
-
-    ``kind`` is ``count`` (whole numbers), ``average`` (fractions allowed), or
-    ``duration`` (seconds, stepped in round clock units).
-    """
-    if peak <= 0:
-        return [0.0, 3600.0 if kind == "duration" else 1.0]
-    target = peak / 4
-    if kind == "duration":
-        step = next(
-            (float(value) for value in _DURATION_STEPS if value >= target),
-            math.ceil(target / 604800) * 604800.0,
-        )
-    else:
-        magnitude = 10 ** math.floor(math.log10(target))
-        step = next(multiple * magnitude for multiple in (1, 2, 2.5, 5, 10) if multiple * magnitude >= target)
-        if kind == "count":
-            step = max(1.0, float(math.ceil(step)))
-    intervals = max(1, math.ceil(peak / step - 1e-9))
-    return [index * step for index in range(intervals + 1)]
-
-
-def _axis_label(value: float, kind: str) -> str:
-    if kind == "duration":
-        if value == 0:
-            return "0"
-        hours, minutes = divmod(int(round(value / 60)), 60)
-        if not hours:
-            return f"{minutes}m"
-        return f"{hours}h" if not minutes else f"{hours}h{minutes:02d}"
-    if kind == "average":
-        return f"{value:.1f}".rstrip("0").rstrip(".")
-    return f"{int(round(value)):,}"
-
-
-def _value_label(value: float, kind: str) -> str:
-    if kind == "duration":
-        return _duration(value)
-    if kind == "average":
-        return f"{value:.1f}"
-    return f"{int(round(value)):,}"
-
-
-def _draw_column(
-    draw: ImageDraw.ImageDraw, box: tuple[float, float, float, float], colour: str, *, rounded: bool
-) -> None:
-    """Draw a column with a rounded data end and a square baseline end."""
-    x0, y0, x1, y1 = box
-    radius = min(_BAR_RADIUS, (x1 - x0) / 2, (y1 - y0) / 2) if rounded else 0
-    if radius >= 1:
-        draw.rounded_rectangle(box, radius=radius, fill=colour, corners=(True, True, False, False))
-    else:
-        draw.rectangle(box, fill=colour)
-
-
-def _plot_frame(
-    draw: ImageDraw.ImageDraw,
-    font: Any,
-    labels: list[str],
-    ticks: list[float],
-    kind: str,
-    chart_top: float,
-    base: float,
-) -> tuple[float, float, float]:
-    """Draw gridlines, y tick labels, and x labels; return ``(left, slot, scale)``."""
-    tick_labels = [_axis_label(value, kind) for value in ticks]
-    left = _CHART_MARGIN + max(font.getlength(label) for label in tick_labels) + 16
-    right = _CHART_WIDTH - _CHART_MARGIN
-    scale = (base - chart_top) / ticks[-1]
-    for value, label in zip(ticks, tick_labels):
-        y = base - value * scale
-        draw.line((left, y, right, y), fill=_BASELINE if value == 0 else _GRID, width=2)
-        draw.text((left - 14, y), label, font=font, fill=_TEXT_SECONDARY, anchor="rm")
-    slot = (right - left) / max(1, len(labels))
-    # Thin the x labels so neighbours never overlap.
-    widest = max((font.getlength(label) for label in labels), default=0)
-    step = max(1, int((widest + 16) // slot) + 1)
-    for position in range(0, len(labels), step):
-        # Low enough to clear the "0" tick label when the first one reaches the gutter.
-        draw.text(
-            (left + (position + 0.5) * slot, base + 20), labels[position],
-            font=font, fill=_TEXT_SECONDARY, anchor="mt",
-        )
-    return left, slot, scale
-
-
-def _label_peak(
-    draw: ImageDraw.ImageDraw, font: Any, text: str, centre: float, top: float, left: float
-) -> None:
-    """Label the tallest mark just above its data end, kept inside the plot."""
-    half = font.getlength(text) / 2
-    centre = min(max(centre, left + half), _CHART_WIDTH - _CHART_MARGIN - half)
-    draw.text((centre, top - 8), text, font=font, fill=_TEXT_PRIMARY, anchor="mb")
-
-
-def _png_bytes(image: Image.Image) -> bytes:
-    output = BytesIO()
-    image.save(output, format="PNG")
-    return output.getvalue()
-
-
 # Cached fonts are shared, and FreeType faces are not safe to use from two
 # threads at once, so charts render one at a time.
 _RENDER_LOCK = threading.Lock()
@@ -889,105 +802,6 @@ async def _render(draw: Callable[..., _T], /, *args: Any) -> _T:
             return draw(*args)
 
     return await asyncio.to_thread(locked)
-
-
-def _bar_panels_png(
-    title: str,
-    labels: list[str],
-    panels: list[tuple[str, list[float], str, str]],
-) -> bytes:
-    """Draw one column chart per ``(heading, values, colour, kind)`` panel.
-
-    Each panel has its own y-axis; different measures never share a scale.
-    """
-    width, panel_height, top = _CHART_WIDTH, 340, 100
-    image = Image.new("RGB", (width, top + panel_height * len(panels) + 12), "#ffffff")
-    draw = ImageDraw.Draw(image)
-    heading_font, axis_font = _chart_fonts()
-    _draw_title(draw, title)
-    for index, (heading, values, colour, kind) in enumerate(panels):
-        y = top + index * panel_height
-        draw.text((_CHART_MARGIN, y), heading, font=heading_font, fill=_TEXT_PRIMARY)
-        chart_top, base = y + 96, y + panel_height - 66
-        peak = max(values, default=0.0)
-        ticks = _axis_ticks(peak, kind)
-        left, slot, scale = _plot_frame(draw, axis_font, labels, ticks, kind, chart_top, base)
-        bar_width = min(_BAR_MAX_WIDTH, slot * 0.72)
-        for position, value in enumerate(values):
-            if value <= 0:
-                continue
-            centre = left + (position + 0.5) * slot
-            height = max(2.0, value * scale)
-            _draw_column(
-                draw, (centre - bar_width / 2, base - height, centre + bar_width / 2, base),
-                colour, rounded=True,
-            )
-        if peak > 0:
-            position = values.index(peak)
-            _label_peak(
-                draw, axis_font, _value_label(peak, kind),
-                left + (position + 0.5) * slot, base - peak * scale, left,
-            )
-    return _png_bytes(image)
-
-
-def _stacked_png(
-    title: str,
-    heading: str,
-    labels: list[str],
-    series: list[tuple[str, list[float], str]],
-) -> bytes:
-    """Draw stacked duration columns with a legend of ``(name, values, colour)`` series."""
-    width = _CHART_WIDTH
-    left_edge, right = _CHART_MARGIN, width - _CHART_MARGIN
-    heading_font, axis_font = _chart_fonts()
-    # Lay the legend out first so the image height fits it.
-    legend: list[tuple[float, float, str, str]] = []
-    x, y = float(left_edge), 100.0
-    for name, _, colour in series:
-        text = name
-        while text and axis_font.getlength(text) > 320:
-            text = text[:-2] + "…" if len(text) > 2 else ""
-        item_width = 42 + axis_font.getlength(text) + 30
-        if x + item_width > right and x > left_edge:
-            x, y = float(left_edge), y + 46
-        legend.append((x, y, text, colour))
-        x += item_width
-    heading_y = y + 64
-    chart_top = heading_y + 96
-    base = chart_top + 340
-    image = Image.new("RGB", (width, int(base + 72)), "#ffffff")
-    draw = ImageDraw.Draw(image)
-    _draw_title(draw, title)
-    for item_x, item_y, text, colour in legend:
-        draw.rounded_rectangle((item_x, item_y + 4, item_x + 30, item_y + 34), radius=4, fill=colour)
-        draw.text((item_x + 42, item_y + 2), text, font=axis_font, fill=_TEXT_PRIMARY)
-    draw.text((left_edge, heading_y), heading, font=heading_font, fill=_TEXT_PRIMARY)
-    totals = [sum(values[index] for _, values, _ in series) for index in range(len(labels))]
-    peak = max(totals, default=0.0)
-    ticks = _axis_ticks(peak, "duration")
-    left, slot, scale = _plot_frame(draw, axis_font, labels, ticks, "duration", chart_top, base)
-    bar_width = min(_BAR_MAX_WIDTH, slot * 0.72)
-    for position in range(len(labels)):
-        centre = left + (position + 0.5) * slot
-        segments = [(values[position] * scale, colour) for _, values, colour in series if values[position] > 0]
-        bottom = base
-        for number, (height, colour) in enumerate(segments):
-            top_edge = bottom - height
-            is_top = number == len(segments) - 1
-            # A surface-coloured gap separates touching segments.
-            gap = 0 if is_top else min(_SEGMENT_GAP, height / 2)
-            _draw_column(
-                draw, (centre - bar_width / 2, top_edge + gap, centre + bar_width / 2, bottom),
-                colour, rounded=is_top,
-            )
-            bottom = top_edge
-    if peak > 0:
-        position = totals.index(peak)
-        _label_peak(
-            draw, axis_font, _duration(peak), left + (position + 0.5) * slot, base - peak * scale, left,
-        )
-    return _png_bytes(image)
 
 
 def _plural(count: int, word: str) -> str:
@@ -1125,7 +939,51 @@ TREND_CHOICES = [
 ]
 
 
-def _daily_trend(series: list[dict[str, Any]], label: str, person: _Person) -> tuple[str, bytes]:
+def _day_label_positions(keys: list[date], unit: str) -> list[int] | None:
+    """Label Mondays on long daily charts; otherwise let the chart thin labels itself."""
+    if unit != "day" or len(keys) <= 14:
+        return None
+    last = len(keys) - 1
+    return [index for index, key in enumerate(keys) if key.weekday() == 0 and index < last - 4] + [last]
+
+
+def _weekend_bands(keys: list[date], unit: str) -> list[tuple[int, int]]:
+    if unit != "day":
+        return []
+    return [(index, index + 1) for index, key in enumerate(keys) if key.weekday() >= 5]
+
+
+def _bucket_states(
+    series: list[dict[str, Any]], unit: str, today: str | None,
+) -> tuple[list[date], list[str | None]]:
+    """Return bucket keys and how each bucket was covered.
+
+    ``unwatched`` marks quiet time the tracker did not watch, ``ghost`` a
+    fully watched quiet day, and ``partial`` the bucket that holds today.
+    """
+    days: dict[date, list[dict[str, Any]]] = {}
+    for entry in series:
+        days.setdefault(_bucket_key(date.fromisoformat(entry["day"]), unit), []).append(entry)
+    keys = sorted(days)
+    states: list[str | None] = []
+    for key in keys:
+        entries = days[key]
+        if today is not None and any(entry["day"] == today for entry in entries):
+            states.append("partial")
+        elif any(_is_active(entry) for entry in entries):
+            states.append(None)
+        elif unit == "day" and entries[0].get("watched"):
+            states.append("ghost")
+        elif not any(entry.get("watched") for entry in entries):
+            states.append("unwatched")
+        else:
+            states.append(None)
+    return keys, states
+
+
+def _daily_trend(
+    series: list[dict[str, Any]], label: str, person: _Person, today: str | None = None,
+) -> tuple[str, bytes]:
     unit, labels, messages, voice = _bucket_series(series)
     busiest = max(series, key=lambda entry: (int(entry["messages"]), float(entry["voice_seconds"])))
     active = sum(1 for entry in series if _is_active(entry))
@@ -1154,13 +1012,42 @@ def _daily_trend(series: list[dict[str, Any]], label: str, person: _Person) -> t
     )
     if unit != "day":
         lines.append(f"The chart groups days by {unit} so the bars stay readable.")
-    png = _bar_panels_png(
-        f"{person.name}'s activity per {unit} — {label}",
-        labels,
+
+    keys, states = _bucket_states(series, unit, today)
+    average_messages = average_voice = None
+    if unit == "day":
+        # Averages leave out unwatched days and today, which isn't over yet.
+        counted = [entry for entry in series if _is_observed(entry) and entry["day"] != today]
+        if counted:
+            average_messages = sum(int(entry["messages"]) for entry in counted) / len(counted)
+            average_voice = sum(float(entry["voice_seconds"]) for entry in counted) / len(counted)
+    chart_keys = []
+    if "unwatched" in states:
+        chart_keys.append(charts.Key("hatch", "not watched"))
+    if "ghost" in states:
+        chart_keys.append(charts.Key("ring", "ghost day"))
+    if "partial" in states:
+        so_far = "today so far" if unit == "day" else f"this {unit} so far"
+        chart_keys.append(charts.Key("swatch", so_far, charts.muted(charts.SERIES[0])))
+    bands = _weekend_bands(keys, unit)
+    if bands:
+        chart_keys.append(charts.Key("swatch", "weekend", charts.BAND))
+    png = charts.daily_chart(
+        f"{unit.capitalize()} by {unit} · {label}",
+        person.name,
         [
-            (f"Messages per {unit}", messages, _PIE_COLORS[0], "count"),
-            (f"Observed voice time per {unit}", voice, _PIE_COLORS[1], "duration"),
+            (f"{sum(int(entry['messages']) for entry in series):,}", "messages"),
+            (_duration(sum(float(entry["voice_seconds"]) for entry in series)), "in voice"),
+            (f"{active} / {observed}", "active days"),
+            (_plural(current, "day"), "current streak"),
         ],
+        labels,
+        _day_label_positions(keys, unit),
+        charts.Panel(f"Messages per {unit}", messages, charts.SERIES[0], "count", average_messages),
+        charts.Panel(f"Observed voice time per {unit}", voice, charts.SERIES[1], "duration", average_voice),
+        states,
+        bands,
+        chart_keys,
     )
     return "\n".join(lines), png
 
@@ -1195,15 +1082,46 @@ def _weekday_trend(series: list[dict[str, Any]], label: str, person: _Person) ->
     )
     if sum(occurrences) < 14:
         lines.append("Each weekday appears at most twice here; a longer period gives a fairer pattern.")
-    png = _bar_panels_png(
-        f"{person.name}'s average day of the week — {label}",
+
+    days_seen = sum(occurrences)
+    week_messages = sum(messages) / days_seen if days_seen else 0.0
+    week_voice = sum(voice) / days_seen if days_seen else 0.0
+    has_messages, has_voice = avg_messages[chattiest] > 0, avg_voice[loudest] > 0
+    stats = []
+    if has_messages:
+        stats.append((f"{avg_messages[chattiest]:.1f}", f"messages, avg {_WEEKDAYS[chattiest]}"))
+    if has_voice:
+        stats.append((_duration(avg_voice[loudest]), f"voice, avg {_WEEKDAYS[loudest]}"))
+    if has_messages and week_messages > 0:
+        lift = avg_messages[chattiest] / week_messages - 1
+        stats.append((f"{lift:+.0%}", f"{_WEEKDAYS[chattiest]} vs week avg"))
+    if has_messages and has_voice and chattiest == loudest:
+        title = f"{person.name} comes alive on {_WEEKDAY_NAMES[chattiest]}s"
+    else:
+        title = f"{person.name}'s week pattern"
+    png = charts.weekday_chart(
+        f"Day of week · {label}",
+        title,
+        stats,
+        charts.Panel(
+            "Average messages per day", avg_messages, charts.SERIES[0], "average",
+            week_messages, None, chattiest if has_messages else None,
+        ),
+        charts.Panel(
+            "Average voice time per day", avg_voice, charts.SERIES[1], "duration",
+            week_voice, None, loudest if has_voice else None,
+        ),
         list(_WEEKDAYS),
+        [_plural(count, "day") for count in occurrences],
         [
-            ("Average messages per day", avg_messages, _PIE_COLORS[0], "average"),
-            ("Average observed voice time per day", avg_voice, _PIE_COLORS[1], "duration"),
+            charts.Key("line", "average across the week"),
+            charts.Key("text", "small print: days averaged"),
         ],
     )
     return "\n".join(lines), png
+
+
+_NIGHT_HOURS = 5
 
 
 def _hour_trend(
@@ -1211,42 +1129,59 @@ def _hour_trend(
 ) -> tuple[str, bytes | None]:
     zone = get_timezone(timezone)
     message_hours = [0.0] * 24
+    grid = [[0.0] * 24 for _ in range(7)]
     for created_at in messages["times"]:
-        message_hours[datetime.fromtimestamp(float(created_at), tz=zone).hour] += 1
+        sent = datetime.fromtimestamp(float(created_at), tz=zone)
+        message_hours[sent.hour] += 1
+        grid[sent.weekday()][sent.hour] += 1
     voice_hours = [float(value) for value in voice["hours"]]
     message_total, voice_total = sum(message_hours), sum(voice_hours)
     if message_total == 0 and voice_total == 0:
         return f"No messages or voice time with retained times have been recorded for {label}.", None
     lines = [f"**{person.safe}'s clock — {label}**"]
+    stats = []
+    message_peak = None
     if message_total:
-        peak = max(range(24), key=lambda hour: (message_hours[hour], -hour))
+        message_peak = max(range(24), key=lambda hour: (message_hours[hour], -hour))
         lines.append(
-            f"Peak message hour: **{peak:02d}:00–{(peak + 1) % 24:02d}:00** "
-            f"with {int(message_hours[peak]):,} of {int(message_total):,} messages."
+            f"Peak message hour: **{message_peak:02d}:00–{(message_peak + 1) % 24:02d}:00** "
+            f"with {int(message_hours[message_peak]):,} of {int(message_total):,} messages."
         )
+        stats.append((f"{message_peak:02d}:00", "peak message hour"))
     if voice_total:
         peak = max(range(24), key=lambda hour: (voice_hours[hour], -hour))
         lines.append(
             f"Peak voice hour: **{peak:02d}:00–{(peak + 1) % 24:02d}:00** "
             f"with {_duration(voice_hours[peak])} of {_duration(voice_total)}."
         )
+        stats.append((f"{peak:02d}:00", "peak voice hour"))
     shares = []
+    night_messages = sum(message_hours[0:_NIGHT_HOURS]) / message_total if message_total else 0.0
     if message_total:
-        shares.append(f"**{sum(message_hours[0:5]) / message_total:.0%}** of messages")
+        shares.append(f"**{night_messages:.0%}** of messages")
+        stats.append((f"{night_messages:.0%}", f"of messages 00–{_NIGHT_HOURS:02d}"))
     if voice_total:
-        shares.append(f"**{sum(voice_hours[0:5]) / voice_total:.0%}** of voice time")
+        shares.append(f"**{sum(voice_hours[0:_NIGHT_HOURS]) / voice_total:.0%}** of voice time")
     lines.append(f"Night owl share (00:00–05:00): {' and '.join(shares)}.")
     lines.append(f"Hours use the {timezone} timezone.")
     note = _retention_note(messages, timezone, "Send times and voice sessions")
     if note:
         lines.append(note)
-    png = _bar_panels_png(
-        f"{person.name} by hour of day — {label}",
-        [f"{hour:02d}" for hour in range(24)],
-        [
-            ("Messages by hour", message_hours, _PIE_COLORS[0], "count"),
-            ("Observed voice time by hour", voice_hours, _PIE_COLORS[1], "duration"),
-        ],
+    if night_messages >= 0.3:
+        title = f"{person.name} is a night owl"
+    elif message_peak is not None and 5 <= message_peak < 11:
+        title = f"{person.name} is an early bird"
+    else:
+        title = f"{person.name} by hour of day"
+    png = charts.hours_chart(
+        f"Time of day · {label} · {timezone}",
+        title,
+        stats,
+        grid,
+        charts.Panel("Observed voice time, by hour", voice_hours, charts.SERIES[1], "duration")
+        if voice_total else None,
+        _NIGHT_HOURS,
+        [] if voice_total else ["No observed voice time in this period."],
     )
     return "\n".join(lines), png
 
@@ -1260,8 +1195,70 @@ def _change(current: float, previous: float) -> str:
     return f"{'up' if ratio > 0 else 'down'} {abs(ratio):.0%}"
 
 
+def _change_mark(current: float, previous: float) -> str:
+    """A compact change for a stat tile, in neutral ink: more isn't better or worse."""
+    if previous <= 0:
+        return "–" if current <= 0 else "new"
+    ratio = current / previous - 1
+    if abs(ratio) < 0.005:
+        return "= no change"
+    return f"{'▲' if ratio > 0 else '▼'} {ratio:+.0%}".replace("-", "−")
+
+
+_PACE_POINTS = 96
+_SHORT_CURRENT = {"today": "today", "week": "this week", "last7": "last 7 days", "month": "this month"}
+_SHORT_PREVIOUS = {"today": "yesterday", "week": "last week", "last7": "previous 7", "month": "last month"}
+
+
+def _running(window: dict[str, Any], kind: str) -> list[tuple[float, float]]:
+    """Return ``(fraction of the window, running total)`` points from the window's detail."""
+    start, end = float(window["start"]), float(window["end"])
+    length = end - start
+    if length <= 0:
+        return []
+    times = sorted(float(value) for value in window.get("message_times", ()))
+    pieces = [(float(a), float(b)) for a, b in window.get("voice_pieces", ())]
+    points = []
+    for step in range(_PACE_POINTS + 1):
+        moment = start + length * step / _PACE_POINTS
+        if kind == "count":
+            value = float(sum(1 for sent in times if sent <= moment))
+        else:
+            value = sum(max(0.0, min(b, moment) - a) for a, b in pieces)
+        points.append((step / _PACE_POINTS, value))
+    return points
+
+
+def _pace_ticks(window: dict[str, Any], period: str, timezone: str) -> list[tuple[float, str]]:
+    """Mark local midnights (or every six hours for today) across the current window."""
+    start, end = float(window["start"]), float(window["end"])
+    length = end - start
+    if length <= 0:
+        return []
+    zone = get_timezone(timezone)
+    first = datetime.fromtimestamp(start, tz=zone)
+    ticks = []
+    if period == "today":
+        moment = first.replace(minute=0, second=0, microsecond=0)
+        while moment.timestamp() <= end:
+            if moment.timestamp() >= start and moment.hour % 6 == 0:
+                ticks.append(((moment.timestamp() - start) / length, f"{moment.hour:02d}:00"))
+            moment = (moment + timedelta(hours=1)).replace(tzinfo=zone)
+        return ticks
+    day = first.date()
+    while True:
+        midnight = datetime(day.year, day.month, day.day, tzinfo=zone).timestamp()
+        if midnight > end:
+            break
+        if midnight >= start:
+            label = day.strftime("%a") if length <= 8 * 86400 else day.strftime("%b %-d")
+            ticks.append(((midnight - start) / length, label))
+        day += timedelta(days=1)
+    return ticks
+
+
 def _compare_trend(
-    result: dict[str, Any], period: str, label: str, person: _Person
+    result: dict[str, Any], period: str, label: str, person: _Person, timezone: str = "UTC",
 ) -> tuple[str, bytes | None]:
     previous = result["previous"]
     if previous is None:
@@ -1296,25 +1293,50 @@ def _compare_trend(
     for window in (previous, current):
         length = float(window["end"]) - float(window["start"])
         watched.append(1.0 if length <= 0 else min(1.0, float(window["watched_seconds"]) / length))
+    notes = []
     if min(watched) < 0.99:
         possessive = f"{previous_label}'" if previous_label.endswith("s") else f"{previous_label}'s"
         lines.append(
             f"The tracker watched {watched[0]:.0%} of {possessive} window and "
             f"{watched[1]:.0%} of this one; unwatched time is not filled in."
         )
-    names = [previous_label.capitalize(), f"{label.capitalize()}"]
-    png = _bar_panels_png(
-        f"{person.name} vs {previous_label} — same point in time",
-        names,
-        [
-            ("Messages", [float(previous["messages"]), float(current["messages"])], _PIE_COLORS[0], "count"),
-            (
-                "Observed voice time",
-                [float(previous["voice_seconds"]), float(current["voice_seconds"])],
-                _PIE_COLORS[1],
-                "duration",
-            ),
-        ],
+        notes.append(f"The tracker watched {watched[0]:.0%} of {possessive} window and {watched[1]:.0%} of this one.")
+    short_now, short_before = _SHORT_CURRENT.get(period, "now"), _SHORT_PREVIOUS.get(period, "before")
+    tiles = [
+        charts.Tile(
+            "Messages", f"{current['messages']:,}",
+            f"{_change_mark(current['messages'], previous['messages'])}  vs {previous['messages']:,}",
+        ),
+        charts.Tile(
+            "Voice time", _duration(current["voice_seconds"]),
+            f"{_change_mark(current['voice_seconds'], previous['voice_seconds'])}  vs {_duration(previous['voice_seconds'])}",
+        ),
+        charts.Tile(
+            "Voice visits", f"{current['voice_visits']:,}",
+            f"{_change_mark(current['voice_visits'], previous['voice_visits'])}  vs {previous['voice_visits']:,}",
+        ),
+    ]
+    panels = []
+    for heading, kind, colour, field in (
+        ("Messages, running total", "count", charts.SERIES[0], "messages"),
+        ("Voice time, running total", "duration", charts.SERIES[1], "voice_seconds"),
+    ):
+        now_points, before_points = _running(current, kind), _running(previous, kind)
+        if not now_points:
+            continue
+        panels.append(charts.PacePanel(
+            heading, kind, colour, before_points, now_points,
+            charts.value_label(float(previous[field]), kind),
+            charts.value_label(float(current[field]), kind),
+        ))
+    png = charts.compare_chart(
+        f"Compared with {previous_label} · same point in time",
+        f"{person.name}, {label} so far",
+        tiles,
+        panels,
+        _pace_ticks(current, period, timezone),
+        [charts.Key("line", short_now, charts.SERIES[0]), charts.Key("line", short_before, charts.ALONE)],
+        notes,
     )
     return "\n".join(lines), png
 
@@ -1340,27 +1362,45 @@ def _burst_trend(
     total = sum(count for _, _, count in bursts)
     biggest = max(bursts, key=lambda burst: (burst[2], -burst[0]))
     rapid = sum(count for _, _, count in bursts if count >= 5)
+    average = total / len(bursts)
     lines = [
         f"**{person.safe}'s message bursts — {label}**",
         f"Biggest burst: **{biggest[2]:,} messages** in {_duration(biggest[1] - biggest[0])} "
         f"({_local_time(biggest[0], timezone)}).",
-        f"Average burst: **{total / len(bursts):.1f} messages** across {len(bursts):,} bursts.",
+        f"Average burst: **{average:.1f} messages** across {len(bursts):,} bursts.",
         f"Rapid fire: **{rapid / total:.0%}** of messages came in bursts of 5 or more.",
         "A burst is messages sent within 2 minutes of the previous one, across tracked channels.",
     ]
     note = _retention_note(result, timezone, "Send times")
     if note:
         lines.append(note)
-    counts = [
-        float(sum(1 for _, _, count in bursts if count >= low and (high is None or count <= high)))
+    in_bin = [
+        [count for _, _, count in bursts if count >= low and (high is None or count <= high)]
         for low, high, _ in _BURST_BINS
     ]
-    png = _bar_panels_png(
-        f"{person.name}'s burst sizes — {label}",
+    if average < 2:
+        title = f"{person.name} mostly sends one-liners"
+    elif rapid / total >= 0.4:
+        title = f"{person.name} sends messages in bursts"
+    else:
+        title = f"{person.name}'s message bursts"
+    png = charts.bursts_chart(
+        f"Message bursts · {label}",
+        title,
+        [
+            (f"{biggest[2]:,}", f"biggest burst ({_duration(biggest[1] - biggest[0])})"),
+            (f"{average:.1f}", "messages per burst"),
+            (f"{rapid / total:.0%}", "rapid fire (5+)"),
+        ],
         [name for _, _, name in _BURST_BINS],
-        [("Bursts, by messages in each burst", counts, _PIE_COLORS[0], "count")],
+        [float(len(counts)) for counts in in_bin],
+        [float(sum(counts)) for counts in in_bin],
+        ["A burst is messages sent within 2 minutes of the previous one."],
     )
     return "\n".join(lines), png
+
+
+_COMPANY_TREND_ROWS = 4
 
 
 async def _company_trend(
@@ -1371,7 +1411,8 @@ async def _company_trend(
     rows = await bot.store.company_daily(
         person.user_id, period, now, include_live=_collection_reliable(bot)
     )
-    rows = _visible_company_rows(bot, interaction, rows)
+    can_view = _audience_can_view(bot, interaction)
+    rows = _visible_company_rows(bot, interaction, rows, can_view)
     if not rows:
         return (
             f"No companion time has been observed for {person.safe} {label} in voice channels visible to this report.",
@@ -1394,12 +1435,13 @@ async def _company_trend(
         (member_id for member_id in by_member if member_id != 0),
         key=lambda member_id: (-sum(by_member[member_id]), member_id),
     )
-    shown = peers[:5]
-    stacks: list[tuple[int, list[float]]] = [(member_id, by_member[member_id]) for member_id in shown]
+    shown = peers[:_COMPANY_TREND_ROWS]
+    strips: list[tuple[int, list[float]]] = [(member_id, by_member[member_id]) for member_id in shown]
     if 0 in by_member:
-        stacks.append((0, by_member[0]))
-    if len(peers) > 5:
-        stacks.append((-1, [sum(by_member[member_id][i] for member_id in peers[5:]) for i in range(len(keys))]))
+        strips.append((0, by_member[0]))
+    if len(peers) > _COMPANY_TREND_ROWS:
+        rest = peers[_COMPANY_TREND_ROWS:]
+        strips.append((-1, [sum(by_member[member_id][i] for member_id in rest) for i in range(len(keys))]))
     recent = list(enumerate(keys))[-6:]
     winners: dict[int, int | None] = {}
     for index, _ in recent:
@@ -1408,12 +1450,16 @@ async def _company_trend(
             ranked, key=lambda member_id: (by_member[member_id][index], -member_id), default=None
         )
     named = list(dict.fromkeys(
-        [member_id for member_id, _ in stacks]
+        [member_id for member_id, _ in strips]
         + [member_id for member_id in winners.values() if member_id is not None]
     ))
     guild = _guild(bot)
-    names = await asyncio.gather(*(_company_name(bot, guild, member_id) for member_id in named))
-    name_of = dict(zip(named, names))
+    identities, colours = await asyncio.gather(
+        asyncio.gather(*(_company_identity(bot, guild, member_id) for member_id in named)),
+        _companion_colours(bot, interaction, person, can_view),
+    )
+    identity_of = dict(zip(named, identities))
+    name_of = {member_id: name for member_id, (name, _) in identity_of.items()}
     full = count == "full"
     title = f"**{person.safe}'s company over time — {label}**"
     lines = [f"{title} (full time with each person)" if full else title]
@@ -1428,7 +1474,7 @@ async def _company_trend(
             lines.append(f"{when}: **{_safe_name(name_of[best])}** — {_duration(by_member[best][index])}")
     if full:
         lines.append(
-            "Each person is credited with every minute they shared, so stacked bars can add up to more "
+            "Each person is credited with every minute they shared, so rows can add up to more "
             "than the observed time; only observed time since companion tracking began is included."
         )
     else:
@@ -1436,16 +1482,33 @@ async def _company_trend(
             "Each shared minute is split evenly among the people present; only observed time since "
             "companion tracking began is included."
         )
+    trend_rows = []
+    for member_id, values in strips:
+        name, avatar = identity_of[member_id]
+        if member_id == -1:
+            name = f"{_plural(len(peers) - _COMPANY_TREND_ROWS, 'other')}"
+        trend_rows.append(charts.TrendRow(
+            name, values, _companion_colour(colours, member_id), _duration(sum(values)), avatar,
+            group=member_id in (0, -1),
+        ))
+    stats = []
+    if peers:
+        top = peers[0]
+        stats.append((name_of[top], f"most time · {_duration(sum(by_member[top]))}"))
+    latest = winners.get(len(keys) - 1)
+    if latest is not None:
+        stats.append((name_of[latest], f"top this {unit}"))
     png = await _render(
-        _stacked_png,
-        f"{person.name}'s company per {unit} — {label}",
-        f"Full shared time per {unit}, by companion (overlapping)" if full
-        else f"Observed voice time per {unit}, by companion",
+        charts.company_trend_chart,
+        f"Company over time · {label} · {'full' if full else 'split'} time",
+        f"{person.name}'s company, {unit} by {unit}",
+        stats,
+        trend_rows,
         [_bucket_label(key, unit, day_count) for key in keys],
-        [
-            (name_of[member_id], values, _PIE_COLORS[index])
-            for index, (member_id, values) in enumerate(stacks)
-        ],
+        _day_label_positions(keys, unit),
+        [charts.Key("swatch", "alone and everyone else", charts.ALONE)],
+        ["All rows share one scale."]
+        + (["Each person counts every minute they shared, so rows overlap."] if full else []),
     )
     return "\n".join(lines), png
 
@@ -1470,7 +1533,7 @@ async def _trend_report(
         return await _render(_burst_trend, result, label, timezone, person)
     if kind == "compare":
         result = await bot.store.period_comparison(user_id, period, now, include_live=reliable)
-        return await _render(_compare_trend, result, period, label, person)
+        return await _render(_compare_trend, result, period, label, person, timezone)
     if kind == "company":
         return await _company_trend(bot, interaction, person, period, label, count)
     series = await bot.store.daily_trend(user_id, period, now, include_live=reliable)
@@ -1478,7 +1541,8 @@ async def _trend_report(
         return f"No activity has been recorded for {label}, so there is no trend to chart.", None
     if kind == "weekdays":
         return await _render(_weekday_trend, series, label, person)
-    return await _render(_daily_trend, series, label, person)
+    today = local_date(now, timezone).isoformat()
+    return await _render(_daily_trend, series, label, person, today)
 
 
 async def _online_text(bot: Any, person: _Person) -> str:
@@ -1673,7 +1737,7 @@ def _help_text(bot: Any) -> str:
         "`/flock stats` — messages, observed voice time, active days, visits, and coverage gaps (week by default).",
         "`/flock records` — busiest day, longest observed voice visit, and top companion.",
         "`/flock where` — last observed voice channel and time.",
-        "`/flock company` — pie chart of who shared observed voice time; `count:full` credits whole group calls.",
+        "`/flock company` — ranked bar chart of who shared observed voice time; `count:full` credits whole group calls.",
         "`/flock leaderboard` — who spent the most voice time with someone, counting whole group calls (all time by default).",
         "`/flock trends` — day by day, versus last period, time of day, day of week, company, or message bursts (last 7 days by default).",
         "`/flock online` — Discord status of a tracked person; away counts as online.",
@@ -1762,7 +1826,8 @@ _GAP_REASONS = {
     "disconnect": "Discord connection lost",
     "process_restart": "bot stopped or restarted",
 }
-_UPTIME_COLORS = (_PIE_COLORS[2], _PIE_COLORS[7], _BASELINE)
+# The timeline shows at most this many of the most recent days.
+_UPTIME_DAYS_SHOWN = 31
 _UPTIME_OUTAGES_SHOWN = 8
 _ERRORS_SHOWN = 15
 
@@ -1941,26 +2006,46 @@ async def _uptime_report(bot: Any, period: str) -> tuple[str, bytes | None]:
         if len(outages) > _UPTIME_OUTAGES_SHOWN:
             lines.append(f"…and {len(outages) - _UPTIME_OUTAGES_SHOWN:,} earlier")
     lines.append("Outages count as missing coverage in every report, never as quiet time.")
-    days = result["days"]
-    unit = _bucket_unit(len(days))
-    buckets: dict[date, list[float]] = {}
+    days = result["days"][-_UPTIME_DAYS_SHOWN:]
+    zone = get_timezone(timezone)
+    spans = [(float(span["start"]), float(span["end"]), span["kind"]) for span in result.get("spans", ())]
+    timeline = []
     for entry in days:
-        totals = buckets.setdefault(_bucket_key(date.fromisoformat(entry["day"]), unit), [0.0, 0.0, 0.0])
-        totals[0] += float(entry["observed"])
-        totals[1] += float(entry["outage"])
-        totals[2] += float(entry["idle"])
-    keys = sorted(buckets)
+        day = date.fromisoformat(entry["day"])
+        day_start = datetime(day.year, day.month, day.day, tzinfo=zone).timestamp()
+        following = day + timedelta(days=1)
+        day_end = datetime(following.year, following.month, following.day, tzinfo=zone).timestamp()
+        length = day_end - day_start
+        pieces = [
+            ((max(start, day_start) - day_start) / length, (min(end, day_end) - day_start) / length, kind)
+            for start, end, kind in spans
+            if start < day_end and end > day_start
+        ]
+        # Use the drawn spans so the percentage always matches the row's bar.
+        covered = sum(end - start for start, end, _ in pieces)
+        watched = sum(end - start for start, end, kind in pieces if kind == "observed")
+        if not pieces:
+            covered = float(entry["observed"]) + float(entry["outage"]) + float(entry["idle"])
+            watched = float(entry["observed"])
+        percent = 100.0 * watched / covered if covered > 0 else 100.0
+        timeline.append(charts.UptimeDay(day.strftime("%a %-d"), pieces, percent))
+    stats = [(_percent(observed, elapsed), "watching")]
+    notes = []
+    if outages:
+        stats.append((f"{len(outages):,}", f"outages · {_duration(outage)}"))
+        stats.append((
+            _duration(longest["seconds"]),
+            f"longest · {_local_time(longest['started_at'], timezone, date_only=True)}",
+        ))
+    if len(result["days"]) > len(days):
+        notes.append(f"The timeline shows the last {len(days)} days; the totals cover {label}.")
     png = await _render(
-        _stacked_png,
-        f"Flock uptime — {label}",
-        f"Time per {unit}",
-        [_bucket_label(key, unit, len(days)) for key in keys],
-        [
-            (name, [buckets[key][index] for key in keys], colour)
-            for index, (name, colour) in enumerate(
-                zip(("Watching", "Outage", "Paused"), _UPTIME_COLORS)
-            )
-        ],
+        charts.uptime_chart,
+        f"Uptime · {label}",
+        f"Flock was watching {_percent(observed, elapsed)} of the time",
+        stats,
+        timeline,
+        notes,
     )
     return "\n".join(lines), png
 

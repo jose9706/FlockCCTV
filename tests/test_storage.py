@@ -342,6 +342,50 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["since"], result["period_start"])
         self.assertEqual(len(result["times"]), 1)
 
+    async def test_window_totals_expose_message_times_and_clipped_voice_pieces(self) -> None:
+        store = await self.new_store("pieces", epoch("2025-02-20T00:00:00"))
+        try:
+            await store.connect(epoch("2025-02-20T00:00:00"))
+            await store.add_message(USER, 1, 30, epoch("2025-03-03T09:00:00"))
+            await store.add_message(USER, 2, 30, epoch("2025-03-03T08:00:00"))
+            await store.add_message(USER, 3, 30, epoch("2025-02-24T09:00:00"))
+            # Starts before the previous window and is clipped to its start.
+            await store.voice_transition(USER, 101, epoch("2025-02-23T23:00:00"))
+            await store.voice_transition(USER, None, epoch("2025-02-24T01:00:00"))
+            await store.voice_transition(USER, 101, epoch("2025-03-03T10:00:00"))
+            await store.checkpoint(epoch("2025-03-03T11:00:00"))
+            now = epoch("2025-03-03T12:00:00")
+
+            result = await store.period_comparison(USER, "week", now)
+            current, previous = result["current"], result["previous"]
+            self.assertEqual(
+                current["message_times"],
+                [epoch("2025-03-03T08:00:00"), epoch("2025-03-03T09:00:00")],
+            )
+            self.assertEqual(previous["message_times"], [epoch("2025-02-24T09:00:00")])
+            self.assertEqual(
+                previous["voice_pieces"],
+                [(epoch("2025-02-24T00:00:00"), epoch("2025-02-24T01:00:00"))],
+            )
+            # Closed-nothing here: the open segment is the live piece, through now.
+            self.assertEqual(
+                current["voice_pieces"],
+                [(epoch("2025-03-03T10:00:00"), epoch("2025-03-03T11:00:00")),
+                 (epoch("2025-03-03T11:00:00"), now)],
+            )
+            for window in (current, previous):
+                self.assertEqual(len(window["message_times"]), window["messages"])
+                self.assertAlmostEqual(
+                    sum(b - a for a, b in window["voice_pieces"]), window["voice_seconds"]
+                )
+            saved = await store.period_comparison(USER, "week", now, include_live=False)
+            self.assertEqual(
+                saved["current"]["voice_pieces"],
+                [(epoch("2025-03-03T10:00:00"), epoch("2025-03-03T11:00:00"))],
+            )
+        finally:
+            await store.close()
+
     async def test_period_comparison_uses_same_elapsed_window_and_refuses_unfair_cases(self) -> None:
         store = await self.new_store("cmp", epoch("2025-02-20T00:00:00"))
         try:
@@ -1638,6 +1682,51 @@ class DebugStoreTests(unittest.IsolatedAsyncioTestCase):
             [(160.0, 220.0, "disconnect", 60.0)],
         )
         self.assertTrue(result["paused"])
+
+    def assert_spans_tile(self, result: dict) -> dict[str, float]:
+        spans = result["spans"]
+        self.assertEqual(spans[0]["start"], result["start"])
+        self.assertEqual(spans[-1]["end"], result["end"])
+        sums = {"observed": 0.0, "outage": 0.0, "idle": 0.0}
+        for index, span in enumerate(spans):
+            self.assertGreater(span["end"], span["start"])
+            sums[span["kind"]] += span["end"] - span["start"]
+            if index:
+                self.assertEqual(spans[index - 1]["end"], span["start"])
+                self.assertNotEqual(spans[index - 1]["kind"], span["kind"])
+        return sums
+
+    async def test_uptime_spans_tile_the_period_and_match_totals(self) -> None:
+        await self.store.connect(100.0)
+        await self.store.checkpoint(160.0)
+        await self.store.disconnect(200.0)
+        await self.store.connect(220.0)
+        await self.store.checkpoint(300.0)
+        await self.store.set_paused(True, 99, 300.0)
+        result = await self.store.uptime("all", 400.0)
+        self.assertEqual(result["spans"], [
+            {"start": 100.0, "end": 160.0, "kind": "observed"},
+            {"start": 160.0, "end": 220.0, "kind": "outage"},
+            {"start": 220.0, "end": 300.0, "kind": "observed"},
+            {"start": 300.0, "end": 400.0, "kind": "idle"},
+        ])
+        sums = self.assert_spans_tile(result)
+        self.assertEqual(sums, {k: result[k] for k in sums})
+
+    async def test_uptime_spans_merge_live_coverage_and_open_outage(self) -> None:
+        await self.store.connect(100.0)
+        await self.store.checkpoint(150.0)
+        live = await self.store.uptime("all", 400.0)
+        self.assertEqual(live["spans"], [{"start": 100.0, "end": 400.0, "kind": "observed"}])
+        not_live = await self.store.uptime("all", 400.0, include_live=False)
+        self.assertEqual(self.assert_spans_tile(not_live)["idle"], not_live["idle"])
+        await self.store.disconnect(400.0)
+        down = await self.store.uptime("all", 500.0)
+        self.assertEqual(down["spans"], [
+            {"start": 100.0, "end": 150.0, "kind": "observed"},
+            {"start": 150.0, "end": 500.0, "kind": "outage"},
+        ])
+        self.assertEqual(self.assert_spans_tile(down)["outage"], down["outage"])
 
     async def test_uptime_counts_live_coverage_and_an_open_outage_through_now(self) -> None:
         await self.store.connect(100.0)
