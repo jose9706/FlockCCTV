@@ -59,6 +59,8 @@ _ROAST_COOLDOWN = SharedRoastCooldown(seconds=30)
 _INTRODUCE_COOLDOWN = SharedRoastCooldown(seconds=300)
 # Company member ID that stands in for people whose data was deleted.
 _DELETED_COMPANION = int(DELETED_COMPANION_ID)
+# Company members that are shown but never ranked: alone, everyone else, deleted people.
+_UNRANKED_COMPANIONS = (0, -1, _DELETED_COMPANION)
 # Seconds a pre-acknowledgement store read may take (Discord allows three).
 _LOOKUP_TIMEOUT = 2.0
 _FAILURE_TEXT = "The tracker could not complete that request. The error was logged."
@@ -441,7 +443,7 @@ async def _avatar_bytes(found: Any) -> bytes | None:
 
 async def _company_identity(bot: Any, guild: Any, member_id: int) -> tuple[str, bytes | None]:
     """Return a companion's chart name and avatar; groups and deleted people have no avatar."""
-    if member_id in (0, -1, _DELETED_COMPANION):
+    if member_id in _UNRANKED_COMPANIONS:
         return await _company_name(bot, guild, member_id), None
     found = await _lookup_user(bot, guild, member_id)
     name = _clean_name(getattr(found, "display_name", None)) or f"User {member_id}"
@@ -455,7 +457,7 @@ async def _companion_colours(
     rows = await _visible_company_totals(bot, interaction, person, "all", can_view)
     totals = _seconds_by_member(rows, "seconds")
     ranked = sorted(
-        (member_id for member_id in totals if member_id not in (0, -1, _DELETED_COMPANION)),
+        (member_id for member_id in totals if member_id not in _UNRANKED_COMPANIONS),
         key=lambda member_id: (-totals[member_id], member_id),
     )
     return {member_id: charts.SERIES[index] for index, member_id in enumerate(ranked[:len(charts.SERIES)])}
@@ -719,9 +721,9 @@ async def _company_report(
             detail = f"{seconds / total:.0%}"
         rows.append(charts.CompanyRow(
             name, seconds, _companion_colour(colours, member_id), detail, avatar,
-            group=member_id in (0, -1),
+            group=member_id in _UNRANKED_COMPANIONS,
         ))
-    # People first, then time alone and everyone else under a divider.
+    # People first, then time alone, deleted people, and everyone else under a divider.
     rows.sort(key=lambda row: row.group)
     stats = [(_duration(total), "observed in voice")]
     peers = [row for row in rows if not row.group]
@@ -1080,7 +1082,7 @@ def _weekday_trend(series: list[dict[str, Any]], label: str, person: _Person) ->
         "Averages count days with activity or a full day of watching; "
         "quiet days the tracker didn't fully watch are left out."
     )
-    if sum(occurrences) < 14:
+    if max(occurrences) <= 2:
         lines.append("Each weekday appears at most twice here; a longer period gives a fairer pattern.")
 
     days_seen = sum(occurrences)
@@ -1124,8 +1126,53 @@ def _weekday_trend(series: list[dict[str, Any]], label: str, person: _Person) ->
 _NIGHT_HOURS = 5
 
 
+def _unwatched_hours(
+    spans: list[dict[str, Any]], start: float, end: float, timezone: str,
+) -> tuple[list[list[bool]], list[bool]] | None:
+    """Mark weekday-hours and hours of day the tracker watched less than half of.
+
+    ``spans`` are ``Store.uptime`` spans; time they don't cover counts as not
+    watched. Returns ``None`` when there is no coverage data to judge by.
+    """
+    if not spans or end <= start:
+        return None
+    zone = get_timezone(timezone)
+    observed = sorted(
+        (float(span["start"]), float(span["end"])) for span in spans if span["kind"] == "observed"
+    )
+    watched_cell = [[0.0] * 24 for _ in range(7)]
+    total_cell = [[0.0] * 24 for _ in range(7)]
+    # Local hours are an hour apart in absolute time, so step from the first one.
+    moment = datetime.fromtimestamp(start, tz=zone).replace(minute=0, second=0, microsecond=0).timestamp()
+    index = 0
+    while moment < end:
+        slot_start, slot_end = max(moment, start), min(moment + 3600, end)
+        local = datetime.fromtimestamp(moment, tz=zone)
+        while index < len(observed) and observed[index][1] <= slot_start:
+            index += 1
+        watched = 0.0
+        for piece_start, piece_end in observed[index:]:
+            if piece_start >= slot_end:
+                break
+            watched += max(0.0, min(piece_end, slot_end) - max(piece_start, slot_start))
+        total_cell[local.weekday()][local.hour] += slot_end - slot_start
+        watched_cell[local.weekday()][local.hour] += watched
+        moment += 3600
+    cells = [
+        [total > 0 and watched < total / 2 for watched, total in zip(watched_row, total_row)]
+        for watched_row, total_row in zip(watched_cell, total_cell)
+    ]
+    hours = []
+    for hour in range(24):
+        total = sum(total_cell[day][hour] for day in range(7))
+        watched = sum(watched_cell[day][hour] for day in range(7))
+        hours.append(total > 0 and watched < total / 2)
+    return cells, hours
+
+
 def _hour_trend(
-    messages: dict[str, Any], voice: dict[str, Any], label: str, timezone: str, person: _Person
+    messages: dict[str, Any], voice: dict[str, Any], label: str, timezone: str, person: _Person,
+    coverage: dict[str, Any] | None = None,
 ) -> tuple[str, bytes | None]:
     zone = get_timezone(timezone)
     message_hours = [0.0] * 24
@@ -1173,6 +1220,11 @@ def _hour_trend(
         title = f"{person.name} is an early bird"
     else:
         title = f"{person.name} by hour of day"
+    unwatched = None
+    if coverage is not None:
+        # Judge coverage only where detail exists and the person was tracked.
+        start = max(float(coverage["start"]), float(messages.get("since", 0.0)), person.since)
+        unwatched = _unwatched_hours(coverage.get("spans", []), start, float(coverage["end"]), timezone)
     png = charts.hours_chart(
         f"Time of day · {label} · {timezone}",
         title,
@@ -1182,6 +1234,7 @@ def _hour_trend(
         if voice_total else None,
         _NIGHT_HOURS,
         [] if voice_total else ["No observed voice time in this period."],
+        *(unwatched or (None, None)),
     )
     return "\n".join(lines), png
 
@@ -1431,14 +1484,16 @@ async def _company_trend(
         values[position[_bucket_key(date.fromisoformat(row["day"]), unit)]] += float(
             row.get(_company_field(count), 0.0)
         )
+    # Deleted people keep their row but are never ranked as a top companion.
     peers = sorted(
-        (member_id for member_id in by_member if member_id != 0),
+        (member_id for member_id in by_member if member_id not in _UNRANKED_COMPANIONS),
         key=lambda member_id: (-sum(by_member[member_id]), member_id),
     )
     shown = peers[:_COMPANY_TREND_ROWS]
     strips: list[tuple[int, list[float]]] = [(member_id, by_member[member_id]) for member_id in shown]
-    if 0 in by_member:
-        strips.append((0, by_member[0]))
+    for group_id in (0, _DELETED_COMPANION):
+        if group_id in by_member:
+            strips.append((group_id, by_member[group_id]))
     if len(peers) > _COMPANY_TREND_ROWS:
         rest = peers[_COMPANY_TREND_ROWS:]
         strips.append((-1, [sum(by_member[member_id][i] for member_id in rest) for i in range(len(keys))]))
@@ -1469,7 +1524,13 @@ async def _company_trend(
         when = _bucket_label(key, unit, day_count)
         if best is None:
             alone = by_member.get(0, [0.0] * len(keys))[index]
-            lines.append(f"{when}: {'alone — ' + _duration(alone) if alone > 0 else 'no company time'}")
+            deleted = by_member.get(_DELETED_COMPANION, [0.0] * len(keys))[index]
+            if alone > 0:
+                lines.append(f"{when}: alone — {_duration(alone)}")
+            elif deleted > 0:
+                lines.append(f"{when}: only a deleted person — {_duration(deleted)}")
+            else:
+                lines.append(f"{when}: no company time")
         else:
             lines.append(f"{when}: **{_safe_name(name_of[best])}** — {_duration(by_member[best][index])}")
     if full:
@@ -1489,7 +1550,7 @@ async def _company_trend(
             name = f"{_plural(len(peers) - _COMPANY_TREND_ROWS, 'other')}"
         trend_rows.append(charts.TrendRow(
             name, values, _companion_colour(colours, member_id), _duration(sum(values)), avatar,
-            group=member_id in (0, -1),
+            group=member_id in _UNRANKED_COMPANIONS,
         ))
     stats = []
     if peers:
@@ -1527,7 +1588,8 @@ async def _trend_report(
     if kind == "hours":
         messages = await bot.store.message_times(user_id, period, now)
         voice = await bot.store.voice_hours(user_id, period, now, include_live=reliable)
-        return await _render(_hour_trend, messages, voice, label, timezone, person)
+        coverage = await bot.store.uptime(period, now, include_live=reliable)
+        return await _render(_hour_trend, messages, voice, label, timezone, person, coverage)
     if kind == "bursts":
         result = await bot.store.message_times(user_id, period, now)
         return await _render(_burst_trend, result, label, timezone, person)
@@ -2509,9 +2571,15 @@ def register_commands(bot: Any) -> None:
         user: discord.User | None = None,
     ) -> None:
         async def roast(person: _Person) -> str:
-            stats = await _read_stats(bot, person.user_id, period, time.time())
-            joke = make_roast(stats, _period_label(period), name=person.name)
+            # Only a delivered joke uses up the shared cooldown.
+            try:
+                stats = await _read_stats(bot, person.user_id, period, time.time())
+                joke = make_roast(stats, _period_label(period), name=person.name)
+            except Exception:
+                await _ROAST_COOLDOWN.refund()
+                raise
             if joke is None:
+                await _ROAST_COOLDOWN.refund()
                 return f"There is no recorded activity to joke about for {_period_label(period)} yet."
             return joke
 
@@ -2696,7 +2764,8 @@ def register_commands(bot: Any) -> None:
     @flock.command(name="pause", description="Pause activity collection")
     async def pause_command(interaction: discord.Interaction) -> None:
         async def action() -> str:
-            await bot.tracker.pause(actor_id=interaction.user.id)
+            if not await bot.tracker.pause(actor_id=interaction.user.id):
+                return "Collection is already paused. Use `/flock resume` to start it again."
             return "Collection is paused. This setting persists across restarts."
 
         await control(interaction, "flock pause", action)
@@ -2704,7 +2773,8 @@ def register_commands(bot: Any) -> None:
     @flock.command(name="resume", description="Resume activity collection")
     async def resume_command(interaction: discord.Interaction) -> None:
         async def action() -> str:
-            await bot.tracker.resume(interaction.user.id, bot.voice_snapshot)
+            if not await bot.tracker.resume(interaction.user.id, bot.voice_snapshot):
+                return "Collection is already running; nothing was paused."
             snapshot = bot.voice_snapshot()
             tracked = getattr(bot.tracker, "tracked_ids", frozenset())
             watching = sum(1 for member_id in snapshot if member_id in tracked)

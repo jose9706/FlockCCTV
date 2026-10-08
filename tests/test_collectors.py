@@ -669,6 +669,16 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         await tracker.resume(99, {})
         self.assertFalse(store.paused)
 
+    async def test_pausing_twice_keeps_the_first_pause_and_reports_no_change(self):
+        store = FakeStore()
+        tracker = Tracker(make_config(), store)
+        await tracker.ready({}, now=150)
+        self.assertTrue(await tracker.pause(99))
+        self.assertFalse(await tracker.pause(20))
+        self.assertEqual(store.paused_by, 99)
+        self.assertTrue(await tracker.resume(20, {}))
+        self.assertFalse(await tracker.resume(20, {}))
+
     async def test_admin_resume_reconciles_incomplete_visits_for_everyone(self):
         store = FakeStore(active=frozenset({20, 21}))
         tracker = Tracker(make_config(), store)

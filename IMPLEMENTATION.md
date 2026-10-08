@@ -448,7 +448,7 @@ access when confirmed, expires, and says exactly whether it erases everyone's da
 or one named person's. Without `user` it calls `tracker.delete_data` and the tracked
 list is kept; with `user` it calls `tracker.delete_user_data` and that person is
 untracked while collection for others continues. Roast uses a shared 30-second
-cooldown. Defer slow interactions and use followups; a reply longer than Discord's 2,000-character limit is split between lines into several messages, with any chart or buttons on the last; errors get a safe response and
+cooldown that only a delivered joke uses up; no data or an error gives it back. Defer slow interactions and use followups; a reply longer than Discord's 2,000-character limit is split between lines into several messages, with any chart or buttons on the last; errors get a safe response and
 logged traceback. Every command checks the guild and output channel first, then
 admin or owner access, then its arguments. Charts are drawn on a worker thread,
 one at a time, after the store reads finish. `charts.py` draws every chart as a
@@ -514,7 +514,11 @@ still exceeds the card width. `daily` marks each bucket as unwatched (no
 activity and not watched), ghost (a watched quiet day), or partial (holds
 today), and averages only observed days before today. `compare` draws running
 totals from `message_times` and `voice_pieces` against elapsed time in each
-window. `debug uptime` splits `Store.uptime` `spans` by local day.
+window. `debug uptime` splits `Store.uptime` `spans` by local day. `hours` also reads `Store.uptime` spans from
+the later of the period start, retained detail, and the person's tracking start,
+and hatches weekday-hours (and voice hours) the bot watched less than half of
+when nothing was recorded in them. Company charts list alone, everyone else, and
+the deleted-person member under the divider and never name them top companion.
 
 `evil-mode` and `reaction-mode` check admin access, then reply privately that Leland
 mode isn't configured when `leland_user_id` is unset.

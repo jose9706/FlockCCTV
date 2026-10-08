@@ -487,10 +487,13 @@ _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 def hours_chart(
     eyebrow: str, title: str, stats: Sequence[tuple[str, str]],
     grid: Sequence[Sequence[float]], voice: Panel | None, night_hours: int, notes: Sequence[str] = (),
+    unwatched: Sequence[Sequence[bool]] | None = None, voice_unwatched: Sequence[bool] | None = None,
 ) -> bytes:
     """A weekday × hour heatmap of messages above voice time by hour, aligned by hour.
 
     With no voice time, ``voice`` is ``None`` and the hour labels go under the heatmap.
+    ``unwatched`` and ``voice_unwatched`` mark quiet hours the tracker mostly
+    did not watch; they are hatched instead of drawn as quiet.
     """
     card = _Card()
     y = _header(card, eyebrow, title, stats)
@@ -507,7 +510,10 @@ def hours_chart(
         for hour, value in enumerate(row):
             x = left + hour * slot
             box = (x + 1.5, top + row_index * cell + 1.5, x + slot - 1.5, top + (row_index + 1) * cell - 1.5)
-            if value <= 0 or peak <= 0:
+            if value <= 0 and unwatched and unwatched[row_index][hour]:
+                card.rect(box, EMPTY_CELL, radius=3)
+                card.hatch(box, HATCH, spacing=4)
+            elif value <= 0 or peak <= 0:
                 card.rect(box, EMPTY_CELL, radius=3)
             else:
                 # Square-root scale so a few busy hours don't wash out the rest.
@@ -526,9 +532,12 @@ def hours_chart(
         y = _x_labels(card, left, slot, y - 4, hours, range(0, 24, 3))
     else:
         y += 30
-        left, _, slot, base = _column_panel(card, y, 150, voice, bands=[(0, night_hours)])
+        states = ["unwatched" if flag else None for flag in voice_unwatched] if voice_unwatched else None
+        left, _, slot, base = _column_panel(card, y, 150, voice, states=states, bands=[(0, night_hours)])
         y = _x_labels(card, left, slot, base, hours, range(0, 24, 3))
     keys = [Key("swatch", f"00:00–{night_hours:02d}:00, the night-owl window", NIGHT_BAND), Key("swatch", "no messages", EMPTY_CELL)]
+    if (unwatched and any(any(row) for row in unwatched)) or (voice_unwatched and any(voice_unwatched)):
+        keys.append(Key("hatch", "mostly not watched"))
     return card.png(_footer(card, y + 4, keys, notes))
 
 
