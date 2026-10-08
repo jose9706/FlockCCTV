@@ -5,7 +5,7 @@ an admin-managed list of people and measures their observed time in configured
 voice channels. It stores statistics in SQLite and is designed to run as a
 systemd service on the Raspberry Pi. It requires Python 3.11 or newer; the
 pinned dependencies were checked on Debian 13, aarch64, with Python 3.13.
-This is release 1.0.1. It replaces the single-person Leland Tracker and starts
+This is release 1.0.2. It replaces the single-person Leland Tracker and starts
 with fresh data: the old database is archived, not imported. See
 [Replacing Leland Tracker](#replacing-leland-tracker).
 
@@ -543,7 +543,7 @@ and the updater rolls back to the current code.
 The release number lives in `src/flock_cctv/__init__.py` (`__version__`,
 semantic versioning) and is bumped by hand in the pull request that changes
 behavior. The updater also stamps the deployed commit into the installed package,
-so the running version is `release (short commit)`, for example `1.0.1 (1a2b3c4)`:
+so the running version is `release (short commit)`, for example `1.0.2 (1a2b3c4)`:
 
 - `/flock version` replies privately with it; `/flock about` also shows it on its second line.
 - The service journal logs `Starting flock-cctv <version>` at every start.
